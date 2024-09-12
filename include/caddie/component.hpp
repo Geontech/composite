@@ -93,13 +93,8 @@ public:
     }
 
     template <typename T>
-    auto get_property(std::string_view name) const -> T
-    {
+    auto get_property(std::string_view name) const -> T {
         return m_prop_set.get_property<T>(name);
-    }
-
-    auto log_level(spdlog::level::level_enum level) const -> void {
-        spdlog::set_level(level);
     }
 
 private:
@@ -109,7 +104,7 @@ private:
     port_set m_port_set;
     property_set m_prop_set;
 
-    void thread_func(std::stop_token token) {
+    auto thread_func(std::stop_token token) -> void {
         while (!token.stop_requested()) {
             auto res = process();
             if (res == retval::NOOP) {
