@@ -1,0 +1,6 @@
+#pragma once
+
+#define VERSION_MAJOR @caddie_VERSION_MAJOR@
+#define VERSION_MINOR @caddie_VERSION_MINOR@
+#define VERSION_PATCH @caddie_VERSION_PATCH@
+#define VERSION "@caddie_VERSION_MAJOR@.@caddie_VERSION_MINOR@.@caddie_VERSION_PATCH@"
