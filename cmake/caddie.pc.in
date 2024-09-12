@@ -1,0 +1,5 @@
+Name: caddie
+Description: Caddie processing framework
+URL: https://github.com/geontech/caddie
+Version: ${PROJECT_VERSION}
+CFlags: -I${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}
