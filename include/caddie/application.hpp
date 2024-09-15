@@ -4,6 +4,8 @@
 #include "lifecycle.hpp"
 
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace caddie {
@@ -14,6 +16,10 @@ public:
 
     explicit application(std::string_view name) :
       m_name(name) {
+    }
+
+    auto name() const noexcept -> const std::string& {
+        return m_name;
     }
 
     auto initialize() -> void override {
@@ -38,13 +44,17 @@ public:
         m_components.emplace_back(comp);
     }
 
-    auto get_component(std::string_view name) const -> component* {
+    auto get_component(std::string_view id) const -> component* {
         for (const auto& component : m_components) {
-            if (component->name() == name) {
+            if (component->id() == id) {
                 return component.get();
             }
         }
         return nullptr;
+    }
+
+    auto clear() -> void {
+        m_components.clear();
     }
 
 private:

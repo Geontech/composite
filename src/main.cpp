@@ -39,7 +39,7 @@ auto set_property(std::shared_ptr<caddie::component> comp, const nlohmann::json&
 
 auto main(int argc, char** argv) -> int {
     // Create argument parser with options
-    auto program = argparse::ArgumentParser{"caddie", VERSION};
+    auto program = argparse::ArgumentParser{"caddie-cli", VERSION};
     program.add_argument("-c", "--config")
         .help("application configuration file")
         .required();
@@ -66,59 +66,126 @@ auto main(int argc, char** argv) -> int {
     auto config_ifstream = std::ifstream{config_file};
     auto app_json = nlohmann::json::parse(config_ifstream);
 
+    // Component handle holders
+    auto close_func = [](void* p) {
+        dlclose(p);
+    };
+    auto comp_handles = std::vector<std::unique_ptr<void, decltype(close_func)>>{};
+
     // Create a new application object
     auto app_name = app_json["name"].get<std::string>();
     auto app = caddie::application{app_name};
 
     // Get components and load them
     for (const auto& comp : app_json["components"]) {
-        auto comp_str = fmt::format("lib{}.so", comp["name"].get<std::string>());
-        spdlog::debug("component: {}", comp_str);
-        auto comp_handle = dlopen(comp_str.c_str(), RTLD_NOW);
+        // Get component name
+        auto name = comp["name"].get<std::string>();
+        // Open component module
+        auto comp_str = fmt::format("lib{}.so", name);
+        spdlog::trace("component module: {}", comp_str);
+        // Get component module handle
+        auto comp_handle = std::unique_ptr<void, decltype(close_func)>(dlopen(comp_str.c_str(), RTLD_NOW), close_func);
         if (!comp_handle) {
-            std::cerr << fmt::format("Failed to open {}: {}\n", comp_str, dlerror());
+            std::cerr << fmt::format("failed to open {}: {}\n", comp_str, dlerror());
             return EXIT_FAILURE;
         }
         dlerror(); // clear existing
+        // Component shared_ptr
+        auto comp_ptr = std::shared_ptr<caddie::component>{nullptr};
         // Get the create function
-        std::shared_ptr<caddie::component> (*create_func)();
-        *(void**)(&create_func) = dlsym(comp_handle, "create");
-        if (auto err = dlerror(); err != nullptr) {
-            std::cerr << fmt::format("Failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+        if (comp.contains("create_arg")) {
+            // Get create arg if present
+            auto create_arg = comp["create_arg"].get<std::string>();
+            // Create function to include string_view argument
+            using function_ptr = std::shared_ptr<caddie::component> (*)(std::string_view);
+            auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
+            if (auto err = dlerror(); err != nullptr) {
+                std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+                return EXIT_FAILURE;
+            }
+            dlerror(); // clear existing
+            // Create a new component
+            comp_ptr = (*create_func)(create_arg);
+        } else {
+            // Empty create function
+            using function_ptr = std::shared_ptr<caddie::component> (*)();
+            auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
+            if (auto err = dlerror(); err != nullptr) {
+                std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+                return EXIT_FAILURE;
+            }
+            dlerror(); // clear existing
+            // Create a new component
+            comp_ptr = (*create_func)();
+        }
+        if (comp_ptr == nullptr) {
+            spdlog::error("failed to create component {}", name);
             return EXIT_FAILURE;
         }
-        dlerror(); // clear existing
-        // Create a new component
-        auto comp_ptr = (*create_func)();
-        // Set log level
-        comp_ptr->log_level(spdlog::level::from_str(level));
+        // Set id if needed
+        if (comp.contains("id")) {
+            comp_ptr->id(comp["id"].get<std::string>());
+        }
+        spdlog::trace("component {} created", comp_ptr->id());
         // Set application-level properties
+        spdlog::trace("setting app-level properties on {}", comp_ptr->id());
         for (const auto& prop : app_json["properties"]) {
             set_property(comp_ptr, prop);
         }
         // Set component-level properties
+        spdlog::trace("setting component-level properties on {}", comp_ptr->id());
         for (const auto& prop : comp["properties"]) {
             set_property(comp_ptr, prop);
         }
         // Add to application
+        spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
         app.add_component(comp_ptr);
-        // Close handle
-        dlclose(comp_handle);
+        // Store handle for closing later
+        comp_handles.emplace_back(std::move(comp_handle));
     }
 
     // Make connections
+    auto conn_exit = [&app](std::string_view msg) {
+        spdlog::error(msg);
+        app.clear();
+        return EXIT_FAILURE;
+    };
     for (const auto& conn : app_json["connections"]) {
+        if (!conn.contains("output")) {
+            return conn_exit(fmt::format("missing output for connection: {}", conn.dump()));
+        }
+        if (!conn.contains("input")) {
+            return conn_exit(fmt::format("missing output for connection: {}", conn.dump()));
+        }
         auto output = conn["output"];
         auto input = conn["input"];
+        if (!output.contains("component")) {
+            return conn_exit(fmt::format("missing component in connection output: {}", conn.dump()));
+        }
+        if (!output.contains("port")) {
+            return conn_exit(fmt::format("missing port in connection output: {}", conn.dump()));
+        }
+        if (!input.contains("component")) {
+            return conn_exit(fmt::format("missing component in connection input: {}", conn.dump()));
+        }
+        if (!input.contains("port")) {
+            return conn_exit(fmt::format("missing port in connection input: {}", conn.dump()));
+        }
         auto output_comp = output["component"].get<std::string>();
         auto output_port = output["port"].get<std::string>();
         auto input_comp = input["component"].get<std::string>();
         auto input_port = input["port"].get<std::string>();
         auto output_comp_ptr = app.get_component(output_comp);
+        if (output_comp_ptr == nullptr) {
+            return conn_exit(fmt::format("output component {} null during connection: {}", output_comp, conn.dump()));
+        }
         auto input_comp_ptr = app.get_component(input_comp);
+        if (input_comp_ptr == nullptr) {
+            return conn_exit(fmt::format("input component {} null during connection: {}", input_comp, conn.dump()));
+        }
+        spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
         if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-            spdlog::error("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
-            return EXIT_FAILURE;
+            return conn_exit(fmt::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
         }
     }
 
@@ -138,16 +205,24 @@ auto main(int argc, char** argv) -> int {
     });
 
     // Initialize the application
+    spdlog::trace("initializing application '{}'", app.name());
     app.initialize();
 
     // Start the application
+    spdlog::trace("starting application '{}'", app.name());
     app.start();
 
     // Wait for signal to stop
+    spdlog::trace("waiting for signal...");
     signal_future.wait();
 
     // Stop the application
+    spdlog::trace("stopping application '{}'", app.name());
     app.stop();
+
+    // Clean up the application resources
+    spdlog::trace("clearing application '{}'", app.name());
+    app.clear();
 
     return EXIT_SUCCESS;
 }

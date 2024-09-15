@@ -24,7 +24,8 @@ class component : public lifecycle {
 
 public:
     explicit component(std::string_view name) :
-      m_name(name) {
+      m_name(name),
+      m_id(m_name) {
         add_property("thread_delay", &m_delay);
     }
 
@@ -32,6 +33,14 @@ public:
 
     auto name() const noexcept -> std::string {
         return m_name;
+    }
+
+    auto id() const noexcept -> std::string {
+        return m_id;
+    }
+
+    auto id(std::string_view id) -> void {
+        m_id = id;
     }
 
     auto initialize() -> void override {
@@ -99,6 +108,7 @@ public:
 
 private:
     std::string m_name;
+    std::string m_id;
     std::jthread m_thread;
     std::chrono::nanoseconds m_delay{DEFAULT_DELAY};
     port_set m_port_set;

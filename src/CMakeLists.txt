@@ -11,9 +11,8 @@ target_include_directories(caddie-cli
 target_link_libraries(caddie-cli
     PRIVATE
     argparse
-    nlohmann_json::nlohmann_json
     fmt::fmt-header-only
+    nlohmann_json::nlohmann_json
     spdlog::spdlog_header_only
-    Threads::Threads
     dl
 )

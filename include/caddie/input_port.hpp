@@ -1,6 +1,7 @@
 #pragma once
 
 #include "port.hpp"
+#include "timestamp.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <mutex>
 #include <vector>
+#include <tuple>
 #include <typeinfo>
 
 namespace caddie {
@@ -18,10 +20,10 @@ class output_port;
 
 template <typename T>
 class input_port : public port {
-    static constexpr int WAIT_DURATION{3}; // seconds
+    static constexpr int WAIT_DURATION{2}; // seconds
 public:
     using value_type = T;
-    using transfer_type = std::unique_ptr<value_type>;
+    using buffer_type = std::unique_ptr<value_type>;
 
     explicit input_port(std::string_view name) : port(name) {}
 
@@ -53,7 +55,7 @@ public:
         return typeid(T).hash_code();
     }
 
-    auto get_data() -> transfer_type {
+    auto get_data() -> std::tuple<buffer_type, timestamp> {
         using namespace std::chrono_literals;
         auto lock = std::unique_lock{m_data_mtx};
         m_data_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty() || m_eos; });
@@ -62,7 +64,7 @@ public:
             m_queue.pop_front();
             return retval;
         }
-        return {nullptr};
+        return {};
     }
 
     auto eos() const noexcept -> bool {
@@ -72,7 +74,7 @@ public:
 private:
     friend class output_port<T>;
 
-    auto add_data(transfer_type data) -> void {
+    auto add_data(std::tuple<buffer_type, timestamp>&& data) -> void {
         const auto lock = std::scoped_lock{m_data_mtx};
         if (m_queue.size() < m_depth) {
             m_queue.emplace_back(std::move(data));
@@ -84,7 +86,7 @@ private:
         m_eos = value;
     }
 
-    std::deque<transfer_type> m_queue;
+    std::deque<std::tuple<buffer_type, timestamp>> m_queue;
     std::size_t m_depth{std::numeric_limits<std::size_t>::max()};
     std::mutex m_data_mtx;
     std::condition_variable m_data_cv;
