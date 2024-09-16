@@ -21,8 +21,8 @@
 
 #include "port.hpp"
 #include "input_port.hpp"
-#include "timestamp.hpp"
 
+#include <chrono>
 #include <ranges>
 #include <string_view>
 #include <typeinfo>
@@ -34,6 +34,7 @@ class output_port : public port {
 public:
     using value_type = T;
     using buffer_type = std::unique_ptr<value_type>;
+    using timestamp_type = std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>;
 
     explicit output_port(std::string_view name) : port(name) {}
 
@@ -41,7 +42,7 @@ public:
         return typeid(T).hash_code();
     }
 
-    auto send_data(buffer_type data, timestamp ts) -> void {
+    auto send_data(buffer_type data, timestamp_type ts) -> void {
         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
             if (auto port = m_connected_ports.at(i); port != nullptr) {
                 if (i == m_connected_ports.size() - 1) {
