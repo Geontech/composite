@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace caddie {
+namespace composite {
 
 class application : public lifecycle {
 public:
@@ -63,4 +63,4 @@ private:
 
 }; // class application
 
-} // namespace caddie
+} // namespace composite

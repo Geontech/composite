@@ -1,8 +1,8 @@
-add_library(caddie INTERFACE)
-add_library(caddie::caddie ALIAS caddie)
-target_compile_features(caddie INTERFACE cxx_std_20)
+add_library(composite INTERFACE)
+add_library(composite::composite ALIAS composite)
+target_compile_features(composite INTERFACE cxx_std_20)
 target_include_directories(
-    caddie
+    composite
     INTERFACE
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>

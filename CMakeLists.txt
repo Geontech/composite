@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(caddie VERSION 0.1.0 LANGUAGES CXX)
+project(composite VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 # Set the C++ version required
 set(CMAKE_CXX_STANDARD 20)
@@ -12,14 +12,14 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Check if being used directly or via add_subdirectory, but allow overriding
-if(NOT DEFINED CADDIE_MASTER_PROJECT)
+if(NOT DEFINED COMPOSITE_MASTER_PROJECT)
     if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-        set(CADDIE_MASTER_PROJECT ON)
+        set(COMPOSITE_MASTER_PROJECT ON)
     else()
-        set(CADDIE_MASTER_PROJECT OFF)
+        set(COMPOSITE_MASTER_PROJECT OFF)
     endif()
 endif()
-option(CADDIE_INSTALL "Generate the install target" ${CADDIE_MASTER_PROJECT})
+option(COMPOSITE_INSTALL "Generate the install target" ${COMPOSITE_MASTER_PROJECT})
 
 # Use FetchContent for dependencies
 include(FetchContent)
@@ -47,11 +47,11 @@ set(FMT_INSTALL OFF)
 # Make all deps available
 FetchContent_MakeAvailable(argparse fmt json spdlog)
 
-configure_file(include/version.hpp.in include/caddie/version.hpp)
+configure_file(include/version.hpp.in include/composite/version.hpp)
 
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
-    "caddieConfigVersion.cmake"
+    "compositeConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMinorVersion
 )
@@ -59,53 +59,53 @@ if(NOT INCLUDE_INSTALL_DIR)
     set(INCLUDE_INSTALL_DIR include)
 endif()
 configure_package_config_file(
-    "${PROJECT_SOURCE_DIR}/cmake/caddieConfig.cmake.in"
-    "${PROJECT_BINARY_DIR}/caddieConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/caddie/cmake
+    "${PROJECT_SOURCE_DIR}/cmake/compositeConfig.cmake.in"
+    "${PROJECT_BINARY_DIR}/compositeConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/composite/cmake
     PATH_VARS INCLUDE_INSTALL_DIR
 )
 
 # Create a pkg-config file, so other tools can find this.
 CONFIGURE_FILE(
-    "${PROJECT_SOURCE_DIR}/cmake/caddie.pc.in"
-    "${PROJECT_BINARY_DIR}/caddie.pc"
+    "${PROJECT_SOURCE_DIR}/cmake/composite.pc.in"
+    "${PROJECT_BINARY_DIR}/composite.pc"
 )
 
 add_subdirectory(include)
 add_subdirectory(src)
 
 # Install
-if(CADDIE_INSTALL)
+if(COMPOSITE_INSTALL)
     install(
-        DIRECTORY $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/caddie>
+        DIRECTORY $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/composite>
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
     install(
-        FILES $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include/caddie>
+        FILES $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include/composite>
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
     install(
         FILES
-        "${PROJECT_BINARY_DIR}/caddieConfig.cmake"
-        "${PROJECT_BINARY_DIR}/caddieConfigVersion.cmake"
-        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/caddie/cmake
+        "${PROJECT_BINARY_DIR}/compositeConfig.cmake"
+        "${PROJECT_BINARY_DIR}/compositeConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/composite/cmake
     )
     install(
-        TARGETS caddie
-        EXPORT caddie_Targets
+        TARGETS composite
+        EXPORT composite_Targets
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
     install(
-        EXPORT caddie_Targets
-        FILE caddieTargets.cmake
-        NAMESPACE caddie::
-        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/caddie/cmake
+        EXPORT composite_Targets
+        FILE compositeTargets.cmake
+        NAMESPACE composite::
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/composite/cmake
     )
     install(
-        FILES "${PROJECT_BINARY_DIR}/caddie.pc"
+        FILES "${PROJECT_BINARY_DIR}/composite.pc"
         DESTINATION ${CMAKE_INSTALL_DATADIR}/pkgconfig
     )
-    install(TARGETS caddie-cli
+    install(TARGETS composite-cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
-endif(CADDIE_INSTALL)
+endif(COMPOSITE_INSTALL)

@@ -2,7 +2,7 @@
 
 #include <string>
 
-namespace caddie {
+namespace composite {
 
 class port {
 public:
@@ -27,4 +27,4 @@ private:
 
 }; // class port
 
-} // namespace caddie
+} // namespace composite

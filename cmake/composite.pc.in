@@ -1,0 +1,5 @@
+Name: composite
+Description: Composite processing framework
+URL: https://github.com/geontech/composite
+Version: ${PROJECT_VERSION}
+CFlags: -I${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}

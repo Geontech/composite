@@ -1,6 +1,6 @@
 #pragma once
 
-namespace caddie {
+namespace composite {
 
 class lifecycle {
 public:
@@ -11,4 +11,4 @@ public:
 
 }; // class lifecycle
 
-} // namespace caddie
+} // namespace composite

@@ -10,7 +10,7 @@
 #include <string_view>
 #include <thread>
 
-namespace caddie {
+namespace composite {
 
 enum class retval : int {
     NORMAL,
@@ -129,4 +129,4 @@ private:
 
 }; // class component
 
-} // namespace caddie
+} // namespace composite

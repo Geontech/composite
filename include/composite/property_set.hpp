@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-namespace caddie {
+namespace composite {
 
 class property_set {
 public:
@@ -32,4 +32,4 @@ private:
 
 }; // class property_set
 
-} // namespace caddie
+} // namespace composite

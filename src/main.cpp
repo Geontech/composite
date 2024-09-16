@@ -1,5 +1,5 @@
-#include "caddie/application.hpp"
-#include "caddie/version.hpp"
+#include "composite/application.hpp"
+#include "composite/version.hpp"
 
 #include <argparse/argparse.hpp>
 #include <atomic>
@@ -14,7 +14,7 @@
 #include <spdlog/spdlog.h>
 #include <vector>
 
-auto set_property(std::shared_ptr<caddie::component> comp, const nlohmann::json& prop) {
+auto set_property(std::shared_ptr<composite::component> comp, const nlohmann::json& prop) {
     auto type = prop["type"].get<std::string>();
     auto name = prop["name"].get<std::string>();
     auto value = prop["value"];
@@ -39,7 +39,7 @@ auto set_property(std::shared_ptr<caddie::component> comp, const nlohmann::json&
 
 auto main(int argc, char** argv) -> int {
     // Create argument parser with options
-    auto program = argparse::ArgumentParser{"caddie-cli", VERSION};
+    auto program = argparse::ArgumentParser{"composite-cli", VERSION};
     program.add_argument("-c", "--config")
         .help("application configuration file")
         .required();
@@ -74,7 +74,7 @@ auto main(int argc, char** argv) -> int {
 
     // Create a new application object
     auto app_name = app_json["name"].get<std::string>();
-    auto app = caddie::application{app_name};
+    auto app = composite::application{app_name};
 
     // Get components and load them
     for (const auto& comp : app_json["components"]) {
@@ -91,13 +91,13 @@ auto main(int argc, char** argv) -> int {
         }
         dlerror(); // clear existing
         // Component shared_ptr
-        auto comp_ptr = std::shared_ptr<caddie::component>{nullptr};
+        auto comp_ptr = std::shared_ptr<composite::component>{nullptr};
         // Get the create function
         if (comp.contains("create_arg")) {
             // Get create arg if present
             auto create_arg = comp["create_arg"].get<std::string>();
             // Create function to include string_view argument
-            using function_ptr = std::shared_ptr<caddie::component> (*)(std::string_view);
+            using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view);
             auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
             if (auto err = dlerror(); err != nullptr) {
                 std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
@@ -108,7 +108,7 @@ auto main(int argc, char** argv) -> int {
             comp_ptr = (*create_func)(create_arg);
         } else {
             // Empty create function
-            using function_ptr = std::shared_ptr<caddie::component> (*)();
+            using function_ptr = std::shared_ptr<composite::component> (*)();
             auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
             if (auto err = dlerror(); err != nullptr) {
                 std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);

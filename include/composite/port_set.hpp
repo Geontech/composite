@@ -5,7 +5,7 @@
 #include <map>
 #include <string>
 
-namespace caddie {
+namespace composite {
 
 class port_set {
     using port_map_t = std::map<std::string, port*>;
@@ -26,4 +26,4 @@ private:
 
 }; // class port_set
 
-} // namespace caddie
+} // namespace composite

@@ -8,7 +8,7 @@
 #include <string_view>
 #include <typeinfo>
 
-namespace caddie {
+namespace composite {
 
 template <typename T>
 class output_port : public port {
@@ -62,4 +62,4 @@ private:
 
 }; // class output_port
 
-} // namespace caddie
+} // namespace composite
