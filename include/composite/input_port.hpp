@@ -13,7 +13,7 @@
 #include <tuple>
 #include <typeinfo>
 
-namespace caddie {
+namespace composite {
 
 template <typename T>
 class output_port;
@@ -94,4 +94,4 @@ private:
 
 }; // class input_port
 
-} // namespace caddie
+} // namespace composite

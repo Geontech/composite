@@ -2,11 +2,11 @@
 
 #include <cstdint>
 
-namespace caddie {
+namespace composite {
 
 struct timestamp {
     uint32_t sec{};
     uint64_t psec{};
 }; // struct timestamp
 
-} // namespace caddie
+} // namespace composite
