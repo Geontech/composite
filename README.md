@@ -1,5 +1,7 @@
 # composite
 
+composite is a lightweight framework for building componentized streaming applications.
+
 ### Build and Install
 
 ```cmake
