@@ -20,6 +20,7 @@
 #pragma once
 
 #include "port.hpp"
+#include "timestamp.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -27,9 +28,9 @@
 #include <deque>
 #include <limits>
 #include <mutex>
-#include <vector>
 #include <tuple>
 #include <typeinfo>
+#include <vector>
 
 namespace composite {
 
@@ -42,7 +43,7 @@ class input_port : public port {
 public:
     using value_type = T;
     using buffer_type = std::unique_ptr<value_type>;
-    using timestamp_type = std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>;
+    using timestamp_type = timestamp;
 
     explicit input_port(std::string_view name) : port(name) {}
 

@@ -21,8 +21,8 @@
 
 #include "port.hpp"
 #include "input_port.hpp"
+#include "timestamp.hpp"
 
-#include <chrono>
 #include <ranges>
 #include <string_view>
 #include <typeinfo>
@@ -34,7 +34,7 @@ class output_port : public port {
 public:
     using value_type = T;
     using buffer_type = std::unique_ptr<value_type>;
-    using timestamp_type = std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>;
+    using timestamp_type = timestamp;
 
     explicit output_port(std::string_view name) : port(name) {}
 
