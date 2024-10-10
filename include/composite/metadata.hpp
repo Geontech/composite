@@ -21,6 +21,7 @@
 
 #include <bit>
 #include <cstdint>
+#include <map>
 #include <string>
 
 namespace composite {
@@ -44,6 +45,7 @@ class metadata {
 public:
     data_format format;
     float sample_rate{};
+    std::map<std::string, std::string> tags;
 
 }; // class metadata
 
