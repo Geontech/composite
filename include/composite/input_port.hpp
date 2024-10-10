@@ -99,7 +99,7 @@ private:
     auto add_data(buffer_type data, timestamp ts) -> void {
         const auto lock = std::scoped_lock{m_data_mtx};
         if (m_queue.size() < m_depth) {
-            m_queue.emplace_back({std::move(data), ts, m_metadata});
+            m_queue.emplace_back(std::make_tuple(std::move(data), ts, m_metadata));
             m_metadata.reset();
             m_data_cv.notify_one();
         }

@@ -47,14 +47,14 @@ public:
                 if constexpr (traits::is_unique_ptr_v<T>) {
                     if (i == m_connected_ports.size() - 1) {
                         // last port, move incoming
-                        port->add_data({std::move(data), ts});
+                        port->add_data(std::move(data), ts);
                     } else {
                         // make a copy of the incoming data
                         auto data_copy = std::make_unique<value_type>(*data);
-                        port->add_data({std::move(data_copy), ts});
+                        port->add_data(std::move(data_copy), ts);
                     }
                 } else { // shared_ptr
-                    port->add_data({data, ts});
+                    port->add_data(data, ts);
                 }
             }
         }
