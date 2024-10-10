@@ -34,15 +34,15 @@
 
 namespace composite {
 
-template <typename T>
+template <traits::smart_ptr T>
 class output_port;
 
-template <typename T>
+template <traits::smart_ptr T>
 class input_port : public port {
     static constexpr int WAIT_DURATION{2}; // seconds
 public:
-    using value_type = T;
-    using buffer_type = std::unique_ptr<value_type>;
+    using value_type = typename T::element_type;
+    using buffer_type = T;
     using timestamp_type = timestamp;
 
     explicit input_port(std::string_view name) : port(name) {}

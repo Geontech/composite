@@ -29,11 +29,11 @@
 
 namespace composite {
 
-template <typename T>
+template <traits::smart_ptr T>
 class output_port : public port {
 public:
-    using value_type = T;
-    using buffer_type = std::unique_ptr<value_type>;
+    using value_type = typename T::element_type;
+    using buffer_type = T;
     using timestamp_type = timestamp;
 
     explicit output_port(std::string_view name) : port(name) {}
@@ -45,13 +45,17 @@ public:
     auto send_data(buffer_type data, timestamp_type ts) -> void {
         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
             if (auto port = m_connected_ports.at(i); port != nullptr) {
-                if (i == m_connected_ports.size() - 1) {
-                    // last port, move incoming
-                    port->add_data({std::move(data), ts});
-                } else {
-                    // make a copy of the incoming data
-                    auto data_copy = std::make_unique<value_type>(*data);
-                    port->add_data({std::move(data_copy), ts});
+                if constexpr (traits::is_unique_ptr_v<T>) {
+                    if (i == m_connected_ports.size() - 1) {
+                        // last port, move incoming
+                        port->add_data({std::move(data), ts});
+                    } else {
+                        // make a copy of the incoming data
+                        auto data_copy = std::make_unique<value_type>(*data);
+                        port->add_data({std::move(data_copy), ts});
+                    }
+                } else { // shared_ptr
+                    port->add_data({data, ts});
                 }
             }
         }
