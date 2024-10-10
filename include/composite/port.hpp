@@ -19,9 +19,29 @@
  
 #pragma once
 
+#include <concepts>
+#include <memory>
 #include <string>
 
 namespace composite {
+
+namespace traits {
+
+// shared_ptr
+template<typename T> struct is_shared_ptr : std::false_type {};
+template<typename T> struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {};
+template<typename T> constexpr bool is_shared_ptr_v = is_shared_ptr<T>::value;
+
+// unique_ptr
+template<typename T> struct is_unique_ptr : std::false_type {};
+template<typename T> struct is_unique_ptr<std::unique_ptr<T>> : std::true_type {};
+template<typename T> constexpr bool is_unique_ptr_v = is_unique_ptr<T>::value;
+
+// concept for port types
+template<typename T> concept smart_ptr = is_shared_ptr_v<T> || is_unique_ptr_v<T>;
+
+} // namespace traits
+    
 
 class port {
 public:
