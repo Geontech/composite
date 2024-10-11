@@ -42,6 +42,11 @@ class component : public lifecycle {
     static constexpr int DEFAULT_DELAY{1000000};
 
 public:
+    struct connection {
+        std::pair<std::string, std::string> output;
+        std::pair<std::string, std::string> input;
+    };
+
     explicit component(std::string_view name) :
       m_name(name),
       m_id(m_name) {
@@ -87,6 +92,10 @@ public:
         return m_port_set.get_port(name);
     }
 
+    auto ports() const -> const std::map<std::string, port*>& {
+        return m_port_set.ports();
+    }
+
     auto connect(
       std::string_view output_port_name,
       component* other,
@@ -107,7 +116,15 @@ public:
             return false;
         }
         out_port->connect(in_port);
+        m_connections.push_back({
+            .output = std::make_pair(id(), std::string{output_port_name}),
+            .input = std::make_pair(other->id(), std::string{input_port_name})
+        });
         return true;
+    }
+
+    auto connections() const -> const std::vector<connection>& {
+        return m_connections;
     }
 
     template <typename T>
@@ -125,6 +142,10 @@ public:
         return m_prop_set.get_property<T>(name);
     }
 
+    auto properties() const -> const std::map<std::string, std::pair<std::string, std::any>>& {
+        return m_prop_set.properties();
+    }
+
 private:
     std::string m_name;
     std::string m_id;
@@ -132,6 +153,7 @@ private:
     std::chrono::nanoseconds m_delay{DEFAULT_DELAY};
     port_set m_port_set;
     property_set m_prop_set;
+    std::vector<connection> m_connections;
 
     auto thread_func(std::stop_token token) -> void {
         while (!token.stop_requested()) {

@@ -20,6 +20,7 @@
 # Executable
 add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
 )
 # Includes
 target_include_directories(composite-cli
@@ -33,5 +34,6 @@ target_link_libraries(composite-cli
     fmt::fmt-header-only
     nlohmann_json::nlohmann_json
     spdlog::spdlog_header_only
+    httplib::httplib
     dl
 )

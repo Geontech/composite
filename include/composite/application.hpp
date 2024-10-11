@@ -72,6 +72,10 @@ public:
         return nullptr;
     }
 
+    auto components() const -> const std::vector<component_ptr>& {
+        return m_components;
+    }
+
     auto clear() -> void {
         m_components.clear();
     }

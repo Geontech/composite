@@ -19,6 +19,7 @@
  
 #include "composite/application.hpp"
 #include "composite/version.hpp"
+// #include "server.hpp"
 
 #include <argparse/argparse.hpp>
 #include <atomic>
@@ -28,10 +29,17 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <httplib.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <vector>
+
+namespace composite {
+
+auto make_server(const application& app) -> std::unique_ptr<httplib::Server>;
+
+} // namespace composite
 
 auto set_property(std::shared_ptr<composite::component> comp, const nlohmann::json& prop) {
     auto type = prop["type"].get<std::string>();
@@ -60,8 +68,15 @@ auto main(int argc, char** argv) -> int {
     // Create argument parser with options
     auto program = argparse::ArgumentParser{"composite-cli", VERSION};
     program.add_argument("-c", "--config")
-        .help("application configuration file")
-        .required();
+      .help("application configuration file")
+      .required();
+    program.add_argument("-s", "--server")
+      .help("REST server address")
+      .default_value(std::string{"localhost"});
+    program.add_argument("-p", "--port")
+      .help("REST server port")
+      .scan<'i', int>()
+      .default_value(5000);
     program.add_argument("-l", "--log-level")
       .help("log level [trace, debug, info, warning, error, critical, off]")
       .default_value(std::string{"info"});
@@ -208,6 +223,11 @@ auto main(int argc, char** argv) -> int {
         }
     }
 
+    // Create REST server for c&c
+    auto server_addr = program.get<std::string>("--server");
+    auto server_port = program.get<int>("--port");
+    auto server = composite::make_server(app);
+
     // Setup signal handlers
     auto signals = std::vector<int>{SIGINT, SIGKILL};
     auto sigset = sigset_t{};
@@ -216,10 +236,11 @@ auto main(int argc, char** argv) -> int {
         sigaddset(&sigset, sig);
     }
     pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
-    auto signal_future = std::async(std::launch::async, [&sigset]() {
+    auto signal_future = std::async(std::launch::async, [&sigset, &server]() {
         auto signum = int{};
         sigwait(&sigset, &signum);
         printf("\r  \r");
+        server->stop();
         return signum;
     });
 
@@ -230,6 +251,10 @@ auto main(int argc, char** argv) -> int {
     // Start the application
     spdlog::trace("starting application '{}'", app.name());
     app.start();
+
+    // Start 
+    spdlog::trace("listening at {}:{}", server_addr, server_port);
+    server->listen(server_addr, server_port);
 
     // Wait for signal to stop
     spdlog::trace("waiting for signal...");

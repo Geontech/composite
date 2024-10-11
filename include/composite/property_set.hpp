@@ -30,24 +30,28 @@ class property_set {
 public:
     template <typename T>
     auto add_property(std::string_view name, T* prop) -> void {
-        m_properties.try_emplace(std::string{name}, prop);
+        m_properties.try_emplace(std::string{name}, std::make_pair(typeid(T).name(), prop));
     }
 
     template <typename T>
     auto set_property(std::string_view name, T value) -> void {
         if (m_properties.contains(std::string{name})) {
-            *(*std::any_cast<T*>(&(m_properties.at(std::string{name})))) = value;
+            *(*std::any_cast<T*>(&(m_properties.at(std::string{name}).second))) = value;
         }
     }
 
     template <typename T>
     auto get_property(std::string_view name) const -> T
     {
-        return *std::any_cast<T*>(m_properties.at(std::string{name}));
+        return *std::any_cast<T*>(m_properties.at(std::string{name}).second);
+    }
+
+    auto properties() const -> const std::map<std::string, std::pair<std::string, std::any>>& {
+        return m_properties;
     }
 
 private:
-    std::map<std::string, std::any> m_properties;
+    std::map<std::string, std::pair<std::string, std::any>> m_properties;
 
 }; // class property_set
 

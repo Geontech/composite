@@ -40,6 +40,10 @@ public:
         return nullptr;
     }
 
+    auto ports() const -> const port_map_t& {
+        return m_ports;
+    }
+
 private:
     port_map_t m_ports;
 

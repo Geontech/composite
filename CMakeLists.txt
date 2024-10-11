@@ -62,9 +62,15 @@ FetchContent_Declare(spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG v1.14.1
 )
+# httplib dependency
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.18.0
+)
 set(FMT_INSTALL OFF)
+set(HTTPLIB_INSTALL OFF)
 # Make all deps available
-FetchContent_MakeAvailable(argparse fmt json spdlog)
+FetchContent_MakeAvailable(argparse fmt json spdlog httplib)
 
 configure_file(include/version.hpp.in include/composite/version.hpp)
 
