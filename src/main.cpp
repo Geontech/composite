@@ -19,7 +19,6 @@
  
 #include "composite/application.hpp"
 #include "composite/version.hpp"
-// #include "server.hpp"
 
 #include <argparse/argparse.hpp>
 #include <atomic>
