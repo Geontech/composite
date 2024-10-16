@@ -56,6 +56,7 @@ public:
     }
 
     virtual auto type_id() const noexcept -> std::size_t = 0;
+    virtual auto is_unique_type() const noexcept -> bool;
 
     virtual auto connect(port* port) -> void {
         // to be implemented by derived class
