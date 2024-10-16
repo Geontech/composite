@@ -23,8 +23,10 @@
 #include "input_port.hpp"
 #include "timestamp.hpp"
 
+#include <algorithm>
 #include <ranges>
 #include <string_view>
+#include <thread>
 #include <typeinfo>
 
 namespace composite {
@@ -38,31 +40,50 @@ public:
 
     explicit output_port(std::string_view name) : port(name) {}
 
+    ~output_port() override {
+        m_thread.request_stop();
+        if (m_thread.joinable()) {
+            m_thread.join();
+        }
+    }
+
     auto type_id() const noexcept -> std::size_t override {
         return typeid(T).hash_code();
     }
 
     auto send_data(buffer_type data, timestamp_type ts) -> void {
-        for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
-            if (auto port = m_connected_ports.at(i); port != nullptr) {
-                if constexpr (traits::is_unique_ptr_v<T>) {
-                    if (i == m_connected_ports.size() - 1) {
-                        // last port, move incoming
-                        port->add_data({std::move(data), ts});
-                    } else {
-                        // make a copy of the incoming data
-                        auto data_copy = std::make_unique<value_type>(*data);
-                        port->add_data({std::move(data_copy), ts});
-                    }
-                } else { // shared_ptr
-                    port->add_data({data, ts});
-                }
+        if (m_thread.joinable()) {
+            const auto lock = std::scoped_lock{m_data_mtx};
+            if (m_queue.size() < m_depth) {
+                m_queue.emplace_back({std::move(data), ts});
+                m_data_cv.notify_one();
             }
+        } else if constexpr (traits::is_unique_ptr_v<T>) {
+            port->add_data({std::move(data), ts});
+        } else { // shared_ptr
+            port->add_data({data, ts});
         }
     }
 
     auto connect(port* port) -> void override {
         m_connected_ports.emplace_back(static_cast<input_port<T>*>(port));
+        // start thread if required
+        auto start_thread = false;
+        if (m_connected_ports.size() > 1) {
+            auto unique_count = size_t{};
+            for (auto& p : m_connected_ports) {
+                if (p->type_id().hash_code() == typeid(std::unique_ptr<value_type>.hash_code())) {
+                    ++unique_count;
+                }
+            }
+            // if any unique ports, start thread
+            if (unique_count > 0) {
+                start_thread = true;
+            }
+        }
+        if (start_thread && !m_thread.joinable()) {
+            m_thread = std::jthread(&component::thread_func, this);
+        }
     }
 
     auto disconnect() -> void {
@@ -83,6 +104,39 @@ public:
 
 private:
     std::vector<input_port<T>*> m_connected_ports;
+    std::jthread m_thread;
+    std::deque<std::tuple<buffer_type, timestamp_type>> m_queue;
+    std::mutex m_data_mtx;
+    std::condition_variable m_data_cv;
+
+    auto thread_func(std::stop_token token) -> void {
+        while (!token.stop_requested()) {
+            using namespace std::chrono_literals;
+            auto lock = std::unique_lock{m_data_mtx};
+            m_data_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty(); });
+            if (!m_queue.empty()) {
+                auto data = std::move(m_queue.front());
+                m_queue.pop_front();
+            }
+        }
+
+        for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
+            if (auto port = m_connected_ports.at(i); port != nullptr) {
+                if constexpr (traits::is_unique_ptr_v<T>) {
+                    if (i == m_connected_ports.size() - 1) {
+                        // last port, move incoming
+                        port->add_data({std::move(data), ts});
+                    } else {
+                        // make a copy of the incoming data
+                        auto data_copy = std::make_unique<value_type>(*data);
+                        port->add_data({std::move(data_copy), ts});
+                    }
+                } else { // shared_ptr
+                    port->add_data({data, ts});
+                }
+            }
+        }
+    }
 
 }; // class output_port
 

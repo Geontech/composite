@@ -27,8 +27,9 @@
 namespace composite {
 
 class port_set {
-    using port_map_t = std::map<std::string, port*>;
 public:
+    using port_map_type = std::map<std::string, port*>;
+
     auto add_port(port* port) -> void {
         m_ports.try_emplace(port->name(), port);
     }
@@ -41,7 +42,7 @@ public:
     }
 
 private:
-    port_map_t m_ports;
+    port_map_type m_ports;
 
 }; // class port_set
 
