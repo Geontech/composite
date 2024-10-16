@@ -45,9 +45,7 @@ template<typename T> concept smart_ptr = is_shared_ptr_v<T> || is_unique_ptr_v<T
 
 class port {
 public:
-    explicit port(std::string_view name) :
-      m_name(name) {
-    }
+    explicit port(std::string_view name) : m_name(name) {}
 
     virtual ~port() = default;
 
@@ -56,7 +54,7 @@ public:
     }
 
     virtual auto type_id() const noexcept -> std::size_t = 0;
-    virtual auto is_unique_type() const noexcept -> bool;
+    virtual auto is_unique_type() const noexcept -> bool = 0;
 
     virtual auto connect(port* port) -> void {
         // to be implemented by derived class

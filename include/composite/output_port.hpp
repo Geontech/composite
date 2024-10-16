@@ -58,7 +58,7 @@ public:
     auto send_data(buffer_type data, timestamp_type ts) -> void {
         if (m_thread.joinable()) {
             const auto lock = std::scoped_lock{m_data_mtx};
-            m_queue.emplace_back({std::move(data), ts});
+            m_queue.emplace_back(std::make_tuple(std::move(data), ts));
             m_data_cv.notify_one();
         } else if constexpr (traits::is_unique_ptr_v<T>) {
             if (m_connected_ports.size() == 1) {
@@ -66,9 +66,9 @@ public:
                     if (dst_port->is_unique_type()) { // u -> u
                         auto dst = static_cast<input_port<T>*>(dst_port);
                         dst->add_data({std::move(data), ts});
-                    } else { // u-> s
+                    } else { // u -> s
                         auto dst = static_cast<input_port<std::shared_ptr<value_type>>*>(dst_port);
-                        dst->add_data({{data.release()}, ts});
+                        dst->add_data({std::shared_ptr<value_type>{data.release()}, ts});
                     }
                 }
             } else { // u -> s,s,...
@@ -79,24 +79,12 @@ public:
                         dst->add_data({shared_data, ts});
                     }
                 }
-            } 
-        } else { // shared_ptr
-            if (m_connected_ports.size() == 1) {
-                if (auto dst_port = m_connected_ports.front(); dst_port != nullptr) {
-                    if (dst_port->is_unique_type()) { // s -> u
-                        auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(dst_port);
-                        dst->add_data({{data.release()}, ts});
-                    } else { // s -> s
-                        auto dst = static_cast<input_port<T>*>(dst_port);
-                        dst->add_data({data, ts});
-                    }
-                }
-            } else { // s -> s,s,...
-                for (auto& port : m_connected_ports) {
-                    if (port != nullptr) {
-                        auto dst = static_cast<input_port<T>*>(port);
-                        dst->add_data({data, ts});
-                    }
+            }
+        } else { // shared_ptr; s -> s || s -> s,s,...
+            for (auto& port : m_connected_ports) {
+                if (port != nullptr) {
+                    auto dst = static_cast<input_port<T>*>(port);
+                    dst->add_data({data, ts});
                 }
             }
         }
@@ -105,11 +93,13 @@ public:
     auto connect(port* port) -> void override {
         m_connected_ports.emplace_back(port);
         // sort with unique_ptr ports at the back
-        std::ranges::sort(m_connected_ports, [](const composite::port* a, const composite::port* b) { 
+        std::ranges::sort(m_connected_ports, [](const auto a, const auto b) { 
             return (!a->is_unique_type() && b->is_unique_type());
         });
         // start thread if required
-        if ((m_connected_ports.size() > 1) && (m_connected_ports.back()->is_unique_type()) && !m_thread.joinable()) {
+        auto thread_required = (traits::is_shared_ptr_v<T> && port->is_unique_type()) ||
+          (m_connected_ports.size() > 1 && port->is_unique_type());
+        if (thread_required && !m_thread.joinable()) {
             m_thread = std::jthread(&output_port::thread_func, this);
         }
     }
@@ -155,10 +145,13 @@ private:
                 m_queue.pop_front();
                 lock.unlock();
                 // Determine structure of fan-out
-                auto front = m_connected_ports.front();
-                auto back = m_connected_ports.back();
-                auto all_unique = (front->is_unique_type() && back->is_unique_type());
-                auto all_shared = (!front->is_unique_type() && !back->is_unique_type());
+                auto all_unique = true;
+                for (const auto port : m_connected_ports) {
+                    if (port != nullptr && !port->is_unique_type()) {
+                        all_unique = false;
+                        break;
+                    }
+                }
                 // What type am I?
                 if constexpr (traits::is_unique_ptr_v<T>) {
                     if (all_unique) { // u -> u,u,...
@@ -176,21 +169,17 @@ private:
                             }
                         }
                     } else { // u -> s,...,u,...
-                        auto shared_data = std::shared_ptr<value_type>{data.release()};
-                        auto unique_data = std::unique_ptr<value_type>{};
+                        auto shared_data = std::make_shared<value_type>(*data);
                         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
                             if (auto port = m_connected_ports.at(i); port != nullptr) {
                                 if (port->is_unique_type()) {
-                                    if (unique_data == nullptr) {
-                                        unique_data = std::unique_ptr<value_type>{*shared_data};
-                                    }
                                     auto dst = static_cast<input_port<T>*>(port);
                                     if (i == m_connected_ports.size() - 1) {
                                         // last port, move incoming
-                                        dst->add_data({std::move(unique_data), ts});
+                                        dst->add_data({std::move(data), ts});
                                     } else {
                                         // make a copy of the incoming data
-                                        auto data_copy = std::make_unique<value_type>(*unique_data);
+                                        auto data_copy = std::make_unique<value_type>(*data);
                                         dst->add_data({std::move(data_copy), ts});
                                     }
                                 } else { // shared_ptr
@@ -201,9 +190,8 @@ private:
                         }
                     }
                 } else { // shared_ptr
-                    auto unique_data = std::unique_ptr<value_type>{};
-                    if (all_unique) { // s -> u,u,...
-                        unique_data = std::unique_ptr<value_type>{data.release()};
+                    auto unique_data = std::make_unique<value_type>(*data);
+                    if (all_unique) { // s -> u || s -> u,u,...
                         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
                             if (auto port = m_connected_ports.at(i); port != nullptr) {
                                 auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
@@ -221,9 +209,6 @@ private:
                         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
                             if (auto port = m_connected_ports.at(i); port != nullptr) {
                                 if (port->is_unique_type()) {
-                                    if (unique_data == nullptr) {
-                                        unique_data = std::unique_ptr<value_type>{data.release()};
-                                    }
                                     auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
                                     if (i == m_connected_ports.size() - 1) {
                                         // last port, move incoming
@@ -236,15 +221,6 @@ private:
                                 } else { // shared_ptr
                                     auto dst = static_cast<input_port<T>*>(port);
                                     dst->add_data({data, ts});
-                                }
-                                auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
-                                if (i == m_connected_ports.size() - 1) {
-                                    // last port, move incoming
-                                    dst->add_data({std::move(unique_data), ts});
-                                } else {
-                                    // make a copy of the incoming data
-                                    auto data_copy = std::make_unique<value_type>(*unique_data);
-                                    dst->add_data({std::move(data_copy), ts});
                                 }
                             }
                         }
