@@ -142,7 +142,7 @@ public:
         return m_prop_set.get_property<T>(name);
     }
 
-    auto properties() const -> const std::map<std::string, std::pair<std::string, std::any>>& {
+    auto properties() const -> const typename property_set::property_map_type& {
         return m_prop_set.properties();
     }
 
@@ -156,13 +156,14 @@ private:
     std::vector<connection> m_connections;
 
     auto thread_func(std::stop_token token) -> void {
+        using enum retval;
         while (!token.stop_requested()) {
             auto res = process();
-            if (res == retval::NOOP) {
+            if (res == NOOP) {
                 std::this_thread::sleep_for(m_delay);
-            } else if (res == retval::FINISH) {
+            } else if (res == FINISH) {
                 break;
-            } else if (res == retval::NORMAL) {
+            } else if (res == NORMAL) {
                 std::this_thread::yield();
             }
         }
