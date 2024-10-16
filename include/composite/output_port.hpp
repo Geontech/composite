@@ -152,22 +152,10 @@ private:
                         break;
                     }
                 }
-                // What type am I?
+                // Use output_port type to determine how data needs to be copied/moved
                 if constexpr (traits::is_unique_ptr_v<T>) {
                     if (all_unique) { // u -> u,u,...
-                        for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
-                            if (auto port = m_connected_ports.at(i); port != nullptr) {
-                                auto dst = static_cast<input_port<T>*>(port);
-                                if (i == m_connected_ports.size() - 1) {
-                                    // last port, move incoming
-                                    dst->add_data({std::move(data), ts});
-                                } else {
-                                    // make a copy of the incoming data
-                                    auto data_copy = std::make_unique<value_type>(*data);
-                                    dst->add_data({std::move(data_copy), ts});
-                                }
-                            }
-                        }
+                        send_all_unique({std::move(data), ts});
                     } else { // u -> s,...,u,...
                         auto shared_data = std::make_shared<value_type>(*data);
                         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
@@ -192,19 +180,7 @@ private:
                 } else { // shared_ptr
                     auto unique_data = std::make_unique<value_type>(*data);
                     if (all_unique) { // s -> u || s -> u,u,...
-                        for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
-                            if (auto port = m_connected_ports.at(i); port != nullptr) {
-                                auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
-                                if (i == m_connected_ports.size() - 1) {
-                                    // last port, move incoming
-                                    dst->add_data({std::move(unique_data), ts});
-                                } else {
-                                    // make a copy of the incoming data
-                                    auto data_copy = std::make_unique<value_type>(*unique_data);
-                                    dst->add_data({std::move(data_copy), ts});
-                                }
-                            }
-                        }
+                        send_all_unique({std::move(unique_data), ts});
                     } else { // s -> s,...,u,...
                         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
                             if (auto port = m_connected_ports.at(i); port != nullptr) {
@@ -225,6 +201,23 @@ private:
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    auto send_all_unique(std::tuple<std::unique_ptr<value_type>, timestamp_type>&& data) -> void {
+        auto [unique_data, ts] = std::move(data);
+        for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
+            if (auto port = m_connected_ports.at(i); port != nullptr) {
+                auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
+                if (i == m_connected_ports.size() - 1) {
+                    // last port, move incoming
+                    dst->add_data({std::move(unique_data), ts});
+                } else {
+                    // make a copy of the incoming data
+                    auto data_copy = std::make_unique<value_type>(*unique_data);
+                    dst->add_data({std::move(data_copy), ts});
                 }
             }
         }
