@@ -80,11 +80,23 @@ public:
                     }
                 }
             }
-        } else { // shared_ptr; s -> s || s -> s,s,...
-            for (auto& port : m_connected_ports) {
-                if (port != nullptr) {
-                    auto dst = static_cast<input_port<T>*>(port);
-                    dst->add_data({data, ts});
+        } else { // shared_ptr
+            if (m_connected_ports.size() == 1) {
+                if (auto dst_port = m_connected_ports.front(); dst_port != nullptr) {
+                    if (dst_port->is_unique_type()) { // s -> u
+                        auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(dst_port);
+                        dst->add_data({std::make_unique<value_type>(std::move(*data)), ts});
+                    } else { // s -> s
+                        auto dst = static_cast<input_port<T>*>(dst_port);
+                        dst->add_data({data, ts});
+                    }
+                }
+            } else { // s -> s,s,...
+                for (auto& port : m_connected_ports) {
+                    if (port != nullptr) {
+                        auto dst = static_cast<input_port<T>*>(port);
+                        dst->add_data({data, ts});
+                    }
                 }
             }
         }
@@ -97,8 +109,10 @@ public:
             return (!a->is_unique_type() && b->is_unique_type());
         });
         // start thread if required
-        auto thread_required = (traits::is_shared_ptr_v<T> && port->is_unique_type()) ||
-          (m_connected_ports.size() > 1 && port->is_unique_type());
+        auto thread_required = false;
+        if (m_connected_ports.size() > 1 && port->is_unique_type()) {
+            thread_required = true;
+        }
         if (thread_required && !m_thread.joinable()) {
             m_thread = std::jthread(&output_port::thread_func, this);
         }
@@ -178,10 +192,10 @@ private:
                         }
                     }
                 } else { // shared_ptr
-                    auto unique_data = std::make_unique<value_type>(*data);
-                    if (all_unique) { // s -> u || s -> u,u,...
-                        send_all_unique({std::move(unique_data), ts});
+                    if (all_unique) { // s -> u,u,...
+                        send_all_unique({std::make_unique<value_type>(std::move(*data)), ts});
                     } else { // s -> s,...,u,...
+                        auto unique_data = std::make_unique<value_type>(*data);
                         for (auto i : std::views::iota(size_t{0}, m_connected_ports.size())) {
                             if (auto port = m_connected_ports.at(i); port != nullptr) {
                                 if (port->is_unique_type()) {
