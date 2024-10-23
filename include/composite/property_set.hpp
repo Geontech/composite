@@ -39,13 +39,13 @@ public:
 
     template <typename T>
     auto add_property(std::string_view name, T* prop) -> void {
-        auto type_id_name = std::string{typeid(T).name()};
+        auto typeid_name = std::string{typeid(T).name()};
         auto status = int{};
-        if (auto demangled_name = abi::__cxa_demangle(type_id_name.c_str(), nullptr, nullptr, &status); status == 0) {
-            type_id_name = demangled_name;
+        if (auto demangled_name = abi::__cxa_demangle(typeid_name.c_str(), nullptr, nullptr, &status); status == 0) {
+            typeid_name = demangled_name;
             std::free(demangled_name);
         }
-        m_properties.try_emplace(std::string{name}, property{type_id_name, prop});
+        m_properties.try_emplace(std::string{name}, property{typeid_name, prop});
     }
 
     template <typename T>
