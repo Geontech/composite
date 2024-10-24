@@ -27,19 +27,6 @@
 
 namespace composite {
 
-auto to_config_type(std::string_view value) -> std::string {
-    if (value == "int") {
-        return "int32";
-    } else if (value == "unsigned int") {
-        return "uint32";
-    } else if (value == "long") {
-        return "int64";
-    } else if (value == "unsigned long") {
-        return "uin642";
-    }
-    return value;
-}
-
 class property {
 public:
     std::string type;
@@ -58,7 +45,17 @@ public:
             typeid_name = demangled_name;
             std::free(demangled_name);
         }
-        typeid_name = to_config_type(typeid_name);
+        if (typeid_name.find("int") != std::string::npos) {
+            typeid_name = "int32";
+        } else if (typeid_name == "unsigned int") {
+            typeid_name = "uint32";
+        } else if (typeid_name.find("long") != std::string::npos) {
+            typeid_name = "int64";
+        } else if (typeid_name == "unsigned long") {
+            typeid_name = "uin642";
+        } else if (typeid_name.find("basic_string") != std::string::npos) {
+            typeid_name = "string";
+        }
         m_properties.try_emplace(std::string{name}, property{typeid_name, prop});
     }
 
