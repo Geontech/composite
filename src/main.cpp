@@ -58,8 +58,12 @@ auto set_property(std::shared_ptr<composite::component> comp, const nlohmann::js
         comp->set_property(name, value.get<uint64_t>());
     } else if (type == "float") {
         comp->set_property(name, value.get<float>());
-    }  else if (type == "double") {
+    } else if (type == "double") {
         comp->set_property(name, value.get<double>());
+    } else {
+        throw std::runtime_error(
+            fmt::format("unknown type {} for property {} of component {}", type, name, comp->name())
+        );
     }
 }
 
@@ -161,14 +165,19 @@ auto main(int argc, char** argv) -> int {
         }
         spdlog::trace("component {} created", comp_ptr->id());
         // Set application-level properties
-        spdlog::trace("setting app-level properties on {}", comp_ptr->id());
-        for (const auto& prop : app_json["properties"]) {
-            set_property(comp_ptr, prop);
-        }
-        // Set component-level properties
-        spdlog::trace("setting component-level properties on {}", comp_ptr->id());
-        for (const auto& prop : comp["properties"]) {
-            set_property(comp_ptr, prop);
+        try {
+            spdlog::trace("setting app-level properties on {}", comp_ptr->id());
+            for (const auto& prop : app_json["properties"]) {
+                set_property(comp_ptr, prop);
+            }
+            // Set component-level properties
+            spdlog::trace("setting component-level properties on {}", comp_ptr->id());
+            for (const auto& prop : comp["properties"]) {
+                set_property(comp_ptr, prop);
+            }
+        } catch (const std::runtime_error& err) {
+            spdlog::error(err.what());
+            return EXIT_FAILURE;
         }
         // Add to application
         spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
