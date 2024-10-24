@@ -58,7 +58,7 @@ auto to_json(nlohmann::json& json_obj, const std::vector<std::shared_ptr<compone
 
 auto to_json(nlohmann::json& json_obj, const application& app) {
     json_obj["name"] = app.name();
-    auto components = app.components();
+    const auto& components = app.components();
     json_obj["components"] = components;
     json_obj["connections"] = nlohmann::json::array();
     for (const auto& comp : components) {
