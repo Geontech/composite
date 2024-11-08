@@ -72,7 +72,11 @@ public:
     }
 
     auto type_id() const noexcept -> std::size_t override {
-        return typeid(T).hash_code();
+        return typeid(value_type).hash_code();
+    }
+
+    auto is_unique_type() const noexcept -> bool override {
+        return traits::is_unique_ptr_v<T>;
     }
 
     auto get_data() -> std::tuple<buffer_type, timestamp_type> {
@@ -92,7 +96,8 @@ public:
     }
 
 private:
-    friend class output_port<T>;
+    friend class output_port<std::unique_ptr<value_type>>;
+    friend class output_port<std::shared_ptr<value_type>>;
 
     auto add_data(std::tuple<buffer_type, timestamp_type>&& data) -> void {
         const auto lock = std::scoped_lock{m_data_mtx};
