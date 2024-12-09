@@ -62,9 +62,23 @@ FetchContent_Declare(spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG v1.14.1
 )
+# httplib dependency
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.18.0
+)
 set(FMT_INSTALL OFF)
+set(HTTPLIB_INSTALL OFF)
 # Make all deps available
-FetchContent_MakeAvailable(argparse fmt json spdlog)
+FetchContent_MakeAvailable(argparse fmt json spdlog httplib)
+
+# OpenSSL support
+option(COMPOSITE_USE_OPENSSL "Compile with OpenSSL support" OFF)
+if(COMPOSITE_USE_OPENSSL)
+    # OpenSSL 3 required
+    find_package(OpenSSL 3 REQUIRED)
+    target_compile_definitions(composite-cli PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT=1)
+endif()
 
 configure_file(include/version.hpp.in include/composite/version.hpp)
 

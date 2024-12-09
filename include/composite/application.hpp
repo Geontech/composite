@@ -63,13 +63,17 @@ public:
         m_components.emplace_back(comp);
     }
 
-    auto get_component(std::string_view id) const -> component* {
+    auto get_component(std::string_view id) const -> component_ptr {
         for (const auto& component : m_components) {
             if (component->id() == id) {
-                return component.get();
+                return component;
             }
         }
-        return nullptr;
+        return {nullptr};
+    }
+
+    auto components() const -> const std::vector<component_ptr>& {
+        return m_components;
     }
 
     auto clear() -> void {

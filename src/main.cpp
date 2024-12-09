@@ -19,49 +19,63 @@
  
 #include "composite/application.hpp"
 #include "composite/version.hpp"
+#include "helpers.hpp"
 
 #include <argparse/argparse.hpp>
 #include <atomic>
 #include <csignal>
 #include <dlfcn.h>
+#include <filesystem>
 #include <fmt/core.h>
 #include <fstream>
 #include <functional>
 #include <future>
+#include <httplib.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <vector>
 
-auto set_property(std::shared_ptr<composite::component> comp, const nlohmann::json& prop) {
-    auto type = prop["type"].get<std::string>();
-    auto name = prop["name"].get<std::string>();
-    auto value = prop["value"];
-    if (type == "bool") {
-        comp->set_property(name, value.get<bool>());
-    } else if (type == "string") {
-        comp->set_property(name, value.get<std::string>());
-    } else if (type == "int32") {
-        comp->set_property(name, value.get<int32_t>());
-    } else if (type == "uint32") {
-        comp->set_property(name, value.get<uint32_t>());
-    } else if (type == "int64") {
-        comp->set_property(name, value.get<int64_t>());
-    } else if (type == "uint64") {
-        comp->set_property(name, value.get<uint64_t>());
-    } else if (type == "float") {
-        comp->set_property(name, value.get<float>());
-    }  else if (type == "double") {
-        comp->set_property(name, value.get<double>());
-    }
-}
+namespace composite {
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+auto make_server(
+  application&,
+  composite::component_handles_type&,
+  const std::string&,
+  const std::string&,
+  const std::string&
+) -> std::unique_ptr<httplib::Server>;
+#else
+auto make_server(application&, composite::component_handles_type&) -> std::unique_ptr<httplib::Server>;
+#endif
+
+} // namespace composite
 
 auto main(int argc, char** argv) -> int {
     // Create argument parser with options
     auto program = argparse::ArgumentParser{"composite-cli", VERSION};
-    program.add_argument("-c", "--config")
-        .help("application configuration file")
-        .required();
+    program.add_argument("-f", "--config-file")
+      .help("application configuration file")
+      .required();
+    program.add_argument("-s", "--server")
+      .help("REST server address")
+      .default_value(std::string{"localhost"});
+    program.add_argument("-p", "--port")
+      .help("REST server port")
+      .scan<'i', int>()
+      .default_value(5000);
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    program.add_argument("-a", "--certificate-authority")
+      .help("Path to a cert file for the certificate authority")
+      .default_value(std::string{});
+    program.add_argument("-c", "--client-certificate")
+      .help("Path to a client certificate file for TLS")
+      .required();
+    program.add_argument("-k", "--client-key")
+      .help("Path to a client key file for TLS")
+      .required();
+#endif
     program.add_argument("-l", "--log-level")
       .help("log level [trace, debug, info, warning, error, critical, off]")
       .default_value(std::string{"info"});
@@ -76,20 +90,39 @@ auto main(int argc, char** argv) -> int {
     }
 
     // Setup logging
-    auto level = program.get<std::string>("--log-level");
-    spdlog::set_level(spdlog::level::from_str(level));
+    auto level = spdlog::level::from_str(program.get<std::string>("--log-level"));
+    spdlog::set_level(level);
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    // Check certificate and key files exist
+    auto ca_path = std::string{};
+    if (auto ca_arg = program.present("--certificate-authority")) {
+        ca_path = *ca_arg;
+    }
+    auto cert_path = program.get<std::string>("--client-certificate");
+    auto key_path = program.get<std::string>("--client-key");
+    if (!std::filesystem::exists(cert_path)) {
+        spdlog::error("client certificate file not found at {}", cert_path);
+        return EXIT_FAILURE;
+    }
+    if (!std::filesystem::exists(cert_path)) {
+        spdlog::error("client key file not found at {}", cert_path);
+        return EXIT_FAILURE;
+    }
+    if (!ca_path.empty() && !std::filesystem::exists(ca_path)) {
+        spdlog::error("certificate authority file not found at {}", ca_path);
+        return EXIT_FAILURE;
+    }
+#endif
 
     // Get configuration file, then read and parse
-    auto config_file = program.get<std::string>("--config");
+    auto config_file = program.get<std::string>("--config-file");
     spdlog::info("Using config file at: {}", config_file);
     auto config_ifstream = std::ifstream{config_file};
     auto app_json = nlohmann::json::parse(config_ifstream);
 
-    // Component handle holders
-    auto close_func = [](void* p) {
-        dlclose(p);
-    };
-    auto comp_handles = std::vector<std::unique_ptr<void, decltype(close_func)>>{};
+    // Component handle holders    
+    auto comp_handles = composite::component_handles_type{};
 
     // Create a new application object
     auto app_name = app_json["name"].get<std::string>();
@@ -97,70 +130,35 @@ auto main(int argc, char** argv) -> int {
 
     // Get components and load them
     for (const auto& comp : app_json["components"]) {
-        // Get component name
-        auto name = comp["name"].get<std::string>();
-        // Open component module
-        auto comp_str = fmt::format("lib{}.so", name);
-        spdlog::trace("component module: {}", comp_str);
-        // Get component module handle
-        auto comp_handle = std::unique_ptr<void, decltype(close_func)>(dlopen(comp_str.c_str(), RTLD_NOW), close_func);
-        if (!comp_handle) {
-            std::cerr << fmt::format("failed to open {}: {}\n", comp_str, dlerror());
-            return EXIT_FAILURE;
-        }
-        dlerror(); // clear existing
-        // Component shared_ptr
-        auto comp_ptr = std::shared_ptr<composite::component>{nullptr};
-        // Get the create function
-        if (comp.contains("create_arg")) {
-            // Get create arg if present
-            auto create_arg = comp["create_arg"].get<std::string>();
-            // Create function to include string_view argument
-            using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view);
-            auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
-            if (auto err = dlerror(); err != nullptr) {
-                std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
-                return EXIT_FAILURE;
-            }
-            dlerror(); // clear existing
-            // Create a new component
-            comp_ptr = (*create_func)(create_arg);
-        } else {
-            // Empty create function
-            using function_ptr = std::shared_ptr<composite::component> (*)();
-            auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
-            if (auto err = dlerror(); err != nullptr) {
-                std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
-                return EXIT_FAILURE;
-            }
-            dlerror(); // clear existing
-            // Create a new component
-            comp_ptr = (*create_func)();
-        }
+        // Add component to application
+        auto comp_ptr = composite::make_component(comp, comp_handles);
         if (comp_ptr == nullptr) {
-            spdlog::error("failed to create component {}", name);
             return EXIT_FAILURE;
         }
-        // Set id if needed
-        if (comp.contains("id")) {
-            comp_ptr->id(comp["id"].get<std::string>());
-        }
-        spdlog::trace("component {} created", comp_ptr->id());
-        // Set application-level properties
-        spdlog::trace("setting app-level properties on {}", comp_ptr->id());
-        for (const auto& prop : app_json["properties"]) {
-            set_property(comp_ptr, prop);
-        }
-        // Set component-level properties
-        spdlog::trace("setting component-level properties on {}", comp_ptr->id());
-        for (const auto& prop : comp["properties"]) {
-            set_property(comp_ptr, prop);
+        // Set log level
+        comp_ptr->log_level(level);
+        // Set properties
+        try {
+            // Set application-level properties
+            spdlog::trace("adding app-level properties to changeset for {}", comp_ptr->id());
+            auto props = std::vector<std::pair<std::string,std::string>>{};
+            for (const auto& prop : app_json["properties"]) {
+                props.emplace_back(prop["name"], prop["value"].get<std::string>());
+            }
+            // Set component-level properties
+            spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
+            for (const auto& prop : comp["properties"]) {
+                props.emplace_back(prop["name"], prop["value"].get<std::string>());
+            }
+            spdlog::trace("setting properties on component {}", comp_ptr->id());
+            comp_ptr->set_properties(props);
+        } catch (const std::runtime_error& err) {
+            spdlog::error(err.what());
+            return EXIT_FAILURE;
         }
         // Add to application
         spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
         app.add_component(comp_ptr);
-        // Store handle for closing later
-        comp_handles.emplace_back(std::move(comp_handle));
     }
 
     // Make connections
@@ -208,6 +206,15 @@ auto main(int argc, char** argv) -> int {
         }
     }
 
+    // Create REST server for c&c
+    auto server_addr = program.get<std::string>("--server");
+    auto server_port = program.get<int>("--port");
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    auto server = composite::make_server(app, comp_handles, cert_path, key_path, ca_path);
+#else
+    auto server = composite::make_server(app, comp_handles);
+#endif
+
     // Setup signal handlers
     auto signals = std::vector<int>{SIGINT, SIGKILL};
     auto sigset = sigset_t{};
@@ -216,10 +223,11 @@ auto main(int argc, char** argv) -> int {
         sigaddset(&sigset, sig);
     }
     pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
-    auto signal_future = std::async(std::launch::async, [&sigset]() {
+    auto signal_future = std::async(std::launch::async, [&sigset, &server]() {
         auto signum = int{};
         sigwait(&sigset, &signum);
         printf("\r  \r");
+        server->stop();
         return signum;
     });
 
@@ -230,6 +238,10 @@ auto main(int argc, char** argv) -> int {
     // Start the application
     spdlog::trace("starting application '{}'", app.name());
     app.start();
+
+    // Start 
+    spdlog::trace("listening at {}:{}", server_addr, server_port);
+    server->listen(server_addr, server_port);
 
     // Wait for signal to stop
     spdlog::trace("waiting for signal...");
