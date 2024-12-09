@@ -19,35 +19,19 @@
  
 #pragma once
 
-#include "port.hpp"
+#include "composite/component.hpp"
 
-#include <map>
-#include <string>
+#include <dlfcn.h>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <vector>
 
 namespace composite {
 
-class port_set {
-public:
-    using port_map_type = std::map<std::string, port*>;
+auto close_func(void* p) -> void;
 
-    auto add_port(port* port) -> void {
-        m_ports.try_emplace(port->name(), port);
-    }
+using component_handles_type = std::vector<std::unique_ptr<void, decltype(&close_func)>>;
 
-    auto get_port(std::string_view name) -> port* {
-        if (m_ports.contains(std::string{name})) {
-            return m_ports.at(std::string{name});
-        }
-        return nullptr;
-    }
-
-    auto ports() const -> const port_map_type& {
-        return m_ports;
-    }
-
-private:
-    port_map_type m_ports;
-
-}; // class port_set
+auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component>;
 
 } // namespace composite
