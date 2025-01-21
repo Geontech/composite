@@ -95,10 +95,7 @@ auto main(int argc, char** argv) -> int {
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     // Check certificate and key files exist
-    auto ca_path = std::string{};
-    if (auto ca_arg = program.present("--certificate-authority")) {
-        ca_path = *ca_arg;
-    }
+    auto ca_path = program.get<std::string>("--certificate-authority");
     auto cert_path = program.get<std::string>("--client-certificate");
     auto key_path = program.get<std::string>("--client-key");
     if (!std::filesystem::exists(cert_path)) {

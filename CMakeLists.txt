@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(composite VERSION 0.2.0 LANGUAGES CXX)
+project(composite VERSION 0.2.1 LANGUAGES CXX)
 include(GNUInstallDirs)
 # Set the C++ version required
 set(CMAKE_CXX_STANDARD 20)
@@ -72,6 +72,10 @@ set(HTTPLIB_INSTALL OFF)
 # Make all deps available
 FetchContent_MakeAvailable(argparse fmt json spdlog httplib)
 
+# Add subdirectories
+add_subdirectory(include)
+add_subdirectory(src)
+
 # OpenSSL support
 option(COMPOSITE_USE_OPENSSL "Compile with OpenSSL support" OFF)
 if(COMPOSITE_USE_OPENSSL)
@@ -103,9 +107,6 @@ CONFIGURE_FILE(
     "${PROJECT_SOURCE_DIR}/cmake/composite.pc.in"
     "${PROJECT_BINARY_DIR}/composite.pc"
 )
-
-add_subdirectory(include)
-add_subdirectory(src)
 
 # Install
 if(COMPOSITE_INSTALL)
