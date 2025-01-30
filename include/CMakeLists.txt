@@ -27,3 +27,10 @@ target_include_directories(
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+if(COMPOSITE_USE_NATS)
+    target_compile_definitions(composite INTERFACE COMPOSITE_USE_NATS=1)
+    target_link_libraries(composite
+        INTERFACE
+        nats
+    )
+endif()

@@ -26,7 +26,7 @@
 #include <csignal>
 #include <dlfcn.h>
 #include <filesystem>
-#include <fmt/core.h>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -38,7 +38,7 @@
 
 namespace composite {
 
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#ifdef COMPOSITE_USE_OPENSSL
 auto make_server(
   application&,
   composite::component_handles_type&,
@@ -65,7 +65,7 @@ auto main(int argc, char** argv) -> int {
       .help("REST server port")
       .scan<'i', int>()
       .default_value(5000);
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#ifdef COMPOSITE_USE_OPENSSL
     program.add_argument("-a", "--certificate-authority")
       .help("Path to a cert file for the certificate authority")
       .default_value(std::string{});
@@ -93,7 +93,7 @@ auto main(int argc, char** argv) -> int {
     auto level = spdlog::level::from_str(program.get<std::string>("--log-level"));
     spdlog::set_level(level);
 
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#ifdef COMPOSITE_USE_OPENSSL
     // Check certificate and key files exist
     auto ca_path = program.get<std::string>("--certificate-authority");
     auto cert_path = program.get<std::string>("--client-certificate");
@@ -147,8 +147,10 @@ auto main(int argc, char** argv) -> int {
             for (const auto& prop : comp["properties"]) {
                 props.emplace_back(prop["name"], prop["value"].get<std::string>());
             }
-            spdlog::trace("setting properties on component {}", comp_ptr->id());
-            comp_ptr->set_properties(props);
+            if (!props.empty()) {
+                spdlog::trace("setting properties on component {}", comp_ptr->id());
+                comp_ptr->set_properties(props, composite::properties::config_type::INITIALIZE, true);
+            }
         } catch (const std::runtime_error& err) {
             spdlog::error(err.what());
             return EXIT_FAILURE;
@@ -166,47 +168,64 @@ auto main(int argc, char** argv) -> int {
     };
     for (const auto& conn : app_json["connections"]) {
         if (!conn.contains("output")) {
-            return conn_exit(fmt::format("missing output for connection: {}", conn.dump()));
+            return conn_exit(std::format("missing output for connection: {}", conn.dump()));
         }
         if (!conn.contains("input")) {
-            return conn_exit(fmt::format("missing output for connection: {}", conn.dump()));
+            return conn_exit(std::format("missing output for connection: {}", conn.dump()));
         }
+        // Validate output section
         auto output = conn["output"];
+        auto [output_comp, output_port, oerror] = composite::validate_connection(output);
+        if (!oerror.empty()) {
+            return conn_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
+        }
+        // Validate input section
         auto input = conn["input"];
-        if (!output.contains("component")) {
-            return conn_exit(fmt::format("missing component in connection output: {}", conn.dump()));
+        auto [input_comp, input_port, ierror] = composite::validate_connection(input);
+        if (!ierror.empty()) {
+            return conn_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
         }
-        if (!output.contains("port")) {
-            return conn_exit(fmt::format("missing port in connection output: {}", conn.dump()));
-        }
-        if (!input.contains("component")) {
-            return conn_exit(fmt::format("missing component in connection input: {}", conn.dump()));
-        }
-        if (!input.contains("port")) {
-            return conn_exit(fmt::format("missing port in connection input: {}", conn.dump()));
-        }
-        auto output_comp = output["component"].get<std::string>();
-        auto output_port = output["port"].get<std::string>();
-        auto input_comp = input["component"].get<std::string>();
-        auto input_port = input["port"].get<std::string>();
-        auto output_comp_ptr = app.get_component(output_comp);
-        if (output_comp_ptr == nullptr) {
-            return conn_exit(fmt::format("output component {} null during connection: {}", output_comp, conn.dump()));
-        }
-        auto input_comp_ptr = app.get_component(input_comp);
-        if (input_comp_ptr == nullptr) {
-            return conn_exit(fmt::format("input component {} null during connection: {}", input_comp, conn.dump()));
-        }
+        
         spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
-        if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-            return conn_exit(fmt::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+        if (input_comp.starts_with("nats://")) {
+#ifndef COMPOSITE_USE_NATS
+            return conn_exit(std::format("NATS support is not enabled: required for connection: {}", conn.dump()));
+#endif
+            // Get the output component port
+            auto output_comp_ptr = app.get_component(output_comp);
+            if (output_comp_ptr == nullptr) {
+                return conn_exit(std::format("output component {} null during connection: {}", output_comp, conn.dump()));
+            }
+#ifdef COMPOSITE_USE_NATS
+            if (!output_comp_ptr->connect(output_port, input_comp, input_port)) {
+                return conn_exit(std::format("Failed to connect {}:{} to {}", output_comp, output_port, input_comp));
+            }
+#endif
+        } else if (output_comp.starts_with("nats://")) {
+            // Future release will enable this support
+            return conn_exit(std::format("NATS support is not enabled: required for connection: {}", conn.dump()));
+        } else {
+            // Get the output component port
+            auto output_comp_ptr = app.get_component(output_comp);
+            if (output_comp_ptr == nullptr) {
+                return conn_exit(std::format("output component {} null during connection: {}", output_comp, conn.dump()));
+            }
+            // Get the input component port
+            auto input_comp_ptr = app.get_component(input_comp);
+            if (input_comp_ptr == nullptr) {
+                return conn_exit(std::format("input component {} null during connection: {}", input_comp, conn.dump()));
+            }
+            spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
+            if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
+                return conn_exit(std::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+            }
         }
     }
 
     // Create REST server for c&c
     auto server_addr = program.get<std::string>("--server");
     auto server_port = program.get<int>("--port");
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#ifdef COMPOSITE_USE_OPENSSL
     auto server = composite::make_server(app, comp_handles, cert_path, key_path, ca_path);
 #else
     auto server = composite::make_server(app, comp_handles);

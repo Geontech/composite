@@ -21,17 +21,64 @@
 
 #include <any>
 #include <cxxabi.h>
+#include <format>
 #include <functional>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace composite {
 
+namespace properties {
+
 enum class config_type {
     INITIALIZE,
     RUNTIME
-}; // enum class configurable
+}; // enum class config_type
+
+enum class error {
+    OK,
+    INVALID_TYPE,
+    INVALID_KEY,
+    INVALID_VALUE
+}; // enum class error
+
+class properties_error : public std::runtime_error {
+public:
+    explicit properties_error(std::string_view msg) : std::runtime_error(std::string{msg}) {}
+
+}; // class properties_error
+
+class configurability_error : public properties_error {
+public:
+    configurability_error(std::string_view comp_id, std::string_view prop) :
+      properties_error(std::format("property {} of component {} is not runtime configurable", prop, comp_id)) {}
+
+}; // class configurability_error
+
+class type_error : public properties_error {
+public:
+    type_error(std::string_view comp_id, std::string_view prop, std::string_view type) :
+      properties_error(std::format("unknown type {} for property {} of component {}", type, prop, comp_id)) {}
+
+}; // class type_error
+
+class key_error : public properties_error {
+public:
+    key_error(std::string_view comp_id, std::string_view prop) :
+      properties_error(std::format("unknown property {} of component {}", prop, comp_id)) {}
+
+}; // class key_error
+
+class value_error : public properties_error {
+public:
+    value_error(std::string_view comp_id, std::string_view prop, std::string_view value) :
+      properties_error(std::format("invalid value for property {} of component {}: {}", prop, comp_id, value)) {}
+
+}; // class key_error
+
+} // namespace properties
 
 class property {
 public:
@@ -67,11 +114,11 @@ public:
         return *this;
     }
 
-    auto configurability() const -> config_type {
+    auto configurability() const -> properties::config_type {
         return m_configurability;
     }
 
-    auto configurability(config_type value) -> property& {
+    auto configurability(properties::config_type value) -> property& {
         m_configurability = value;
         return *this;
     }
@@ -88,7 +135,7 @@ private:
     std::string m_type;
     std::any m_value;
     std::string m_units;
-    config_type m_configurability;
+    properties::config_type m_configurability;
     change_func_type m_change_func;
 
 }; // class property
@@ -123,16 +170,19 @@ public:
     }
 
     template <typename T>
-    auto set_property(std::string_view name, T value) -> void {
-        if (m_properties.contains(std::string{name})) {
-            const auto& prop = m_properties.at(std::string{name});
-            auto val_ptr = *std::any_cast<T*>(&(prop.value()));
-            auto prev_value = *val_ptr;
-            *val_ptr = value;
-            if (prop.change_listener() && !prop.change_listener()()) {
-                *val_ptr = prev_value;
-            }
+    auto set_property(std::string_view name, T value) -> properties::error {
+        if (!m_properties.contains(std::string{name})) {
+            return properties::error::INVALID_KEY;
         }
+        const auto& prop = m_properties.at(std::string{name});
+        auto val_ptr = *std::any_cast<T*>(&(prop.value()));
+        auto prev_value = *val_ptr;
+        *val_ptr = value;
+        if (prop.change_listener() && !prop.change_listener()()) {
+            *val_ptr = prev_value;
+            return properties::error::INVALID_VALUE;
+        }
+        return properties::error::OK;
     }
 
     template <typename T>

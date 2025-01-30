@@ -47,11 +47,6 @@ FetchContent_Declare(argparse
     GIT_REPOSITORY https://github.com/p-ranav/argparse.git
     GIT_TAG v3.0
 )
-# Fmt dependency
-FetchContent_Declare(fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 10.2.1
-)
 # JSON dependency
 FetchContent_Declare(json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
@@ -67,22 +62,38 @@ FetchContent_Declare(httplib
     GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
     GIT_TAG v0.18.0
 )
-set(FMT_INSTALL OFF)
 set(HTTPLIB_INSTALL OFF)
 # Make all deps available
-FetchContent_MakeAvailable(argparse fmt json spdlog httplib)
+FetchContent_MakeAvailable(argparse json spdlog)
 
-# Add subdirectories
-add_subdirectory(include)
-add_subdirectory(src)
+# Check for NATS enable
+option(COMPOSITE_USE_NATS "Compile with NATS functionality" OFF)
+if(COMPOSITE_USE_NATS)
+    FetchContent_Declare(cnats
+        GIT_REPOSITORY https://github.com/nats-io/nats.c.git
+        GIT_TAG v3.9.2
+    )
+    set(NATS_BUILD_WITH_TLS OFF)
+    set(NATS_BUILD_STREAMING OFF)
+    set(NATS_BUILD_EXAMPLES OFF)
+    set(NATS_BUILD_LIB_STATIC OFF)
+    set(BUILD_TESTING OFF)
+    FetchContent_MakeAvailable(cnats)
+    file(COPY ${cnats_SOURCE_DIR}/src/ DESTINATION ${PROJECT_BINARY_DIR}/include/nats/ FILES_MATCHING PATTERN "*.h")
+endif()
 
 # OpenSSL support
 option(COMPOSITE_USE_OPENSSL "Compile with OpenSSL support" OFF)
 if(COMPOSITE_USE_OPENSSL)
     # OpenSSL 3 required
     find_package(OpenSSL 3 REQUIRED)
-    target_compile_definitions(composite-cli PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT=1)
+    set(HTTPLIB_REQUIRE_OPENSSL ON)
 endif()
+FetchContent_MakeAvailable(httplib)
+
+# Add subdirectories
+add_subdirectory(include)
+add_subdirectory(src)
 
 configure_file(include/version.hpp.in include/composite/version.hpp)
 

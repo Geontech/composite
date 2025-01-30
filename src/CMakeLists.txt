@@ -23,18 +23,30 @@ add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers.cpp
 )
+# Compile definitions
+if(COMPOSITE_USE_OPENSSL)
+    target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_OPENSSL=1)
+endif()
+if(COMPOSITE_USE_NATS)
+    target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_NATS=1)
+endif()
 # Includes
 target_include_directories(composite-cli
-    PRIVATE ${CMAKE_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_BINARY_DIR}/include
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${PROJECT_BINARY_DIR}/include
 )
 # Linkage
 target_link_libraries(composite-cli
     PRIVATE
     argparse
-    fmt::fmt-header-only
     nlohmann_json::nlohmann_json
     spdlog::spdlog_header_only
     httplib::httplib
     dl
 )
+if(COMPOSITE_USE_NATS)
+    target_link_libraries(composite-cli
+        PRIVATE
+        nats
+    )
+endif()

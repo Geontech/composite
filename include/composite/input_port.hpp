@@ -35,9 +35,11 @@
 namespace composite {
 
 template <traits::smart_ptr T>
+requires std::ranges::contiguous_range<typename T::element_type>
 class output_port;
 
 template <traits::smart_ptr T>
+requires std::ranges::contiguous_range<typename T::element_type>
 class input_port : public port {
     static constexpr int WAIT_DURATION{2}; // seconds
 public:
