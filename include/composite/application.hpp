@@ -49,7 +49,9 @@ public:
 
     auto start() -> void override {
         for (auto& component : m_components) {
-            component->start();
+            if (component->get_property<bool>("enabled")){
+                component->start();
+            }       
         }
     }
 

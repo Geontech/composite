@@ -49,21 +49,21 @@ auto to_json(nlohmann::json& json_obj, const component& comp) {
         prop_obj["units"] = value.units();
         prop_obj["configurability"] = (static_cast<int>(value.configurability()) == 1) ? "runtime" : "initialize";
         if (type == "bool") {
-            prop_obj["value"] = comp.get_property<bool>(name);
+            prop_obj["value"] = std::format("{}", comp.get_property<bool>(name));
         } else if (type == "string") {
             prop_obj["value"] = comp.get_property<std::string>(name);
         } else if (type == "int32") {
-            prop_obj["value"] = comp.get_property<int32_t>(name);
+            prop_obj["value"] = std::to_string(comp.get_property<int32_t>(name));
         } else if (type == "uint32") {
-            prop_obj["value"] = comp.get_property<uint32_t>(name);
+            prop_obj["value"] = std::to_string(comp.get_property<uint32_t>(name));
         } else if (type == "int64") {
-            prop_obj["value"] = comp.get_property<int64_t>(name);
+            prop_obj["value"] = std::to_string(comp.get_property<int64_t>(name));
         } else if (type == "uint64") {
-            prop_obj["value"] = comp.get_property<uint64_t>(name);
+            prop_obj["value"] = std::to_string(comp.get_property<uint64_t>(name));
         } else if (type == "float") {
-            prop_obj["value"] = comp.get_property<float>(name);
+            prop_obj["value"] = std::to_string(comp.get_property<float>(name));
         } else if (type == "double") {
-            prop_obj["value"] = comp.get_property<double>(name);
+            prop_obj["value"] = std::to_string(comp.get_property<double>(name));
         }
         props_obj.push_back(prop_obj);
     }
@@ -107,9 +107,17 @@ auto set_component_properties(
         spdlog::trace("patching component-level properties on {}", comp->id());
         auto props = std::vector<std::pair<std::string,std::string>>{};
         for (const auto& prop : properties) {
-            props.emplace_back(prop["name"], prop["value"].get<std::string>());
+            auto name = prop["name"].get<std::string>();
+            auto value = prop["value"].get<std::string>();
+            if (name == "enabled") {
+                (value == "false" || value == "0") ? comp->stop() : comp->start();
+            } else {
+                props.emplace_back(name, value);
+            }
         }
-        comp->set_properties(props, composite::properties::config_type::RUNTIME);
+        if (!props.empty()) {
+            comp->set_properties(props, composite::properties::config_type::RUNTIME);
+        }
         content["success"] = std::format("successfully set properties on component {}", comp->id());
         res.set_content(content.dump(), "application/json");
         res.status = httplib::OK_200;
