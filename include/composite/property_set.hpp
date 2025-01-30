@@ -164,9 +164,8 @@ public:
         } else if (typeid_name.find("basic_string") != std::string::npos) {
             typeid_name = "string";
         }
-        if (auto [iter, res] = m_properties.try_emplace(std::string{name}, property{typeid_name, prop}); res) {
-            return m_properties.at(std::string{name});
-        }
+        auto [iter, res] = m_properties.try_emplace(std::string{name}, property{typeid_name, prop});
+        return iter->second;
     }
 
     template <typename T>

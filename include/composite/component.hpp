@@ -57,6 +57,8 @@ public:
       m_id(m_name),
       m_logger(spdlog::stdout_color_mt(m_name)) {
         add_property("thread_delay", &m_delay).units("ns");
+        using enum composite::properties::config_type;
+        add_property("enabled", &m_enabled).configurability(RUNTIME);
     }
 
     ~component() override = default;
@@ -79,9 +81,11 @@ public:
 
     auto start() -> void override {
         m_thread = std::jthread(&component::thread_func, this);
+        m_enabled = true;
     }
 
     auto stop() -> void override {
+        m_enabled = false;
         m_thread.request_stop();
         if (m_thread.joinable()) {
             m_thread.join();
@@ -251,6 +255,7 @@ private:
     std::shared_ptr<spdlog::logger> m_logger;
     std::jthread m_thread;
     uint32_t m_delay{DEFAULT_DELAY};
+    bool m_enabled{true};
     port_set m_port_set;
     property_set m_prop_set;
     std::mutex m_prop_mtx;
