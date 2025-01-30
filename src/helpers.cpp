@@ -2,7 +2,7 @@
 #include "helpers.hpp"
 
 #include <iostream>
-#include <fmt/core.h>
+#include <format>
 #include <spdlog/spdlog.h>
 
 namespace composite {
@@ -15,12 +15,12 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
     // Get component name
     auto name = comp_json["name"].get<std::string>();
     // Open component module
-    auto comp_str = fmt::format("lib{}.so", name);
+    auto comp_str = std::format("lib{}.so", name);
     spdlog::trace("component module: {}", comp_str);
     // Get component module handle
     auto comp_handle = std::unique_ptr<void, decltype(&close_func)>(dlopen(comp_str.c_str(), RTLD_NOW), close_func);
     if (!comp_handle) {
-        std::cerr << fmt::format("failed to open {}: {}\n", comp_str, dlerror());
+        std::cerr << std::format("failed to open {}: {}\n", comp_str, dlerror());
         return {};
     }
     dlerror(); // clear existing
@@ -34,7 +34,7 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
         using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view);
         auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
         if (auto err = dlerror(); err != nullptr) {
-            std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
             return {};
         }
         dlerror(); // clear existing
@@ -45,7 +45,7 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
         using function_ptr = std::shared_ptr<composite::component> (*)();
         auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
         if (auto err = dlerror(); err != nullptr) {
-            std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
             return {};
         }
         dlerror(); // clear existing
@@ -64,6 +64,36 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
     handles.emplace_back(std::move(comp_handle));
     spdlog::trace("component {} created", comp_ptr->id());
     return comp_ptr;
+}
+
+auto validate_component_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {
+    if (!conn.contains("port")) {
+        return {"", "", "missing 'port' field for component connection"};
+    }
+    auto component = conn["component"].get<std::string>();
+    auto port = conn["port"].get<std::string>();
+    return {component, port, {}};
+}
+
+auto validate_nats_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {
+#ifndef COMPOSITE_USE_NATS
+    return {"", "", "NATS support is not enabled"};
+#endif
+    if (!conn.contains("subject")) {
+        return {{}, {}, "missing 'subject' field for NATS connection"};
+    }
+    auto url = conn["nats"].get<std::string>();
+    auto subject = conn["subject"].get<std::string>();
+    return {url, subject, {}};
+}
+
+auto validate_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {
+    if (conn.contains("component")) {
+        return validate_component_connection(conn);
+    } else if (conn.contains("nats")) {
+        return validate_nats_connection(conn);
+    }
+    return {{}, {}, "missing connection type"};
 }
 
 } // namespace composite

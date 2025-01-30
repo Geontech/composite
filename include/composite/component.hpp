@@ -129,6 +129,30 @@ public:
         return true;
     }
 
+#ifdef COMPOSITE_USE_NATS
+    auto connect(std::string_view port_name, std::string_view url, std::string_view subject, bool input=false) -> bool {
+        auto port = get_port(port_name);
+        if (port == nullptr) {
+            return false;
+        }
+        auto res = port->connect(std::string{url}, std::string{subject});
+        if (res) {
+            if (input) {
+                m_connections.push_back({
+                    .output = std::make_pair(std::string{url}, std::string{subject}),
+                    .input = std::make_pair(id(), std::string{port_name}),
+                });
+            } else {
+                m_connections.push_back({
+                    .output = std::make_pair(id(), std::string{port_name}),
+                    .input = std::make_pair(std::string{url}, std::string{subject})
+                });
+            }
+        }
+        return res;
+    }
+#endif
+
     auto connections() const -> const std::vector<connection>& {
         return m_connections;
     }
@@ -145,39 +169,54 @@ public:
 
     auto set_properties(
       const std::vector<std::pair<std::string, std::string>>& prop_values,
-      config_type config=config_type::INITIALIZE) -> void {
+      properties::config_type config=properties::config_type::INITIALIZE,
+      bool allow_invalid_key=false) -> void {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         const auto& props = properties();
         for (const auto& [name, value] : prop_values) {
-            if (props.contains(name)) {
-                if ((config == config_type::RUNTIME) && (props.at(name).configurability() == config_type::INITIALIZE)) {
-                    continue;
-                }
-                auto type = props.at(name).type();
-                if (type == "bool") {
-                    m_prop_set.set_property(name, (value == "1" || value == "true") ? true : false);
-                } else if (type == "string") {
-                    m_prop_set.set_property(name, value);
-                } else if (type == "int32") {
-                    m_prop_set.set_property(name, static_cast<int32_t>(std::stoi(value)));
-                } else if (type == "uint32") {
-                    m_prop_set.set_property(name, static_cast<uint32_t>(std::stoul(value)));
-                } else if (type == "int64") {
-                    m_prop_set.set_property(name, static_cast<int64_t>(std::stoll(value)));
-                } else if (type == "uint64") {
-                    m_prop_set.set_property(name, static_cast<uint64_t>(std::stoull(value)));
-                } else if (type == "float") {
-                    m_prop_set.set_property(name, std::stof(value));
-                } else if (type == "double") {
-                    m_prop_set.set_property(name, std::stod(value));
-                } else {
-                    auto msg = std::stringstream{}
-                        << "unknown type " << type
-                        << " for property " << name
-                        << " of component " << m_name;
-                    throw std::runtime_error(msg.str());
-                }
+            if (!props.contains(name)) {
+                auto err = properties::key_error(m_id, name);
+                logger()->warn(err.what());
+                throw err;
+            }
+            using enum properties::config_type;
+            if ((config == RUNTIME) && (props.at(name).configurability() == INITIALIZE)) {
+                auto err = properties::configurability_error(m_id, name);
+                logger()->warn(err.what());
+                throw err;
+            }
+            auto type = props.at(name).type();
+            auto res = properties::error::OK;
+            if (type == "bool") {
+                res = m_prop_set.set_property(name, (value == "1" || value == "true") ? true : false);
+            } else if (type == "string") {
+                res = m_prop_set.set_property(name, value);
+            } else if (type == "int32") {
+                res = m_prop_set.set_property(name, static_cast<int32_t>(std::stoi(value)));
+            } else if (type == "uint32") {
+                res = m_prop_set.set_property(name, static_cast<uint32_t>(std::stoul(value)));
+            } else if (type == "int64") {
+                res = m_prop_set.set_property(name, static_cast<int64_t>(std::stoll(value)));
+            } else if (type == "uint64") {
+                res = m_prop_set.set_property(name, static_cast<uint64_t>(std::stoull(value)));
+            } else if (type == "float") {
+                res = m_prop_set.set_property(name, std::stof(value));
+            } else if (type == "double") {
+                res = m_prop_set.set_property(name, std::stod(value));
+            } else {
+                auto err = properties::type_error(m_id, name, type);
+                logger()->warn(err.what());
+                throw err;
+            }
+            if (res == properties::error::INVALID_KEY && !allow_invalid_key) {
+                auto err = properties::key_error(m_id, name);
+                logger()->warn(err.what());
+                throw err;
+            } else if (res == properties::error::INVALID_VALUE) {
+                auto err = properties::value_error(m_id, name, value);
+                logger()->warn(err.what());
+                throw err;
             }
         }
         property_change_handler();

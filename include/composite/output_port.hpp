@@ -19,8 +19,11 @@
 
 #pragma once
 
-#include "port.hpp"
 #include "input_port.hpp"
+#ifdef COMPOSITE_USE_NATS
+#include "nats/client.hpp"
+#endif
+#include "port.hpp"
 #include "timestamp.hpp"
 
 #include <algorithm>
@@ -32,6 +35,7 @@
 namespace composite {
 
 template <traits::smart_ptr T>
+requires std::ranges::contiguous_range<typename T::element_type>
 class output_port : public port {
 public:
     using value_type = typename T::element_type;
@@ -118,6 +122,23 @@ public:
         }
     }
 
+#ifdef COMPOSITE_USE_NATS
+    auto connect(std::string_view url, std::string_view subject) -> bool override {
+        if (m_nats_client != nullptr) {
+            return false;
+        }
+        m_nats_client = std::make_unique<nats::client>(std::string{url});
+        if (!m_nats_client->is_connected()) {
+            return false;
+        }
+        m_nats_subjects.emplace_back(subject);
+        if (!m_thread.joinable()) {
+            m_thread = std::jthread(&output_port::thread_func, this);
+        }
+        return true;
+    }
+#endif
+
     auto disconnect() -> void {
         m_connected_ports.clear();
         m_thread.request_stop();
@@ -130,7 +151,7 @@ public:
         return !m_connected_ports.empty();
     }
 
-    void eos(bool value) const {
+    auto eos(bool value) const -> void {
         for (auto port : m_connected_ports) {
             if (port) {
                 if (port->is_unique_type()) {
@@ -148,6 +169,10 @@ private:
     std::deque<std::tuple<buffer_type, timestamp_type>> m_queue;
     std::mutex m_data_mtx;
     std::condition_variable m_data_cv;
+#ifdef COMPOSITE_USE_NATS
+    std::unique_ptr<nats::client> m_nats_client;
+    std::vector<std::string> m_nats_subjects;
+#endif
 
     auto thread_func(std::stop_token token) -> void {
         while (!token.stop_requested()) {
@@ -158,6 +183,15 @@ private:
                 auto [data, ts] = std::move(m_queue.front());
                 m_queue.pop_front();
                 lock.unlock();
+#ifdef COMPOSITE_USE_NATS
+                // Send to NATS subjects
+                for (const auto& subject : m_nats_subjects) {
+                    m_nats_client->publish(
+                        subject,
+                        std::as_bytes(std::span{std::ranges::data(*data), std::ranges::size(*data)})
+                    );
+                }
+#endif
                 // Determine structure of fan-out
                 auto all_unique = true;
                 for (const auto port : m_connected_ports) {

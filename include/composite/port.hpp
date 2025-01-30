@@ -60,6 +60,13 @@ public:
         // to be implemented by derived class
     }
 
+#ifdef COMPOSITE_USE_NATS
+    virtual auto connect(std::string_view url, std::string_view subject) -> bool {
+        // to be implemented by derived class
+        return false;
+    }
+#endif
+
 private:
     std::string m_name;
 
