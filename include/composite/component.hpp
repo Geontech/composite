@@ -174,12 +174,15 @@ public:
     auto set_properties(
       const std::vector<std::pair<std::string, std::string>>& prop_values,
       properties::config_type config=properties::config_type::INITIALIZE,
-      bool allow_invalid_key=false) -> void {
+      bool allow_unknown_key=false) -> void {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         const auto& props = properties();
         for (const auto& [name, value] : prop_values) {
             if (!props.contains(name)) {
+                if (allow_unknown_key) {
+                    continue;
+                }
                 auto err = properties::key_error(m_id, name);
                 logger()->warn(err.what());
                 throw err;
@@ -213,7 +216,7 @@ public:
                 logger()->warn(err.what());
                 throw err;
             }
-            if (res == properties::error::INVALID_KEY && !allow_invalid_key) {
+            if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
                 auto err = properties::key_error(m_id, name);
                 logger()->warn(err.what());
                 throw err;
