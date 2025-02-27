@@ -177,6 +177,7 @@ public:
       bool allow_unknown_key=false) -> void {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
+        m_prop_change_requested = false;
         const auto& props = properties();
         for (const auto& [name, value] : prop_values) {
             if (!props.contains(name)) {
@@ -227,7 +228,6 @@ public:
             }
         }
         property_change_handler();
-        m_prop_change_requested = false;
     }
 
     auto add_property_change_listener(std::string_view name, property_set::change_func_type func) -> void {
@@ -269,7 +269,7 @@ private:
         using enum retval;
         while (!token.stop_requested()) {
             if (m_prop_change_requested) {
-                std::this_thread::yield();
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
             auto lk = std::scoped_lock{m_prop_mtx};
             auto res = process();
