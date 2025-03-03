@@ -24,6 +24,7 @@ add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers.cpp
 )
 # Compile definitions
+target_compile_definitions(composite-cli PRIVATE CPPHTTPLIB_THREAD_POOL_COUNT=2)
 if(COMPOSITE_USE_OPENSSL)
     target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_OPENSSL=1)
 endif()
