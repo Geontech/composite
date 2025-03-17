@@ -56,7 +56,7 @@ public:
       m_name(name),
       m_id(m_name),
       m_logger(spdlog::stdout_color_mt(m_name)) {
-        add_property("thread_delay", &m_delay).units("ns");
+        add_property("noop_thread_delay", &m_delay).units("ns");
         using enum composite::properties::config_type;
         add_property("enabled", &m_enabled).configurability(RUNTIME);
     }
@@ -81,6 +81,7 @@ public:
 
     auto start() -> void override {
         m_thread = std::jthread(&component::thread_func, this);
+        pthread_setname_np(m_thread.native_handle(), m_id.c_str());
         m_enabled = true;
     }
 

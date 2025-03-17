@@ -33,6 +33,8 @@ auto close_func(void* p) -> void;
 
 using component_handles_type = std::vector<std::unique_ptr<void, decltype(&close_func)>>;
 
+auto generate_app_name() -> std::string;
+
 auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component>;
 
 auto validate_connection(const nlohmann::json& conn_json) -> std::tuple<std::string, std::string, std::string>;

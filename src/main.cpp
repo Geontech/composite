@@ -122,7 +122,11 @@ auto main(int argc, char** argv) -> int {
     auto comp_handles = composite::component_handles_type{};
 
     // Create a new application object
-    auto app_name = app_json["name"].get<std::string>();
+    auto app_name = composite::generate_app_name();
+    if (app_json.contains("name")) {
+        app_name = app_json["name"].get<std::string>();
+    }
+    pthread_setname_np(pthread_self(), app_name.c_str());
     auto app = composite::application{app_name};
 
     // Get components and load them
