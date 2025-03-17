@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <format>
+#include <random>
 #include <spdlog/spdlog.h>
 
 namespace composite {
@@ -10,6 +11,18 @@ namespace composite {
 auto close_func(void* p) -> void {
     dlclose(p);
 };
+
+auto generate_app_name() -> std::string {
+    auto app_name = std::string{"composite-"};
+    auto characters = std::string{"abcdefghijklmnopqrstuvwxyz0123456789"};
+    auto rd = std::random_device{};
+    auto generator = std::mt19937{rd()};
+    auto distribution = std::uniform_int_distribution<std::size_t>{0, characters.size() - 1};
+    for (auto i = 0; i < 8; ++i) {
+        app_name += characters.at(distribution(generator));
+    }
+    return app_name;
+}
 
 auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component> {
     // Get component name
