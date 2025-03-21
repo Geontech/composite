@@ -27,8 +27,8 @@
 
 #include <concepts>
 #include <mutex>
-#include <sstream>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -52,16 +52,7 @@ public:
         std::pair<std::string, std::string> input;
     };
 
-    explicit component(std::string_view name) :
-      m_name(name),
-      m_id(m_name),
-      m_logger(spdlog::stdout_color_mt(m_name)) {
-        add_property("noop_thread_delay", &m_delay).units("ns");
-        using enum composite::properties::config_type;
-        add_property("enabled", &m_enabled).configurability(RUNTIME);
-    }
-
-    ~component() override = default;
+    virtual ~component() override = default;
 
     auto name() const noexcept -> std::string {
         return m_name;
@@ -73,6 +64,8 @@ public:
 
     auto id(std::string_view id) -> void {
         m_id = id;
+        auto pattern = std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
+        m_logger->set_pattern(pattern);
     }
 
     auto initialize() -> void override {
@@ -249,6 +242,15 @@ public:
     }
 
 protected:
+    explicit component(std::string_view name) :
+      m_name(name),
+      m_id(m_name),
+      m_logger(spdlog::stdout_color_mt(std::format("{}_{}", m_name, (void*)this))) {
+        add_property("noop_thread_delay", &m_delay).units("ns");
+        using enum composite::properties::config_type;
+        add_property("enabled", &m_enabled).configurability(RUNTIME);
+    }
+
     auto logger() const -> std::shared_ptr<spdlog::logger> {
         return m_logger;
     }

@@ -261,7 +261,9 @@ auto main(int argc, char** argv) -> int {
 
     // Start 
     spdlog::trace("listening at {}:{}", server_addr, server_port);
-    server->listen(server_addr, server_port);
+    auto server_thread = std::jthread([&]() {
+        server->listen(server_addr, server_port);
+    });
 
     // Wait for signal to stop
     spdlog::trace("waiting for signal...");

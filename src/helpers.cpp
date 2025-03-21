@@ -72,6 +72,8 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
     // Set id if needed
     if (comp_json.contains("id")) {
         comp_ptr->id(comp_json["id"].get<std::string>());
+    } else {
+        comp_ptr->id(name);
     }
     // Store handle for closing later
     handles.emplace_back(std::move(comp_handle));
