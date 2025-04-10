@@ -66,6 +66,13 @@ set(HTTPLIB_INSTALL OFF)
 # Make all deps available
 FetchContent_MakeAvailable(argparse json spdlog)
 
+# Options for enabling target RUNPATH
+option(COMPOSITE_EMBED_MODULE_RPATH "Enable embedding a RUNPATH in composite-cli to find modules" ON)
+set(DEFAULT_MODULE_RPATH "$ORIGIN/../lib64" CACHE INTERNAL "Default RPATH for modules")
+# Define the user-configurable RUNPATH string variable
+set(COMPOSITE_MODULE_RPATH_VALUE "${DEFAULT_MODULE_RPATH}" CACHE STRING
+    "The RUNPATH string to embed (e.g., '$ORIGIN/../lib' or '/opt/myapp/lib'). Used only if COMPOSITE_EMBED_MODULE_RPATH is ON.")
+
 # Check for NATS enable
 option(COMPOSITE_USE_NATS "Compile with NATS functionality" OFF)
 if(COMPOSITE_USE_NATS)

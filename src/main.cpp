@@ -89,6 +89,16 @@ auto main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
     }
 
+    // Setup signal handlers
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGINT);
+    sigaddset(&sigset, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &sigset, nullptr) != 0) {
+        std::cerr << "failed to block signals: " << strerror(errno) << std::endl;
+        return EXIT_FAILURE;
+    }
+
     // Setup logging
     auto level = spdlog::level::from_str(program.get<std::string>("--log-level"));
     spdlog::set_level(level);
@@ -235,47 +245,54 @@ auto main(int argc, char** argv) -> int {
     auto server = composite::make_server(app, comp_handles);
 #endif
 
-    // Setup signal handlers
-    auto signals = std::vector<int>{SIGINT, SIGKILL};
-    auto sigset = sigset_t{};
-    sigemptyset(&sigset);
-    for (const auto& sig : signals) {
-        sigaddset(&sigset, sig);
-    }
-    pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
-    auto signal_future = std::async(std::launch::async, [&sigset, &server]() {
+    // Create the signal handling thread
+    auto signal_future = std::async(std::launch::async, [sigset]() mutable -> int {
         auto signum = int{};
-        sigwait(&sigset, &signum);
-        printf("\r  \r");
-        server->stop();
+        if (auto rc = sigwait(&sigset, &signum); rc != 0) {
+            spdlog::error("sigwait failed: {}", strerror(rc));
+            return -1;
+        }
+        spdlog::trace("signal {} received, initiating shutdown...", signum);
         return signum;
     });
 
-    // Initialize the application
-    spdlog::trace("initializing application '{}'", app.name());
-    app.initialize();
+    try {
+        // Initialize the application
+        spdlog::trace("initializing application '{}'", app.name());
+        app.initialize();
 
-    // Start the application
-    spdlog::trace("starting application '{}'", app.name());
-    app.start();
+        // Start the application
+        spdlog::trace("starting application '{}'", app.name());
+        app.start();
 
-    // Start 
-    spdlog::trace("listening at {}:{}", server_addr, server_port);
-    auto server_thread = std::jthread([&]() {
-        server->listen(server_addr, server_port);
-    });
+        // Start REST server
+        spdlog::trace("listening at {}:{}", server_addr, server_port);
+        auto server_thread = std::jthread([&]() {
+            server->listen(server_addr, server_port);
+        });
 
-    // Wait for signal to stop
-    spdlog::trace("waiting for signal...");
-    signal_future.wait();
+        // Wait for signal to stop
+        spdlog::trace("waiting for signal...");
+        signal_future.wait();
 
-    // Stop the application
-    spdlog::trace("stopping application '{}'", app.name());
-    app.stop();
+        // Stop server
+        spdlog::trace("stopping server...");
+        server->stop();
 
-    // Clean up the application resources
-    spdlog::trace("clearing application '{}'", app.name());
-    app.clear();
+        // Stop the application
+        spdlog::trace("stopping application '{}'", app.name());
+        app.stop();
+
+        // Clean up the application resources
+        spdlog::trace("clearing application '{}'", app.name());
+        app.clear();
+    } catch (const std::exception& e) {
+        spdlog::critical("unhandled exception in main: {}", e.what());
+        return EXIT_FAILURE;
+    }
+
+    spdlog::trace("complete");
+    spdlog::shutdown();
 
     return EXIT_SUCCESS;
 }
