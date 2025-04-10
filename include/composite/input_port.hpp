@@ -50,7 +50,6 @@ public:
     explicit input_port(std::string_view name) : port(name) {}
 
     ~input_port() override {
-        m_eos = true;
         m_data_cv.notify_all();
     }
 
@@ -84,17 +83,13 @@ public:
     auto get_data() -> std::tuple<buffer_type, timestamp_type> {
         using namespace std::chrono_literals;
         auto lock = std::unique_lock{m_data_mtx};
-        m_data_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty() || m_eos; });
+        m_data_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty(); });
         if (!m_queue.empty()) {
             auto retval = std::move(m_queue.front());
             m_queue.pop_front();
             return retval;
         }
         return {};
-    }
-
-    auto eos() const noexcept -> bool {
-        return m_eos;
     }
 
 private:
@@ -109,15 +104,10 @@ private:
         }
     }
 
-    auto eos(bool value) -> void {
-        m_eos = value;
-    }
-
     std::deque<std::tuple<buffer_type, timestamp_type>> m_queue;
     std::size_t m_depth{std::numeric_limits<std::size_t>::max()};
     std::mutex m_data_mtx;
     std::condition_variable m_data_cv;
-    std::atomic_bool m_eos{false};
 
 }; // class input_port
 

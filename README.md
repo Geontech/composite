@@ -59,8 +59,8 @@ class MyComponent : public composite::component {
 public:
     MyComponent() : composite::component("MyComponent") {
         // Add ports to port set
-        add_port(m_in_port.get());
-        add_port(m_out_port.get());
+        add_port(&m_in_port);
+        add_port(&m_out_port);
 
         // Add properties to configure
         add_property("property_name", &m_property_name);
@@ -83,13 +83,14 @@ public:
 
         // Send data via an output port
         m_out_port->send_data(std::move(data), ts);
+
         return NORMAL;
     }
 
 private:
     // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
-    std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
+    input_port_t m_in_port{"data_in"};
+    output_port_t m_out_port{"data_out"};
 
     // Properties
     uint32_t m_property_name{};
