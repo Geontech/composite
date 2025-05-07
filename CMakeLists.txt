@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(composite VERSION 0.2.1 LANGUAGES CXX)
+project(composite VERSION 0.4.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 # Set the C++ version required
 set(CMAKE_CXX_STANDARD 20)

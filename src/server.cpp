@@ -16,7 +16,7 @@ auto to_json(nlohmann::json& json_obj, const port& port) {
 
 auto to_json(nlohmann::json& json_obj, const std::map<std::string, port*>& ports) {
     json_obj = nlohmann::json::array();
-    for (auto& [name, port] : ports) {
+    for (const auto& [name, port] : ports) {
         if (port != nullptr) {
             json_obj.push_back(*port);
         }
@@ -35,37 +35,129 @@ auto to_json(nlohmann::json& json_obj, const std::vector<component::connection>&
     }
 }
 
+auto to_json(nlohmann::json& json_obj, const composite::property_set& set) -> void; // forward
+
+auto to_json(nlohmann::json& json_obj, const composite::property& prop) {
+    if (prop.is_structured()) {
+        nlohmann::json nested;
+        to_json(nested, prop.structured());
+    } else {
+        auto type = prop.type();
+        json_obj["type"] = type;
+        json_obj["units"] = prop.units();
+        json_obj["configurability"] = (static_cast<int>(prop.configurability()) == 1) ? "runtime" : "initialize";
+        if (type == "bool") {
+            json_obj["value"] = std::format("{}", *std::any_cast<bool*>(prop.value()));
+        } else if (type == "bool?") {
+            auto opt_val = *std::any_cast<std::optional<bool>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::format("{}", opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "string") {
+            json_obj["value"] = *std::any_cast<std::string*>(prop.value());
+        } else if (type == "string?") {
+            auto opt_val = *std::any_cast<std::optional<std::string>*>(prop.value());
+            json_obj["value"] = opt_val.value_or(nullptr);
+        } else if (type == "int16") {
+            json_obj["value"] = std::to_string(*std::any_cast<int16_t*>(prop.value()));
+        } else if (type == "int16?") {
+            auto opt_val = *std::any_cast<std::optional<int16_t>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "uint16") {
+            json_obj["value"] = std::to_string(*std::any_cast<uint16_t*>(prop.value()));
+        } else if (type == "uint16?") {
+            auto opt_val = *std::any_cast<std::optional<uint16_t>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "int32") {
+            json_obj["value"] = std::to_string(*std::any_cast<int32_t*>(prop.value()));
+        } else if (type == "int32?") {
+            auto opt_val = *std::any_cast<std::optional<int32_t>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "uint32") {
+            json_obj["value"] = std::to_string(*std::any_cast<uint32_t*>(prop.value()));
+        } else if (type == "uint32?") {
+            auto opt_val = *std::any_cast<std::optional<uint32_t>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "int64") {
+            json_obj["value"] = std::to_string(*std::any_cast<int64_t*>(prop.value()));
+        } else if (type == "int64?") {
+            auto opt_val = *std::any_cast<std::optional<int64_t>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "uint64") {
+            json_obj["value"] = std::to_string(*std::any_cast<uint64_t*>(prop.value()));
+        } else if (type == "uint64?") {
+            auto opt_val = *std::any_cast<std::optional<uint64_t>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "float") {
+            json_obj["value"] = std::to_string(*std::any_cast<float*>(prop.value()));
+        } else if (type == "float?") {
+            auto opt_val = *std::any_cast<std::optional<float>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        } else if (type == "double") {
+            json_obj["value"] = std::to_string(*std::any_cast<double*>(prop.value()));
+        } else if (type == "double?") {
+            auto opt_val = *std::any_cast<std::optional<double>*>(prop.value());
+            if (opt_val.has_value()) {
+                json_obj["value"] = std::to_string(opt_val.value());
+            } else {
+                json_obj["value"] = nullptr;
+            }
+        }
+    }
+}
+
+auto to_json(nlohmann::json& json_obj, const composite::property_set& set) -> void {
+    for (const auto& [name, prop] : set.properties()) {
+        auto prop_obj = nlohmann::json::object();
+        to_json(prop_obj, prop);
+        json_obj[name] = prop_obj;
+    }
+}
+
 auto to_json(nlohmann::json& json_obj, const component& comp) {
     json_obj["id"] = comp.id();
     json_obj["name"] = comp.name();
     json_obj["ports"] = comp.ports();
     json_obj["connections"] = comp.connections();
-    auto props_obj = nlohmann::json::array();
+    auto props_obj = nlohmann::json{};
     for (const auto& [name, value] : comp.properties()) {
         auto prop_obj = nlohmann::json::object();
-        auto type = value.type();
-        prop_obj["name"] = name;
-        prop_obj["type"] = type;
-        prop_obj["units"] = value.units();
-        prop_obj["configurability"] = (static_cast<int>(value.configurability()) == 1) ? "runtime" : "initialize";
-        if (type == "bool") {
-            prop_obj["value"] = std::format("{}", comp.get_property<bool>(name));
-        } else if (type == "string") {
-            prop_obj["value"] = comp.get_property<std::string>(name);
-        } else if (type == "int32") {
-            prop_obj["value"] = std::to_string(comp.get_property<int32_t>(name));
-        } else if (type == "uint32") {
-            prop_obj["value"] = std::to_string(comp.get_property<uint32_t>(name));
-        } else if (type == "int64") {
-            prop_obj["value"] = std::to_string(comp.get_property<int64_t>(name));
-        } else if (type == "uint64") {
-            prop_obj["value"] = std::to_string(comp.get_property<uint64_t>(name));
-        } else if (type == "float") {
-            prop_obj["value"] = std::to_string(comp.get_property<float>(name));
-        } else if (type == "double") {
-            prop_obj["value"] = std::to_string(comp.get_property<double>(name));
+        if (value.is_structured()) {
+            to_json(prop_obj, value.structured());
+        } else {
+            to_json(prop_obj, value);
         }
-        props_obj.push_back(prop_obj);
+        props_obj[name] = prop_obj;
     }
     json_obj["properties"] = props_obj;
 }
@@ -106,9 +198,7 @@ auto set_component_properties(
     try {
         spdlog::trace("patching component-level properties on {}", comp->id());
         auto props = std::vector<std::pair<std::string,std::string>>{};
-        for (const auto& prop : properties) {
-            auto name = prop["name"].get<std::string>();
-            auto value = prop["value"].get<std::string>();
+        for (const auto& [name, value] : properties.get<std::map<std::string,std::string>>()) {
             if (name == "enabled") {
                 (value == "false" || value == "0") ? comp->stop() : comp->start();
             } else {
@@ -213,8 +303,8 @@ auto make_server(application& app, composite::component_handles_type& handles) -
                     // Set component-level properties
                     spdlog::trace("setting component-level properties on {}", comp_ptr->id());
                     auto props = std::vector<std::pair<std::string,std::string>>{};
-                    for (const auto& prop : comp_json["properties"]) {
-                        props.emplace_back(prop["name"], prop["value"].get<std::string>());
+                    for (const auto& [name, value] : comp_json["properties"].get<std::map<std::string,std::string>>()) {
+                        props.emplace_back(name, value);
                     }
                     comp_ptr->set_properties(props);
                 } catch (const std::runtime_error& err) {

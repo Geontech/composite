@@ -100,7 +100,7 @@ public:
         return m_port_set.get_port(name);
     }
 
-    auto ports() const -> const std::map<std::string, port*>& {
+    auto ports() const -> const port_set::port_map_type& {
         return m_port_set.ports();
     }
 
@@ -164,6 +164,11 @@ public:
        return  m_prop_set.add_property(name, prop);
     }
 
+    template <typename T, typename Func>
+    auto add_struct_property(std::string_view name, T* obj, Func&& register_fields) -> property& {
+        return m_prop_set.add_struct_property(name, obj, register_fields);
+    }
+
     template <typename T>
     auto get_property(std::string_view name) const -> T {
         return m_prop_set.get_property<T>(name);
@@ -176,9 +181,9 @@ public:
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         m_prop_change_requested = false;
-        const auto& props = properties();
         for (const auto& [name, value] : prop_values) {
-            if (!props.contains(name)) {
+            auto* prop = m_prop_set.resolve_property(name);
+            if (prop == nullptr) {
                 if (allow_unknown_key) {
                     continue;
                 }
@@ -187,17 +192,24 @@ public:
                 throw err;
             }
             using enum properties::config_type;
-            if ((config == RUNTIME) && (props.at(name).configurability() == INITIALIZE)) {
+            if ((config == RUNTIME) && (prop->configurability() == INITIALIZE)) {
                 auto err = properties::configurability_error(m_id, name);
                 logger()->warn(err.what());
                 throw err;
             }
-            auto type = props.at(name).type();
+            auto type = prop->type();
+            if (prop->is_optional()) {
+                type.pop_back();
+            }
             auto res = properties::error::OK;
             if (type == "bool") {
                 res = m_prop_set.set_property(name, (value == "1" || value == "true") ? true : false);
             } else if (type == "string") {
                 res = m_prop_set.set_property(name, value);
+            } else if (type == "int16") {
+                res = m_prop_set.set_property(name, static_cast<int16_t>(std::stoi(value)));
+            } else if (type == "uint16") {
+                res = m_prop_set.set_property(name, static_cast<uint16_t>(std::stoul(value)));
             } else if (type == "int32") {
                 res = m_prop_set.set_property(name, static_cast<int32_t>(std::stoi(value)));
             } else if (type == "uint32") {
@@ -249,7 +261,6 @@ protected:
     explicit component(std::string_view name) :
       m_name(name),
       m_id(m_name),
-      m_sink(std::make_shared<spdlog::sinks::stdout_color_sink_mt>()),
       m_logger(std::make_shared<spdlog::logger>(m_name, m_sink)) {
         add_property("noop_thread_delay", &m_delay).units("ns");
         using enum composite::properties::config_type;
@@ -263,7 +274,7 @@ protected:
 private:
     std::string m_name;
     std::string m_id;
-    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink;
+    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     std::shared_ptr<spdlog::logger> m_logger;
     std::jthread m_thread;
     uint32_t m_delay{DEFAULT_DELAY};

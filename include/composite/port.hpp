@@ -41,7 +41,6 @@ template<typename T> constexpr bool is_unique_ptr_v = is_unique_ptr<T>::value;
 template<typename T> concept smart_ptr = is_shared_ptr_v<T> || is_unique_ptr_v<T>;
 
 } // namespace traits
-    
 
 class port {
 public:
