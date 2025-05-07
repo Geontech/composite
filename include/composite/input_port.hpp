@@ -19,6 +19,7 @@
  
 #pragma once
 
+#include "metadata.hpp"
 #include "port.hpp"
 #include "timestamp.hpp"
 
@@ -28,6 +29,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <typeinfo>
 #include <vector>
@@ -41,11 +43,11 @@ class output_port;
 template <traits::smart_ptr T>
 requires std::ranges::contiguous_range<typename T::element_type>
 class input_port : public port {
-    static constexpr int WAIT_DURATION{2}; // seconds
+    static constexpr int WAIT_DURATION{1}; // seconds
 public:
     using value_type = typename T::element_type;
     using buffer_type = T;
-    using timestamp_type = timestamp;
+    using metadata_type = std::optional<metadata>;
 
     explicit input_port(std::string_view name) : port(name) {}
 
@@ -54,6 +56,7 @@ public:
     }
 
     auto depth() const -> std::size_t {
+        const auto lock = std::scoped_lock{m_data_mtx};
         return m_depth;
     }
 
@@ -80,7 +83,7 @@ public:
         return traits::is_unique_ptr_v<T>;
     }
 
-    auto get_data() -> std::tuple<buffer_type, timestamp_type> {
+    auto get_data() -> std::tuple<buffer_type, timestamp, metadata_type> {
         using namespace std::chrono_literals;
         auto lock = std::unique_lock{m_data_mtx};
         m_data_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty(); });
@@ -96,18 +99,25 @@ private:
     friend class output_port<std::unique_ptr<value_type>>;
     friend class output_port<std::shared_ptr<value_type>>;
 
-    auto add_data(std::tuple<buffer_type, timestamp_type>&& data) -> void {
+    auto add_data(buffer_type data, timestamp ts) -> void {
         const auto lock = std::scoped_lock{m_data_mtx};
         if (m_queue.size() < m_depth) {
-            m_queue.emplace_back(std::move(data));
+            m_queue.emplace_back(std::make_tuple(std::move(data), ts, m_metadata));
+            m_metadata.reset();
             m_data_cv.notify_one();
         }
     }
 
-    std::deque<std::tuple<buffer_type, timestamp_type>> m_queue;
+    auto set_metadata(const metadata& md) -> void {
+        const auto lock = std::scoped_lock{m_data_mtx};
+        m_metadata = md;
+    }
+
+    std::deque<std::tuple<buffer_type, timestamp, metadata_type>> m_queue;
     std::size_t m_depth{std::numeric_limits<std::size_t>::max()};
     std::mutex m_data_mtx;
     std::condition_variable m_data_cv;
+    metadata_type m_metadata;
 
 }; // class input_port
 

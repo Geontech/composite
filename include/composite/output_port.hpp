@@ -69,6 +69,21 @@ public:
         }
     }
 
+    auto send_metadata(const metadata& value) const -> void {
+        for (auto port : m_connected_ports) {
+            if (port == nullptr) {
+                continue;
+            }
+            if (port->is_unique_type()) {
+                auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
+                dst->set_metadata(value);
+            } else {
+                auto dst = static_cast<input_port<std::shared_ptr<value_type>>*>(port);
+                dst->set_metadata(value);
+            }
+        }
+    }
+
     auto connect(port* port) -> void override {
         m_connected_ports.emplace_back(port);
         // sort with unique_ptr ports at the back
@@ -117,20 +132,20 @@ private:
                 auto dst = static_cast<input_port<T>*>(port);
                 if (i == m_connected_ports.size() - 1) {
                     // last port, move incoming
-                    dst->add_data({std::move(data), ts});
+                    dst->add_data(std::move(data), ts);
                 } else {
                     // make a copy of the incoming data
-                    dst->add_data({std::make_unique<value_type>(*data), ts});
+                    dst->add_data(std::make_unique<value_type>(*data), ts);
                 }
             } else { // u -> s
                 auto dst = static_cast<input_port<std::shared_ptr<value_type>>*>(port);
                 if (i == m_connected_ports.size() - 1) {
-                    dst->add_data({std::shared_ptr<value_type>{data.release()}, ts});
+                    dst->add_data(std::shared_ptr<value_type>{data.release()}, ts);
                 } else {
                     if (shared_data == nullptr) {
                         shared_data = std::make_shared<value_type>(*data);
                     }
-                    dst->add_data({shared_data, ts});
+                    dst->add_data(shared_data, ts);
                 }
             }
         }
@@ -144,13 +159,13 @@ private:
             if (port->is_unique_type()) {
                 auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
                 if (m_connected_ports.size() == 1) {
-                    dst->add_data({std::make_unique<value_type>(std::move(*data)), ts});
+                    dst->add_data(std::make_unique<value_type>(std::move(*data)), ts);
                 } else {
-                    dst->add_data({std::make_unique<value_type>(*data), ts});
+                    dst->add_data(std::make_unique<value_type>(*data), ts);
                 }
             } else {
                 auto dst = static_cast<input_port<T>*>(port);
-                dst->add_data({data, ts});
+                dst->add_data(data, ts);
             }
         }
     }
