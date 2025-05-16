@@ -25,14 +25,12 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <deque>
 #include <limits>
-#include <mutex>
 #include <optional>
+#include <ranges>
 #include <tuple>
 #include <typeinfo>
-#include <vector>
 
 namespace composite {
 
@@ -42,36 +40,23 @@ class output_port;
 
 template <traits::smart_ptr T>
 requires std::ranges::contiguous_range<typename T::element_type>
-class input_port : public port {
+class input_port : public input_port_base {
     static constexpr int WAIT_DURATION{1}; // seconds
 public:
     using value_type = typename T::element_type;
     using buffer_type = T;
-    using metadata_type = std::optional<metadata>;
 
-    explicit input_port(std::string_view name) : port(name) {}
+    using input_port_base::input_port_base;
 
-    ~input_port() override {
-        m_data_cv.notify_all();
-    }
+    ~input_port() override = default;
 
-    auto depth() const -> std::size_t {
-        const auto lock = std::scoped_lock{m_data_mtx};
-        return m_depth;
-    }
-
-    auto depth(std::size_t value) -> void {
-        const auto lock = std::scoped_lock{m_data_mtx};
-        m_depth = value;
-    }
-
-    auto size() -> std::size_t {
-        const auto lock = std::scoped_lock{m_data_mtx};
+    auto size() const -> std::size_t {
+        const auto lock = std::scoped_lock{m_mtx};
         return m_queue.size();
     }
 
     auto clear() -> void {
-        const auto lock = std::scoped_lock{m_data_mtx};
+        const auto lock = std::scoped_lock{m_mtx};
         m_queue.clear();
     }
 
@@ -83,10 +68,10 @@ public:
         return traits::is_unique_ptr_v<T>;
     }
 
-    auto get_data() -> std::tuple<buffer_type, timestamp, metadata_type> {
+    auto get_data() -> std::tuple<buffer_type, composite::timestamp, std::optional<composite::metadata>> {
         using namespace std::chrono_literals;
-        auto lock = std::unique_lock{m_data_mtx};
-        m_data_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty(); });
+        auto lock = std::unique_lock{m_mtx};
+        m_cv.wait_for(lock, WAIT_DURATION*1s, [this]{ return !m_queue.empty(); });
         if (!m_queue.empty()) {
             auto retval = std::move(m_queue.front());
             m_queue.pop_front();
@@ -96,28 +81,19 @@ public:
     }
 
 private:
-    friend class output_port<std::unique_ptr<value_type>>;
-    friend class output_port<std::shared_ptr<value_type>>;
-
     auto add_data(buffer_type data, timestamp ts) -> void {
-        const auto lock = std::scoped_lock{m_data_mtx};
+        const auto lock = std::scoped_lock{m_mtx};
         if (m_queue.size() < m_depth) {
             m_queue.emplace_back(std::make_tuple(std::move(data), ts, m_metadata));
             m_metadata.reset();
-            m_data_cv.notify_one();
+            m_cv.notify_one();
         }
     }
 
-    auto set_metadata(const metadata& md) -> void {
-        const auto lock = std::scoped_lock{m_data_mtx};
-        m_metadata = md;
-    }
+    std::deque<std::tuple<buffer_type, composite::timestamp, std::optional<composite::metadata>>> m_queue;
 
-    std::deque<std::tuple<buffer_type, timestamp, metadata_type>> m_queue;
-    std::size_t m_depth{std::numeric_limits<std::size_t>::max()};
-    std::mutex m_data_mtx;
-    std::condition_variable m_data_cv;
-    metadata_type m_metadata;
+    friend class output_port<std::unique_ptr<value_type>>;
+    friend class output_port<std::shared_ptr<value_type>>;
 
 }; // class input_port
 

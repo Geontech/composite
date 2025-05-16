@@ -23,6 +23,7 @@
 
 #include <map>
 #include <string>
+#include <type_traits>
 
 namespace composite {
 
@@ -34,9 +35,13 @@ public:
         m_ports.try_emplace(port->name(), port);
     }
 
-    auto get_port(std::string_view name) -> port* {
-        if (m_ports.contains(std::string{name})) {
-            return m_ports.at(std::string{name});
+    template <typename T>
+    requires (std::is_base_of_v<input_port_base, T> || std::is_base_of_v<output_port_base, T>)
+    auto get_port(std::string_view name) -> T* {
+        if (auto it = m_ports.find(std::string{name}); it != m_ports.end()) {
+            if (auto casted = dynamic_cast<T*>(it->second)) {
+                return casted;
+            }
         }
         return nullptr;
     }

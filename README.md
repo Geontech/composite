@@ -17,7 +17,7 @@ Ensure you have the following installed:
 
 - [CMake](https://cmake.org/) (version 3.15 or higher)
 - A compatible C++ compiler (e.g., GCC, Clang) with C++20 support
-- OpenSSL (version 3.0 or higher) if compiling with  `-DCOMPOSITE_USE_OPENSSL=ON`
+- OpenSSL (version 3.0 or higher) if compiling with `-DCOMPOSITE_USE_OPENSSL=ON`
 - [nats.c](https://github.com/nats-io/nats.c) if compiling with `-DCOMPOSITE_USE_NATS=ON`
 
 ### Build and Install
@@ -32,6 +32,116 @@ cmake --install build
 
 - `COMPOSITE_USE_NATS`: Enable components to publish data to a NATS server on a defined subject
 - `COMPOSITE_USE_OPENSSL`: Compile with OpenSSL support to enable a secure REST server
+
+## Composite CLI Application and Configuration
+
+The **composite** framework includes a command-line interface (CLI) application, `composite-cli`,
+for running and managing composite applications. This application uses a JSON file for its configuration.
+
+```bash
+$ composite-cli -h
+Usage: composite-cli [--help] [--version] --config-file VAR [--server VAR] [--port VAR] [--log-level VAR]
+
+Optional arguments:
+  -h, --help         shows help message and exits 
+  -v, --version      prints version information and exits 
+  -f, --config-file  application configuration file [required]
+  -s, --server       REST server address [nargs=0..1] [default: "localhost"]
+  -p, --port         REST server port [nargs=0..1] [default: 5000]
+  -l, --log-level    log level [trace, debug, info, warning, error, critical, off] [nargs=0..1] [default: "info"]
+```
+
+### JSON Configuration File
+
+The `composite-cli` application requires a JSON file to define the structure and behavior of the streaming application.
+This file specifies the components, their properties, and how they are interconnected.
+
+#### Schema Overview
+
+The main structure of the JSON configuration file includes the following top-level keys:
+
+1. **name (optional, string):** Specifies a name for the application. If not provided, a default name will be generated.
+
+```json
+{
+    "name": "my_streaming_application"
+    ...
+}
+```
+
+2. **properties (optional, object):** Defines application-level properties that can be applied to components.
+These properties are applied to all components and are applied before the component-level properties. All property
+values must be defined as strings.
+
+```json
+{
+    "name": "my_streaming_application",
+    "properties": {
+        "global_setting": "value1",
+        "feature_flags": {
+            "enable_x": "true"
+        }
+    }
+    ...
+}
+```
+
+3. **components (required, array of objects):** An array where each object defines a component to be loaded into the application.
+Each component object must contain:
+    - **name (required, string):** The name of the shared object to be loaded (e.g., `"name": "my_component"` will attempt to load `libmy_component.so`).
+    - **id (optional, string):** When defining two components of the same name, a unique identifier must be provided with this field
+      to differentiate them. By default, the `id` is assigned the `name`. This identifier must also be used when making connections (see below).
+    - **properties (optional, object):** Defines component-specific properties that can override application-level properties or
+      provide unique configurations for this component. Just as with application-level properties, all property values must be defined
+      as strings.
+
+```json
+{
+    "name": "my_streaming_application",
+    "properties": {
+        ...
+    },
+    "components": [
+        {
+            "name": "my_component",
+            "properties": {
+                "specific_param": "123",
+                "processing_gain": "2.5"
+            }
+        }
+    ]
+}
+```
+
+4. **connections (required, array of objects):** An array where each object defines a connection between an output
+port of one component and an input port of another component (or a NATS subject). Each connection object must contain:
+    - **output (required, object):** Specifies the source of the data. Must contain keys identifying the output component and
+      its port (e.g., "component": "component_A_id", "port": "data_out").
+    - **input (required, object):** Specifies the destination of the data. Must contain keys identifying the input component
+      and its port (e.g., "component": "component_B_id", "port": "data_in").
+        - For NATS output, the object keys become `"nats"` and `"subject"` for defining the NATS URI and subject to publish data to.
+
+```json
+{
+    "name": "my_streaming_application",
+    "properties": {
+        ...
+    },
+    "components": [
+        ...
+    ],
+    "connections": [
+        {
+            "output": { "component": "source_component", "port": "output_data" },
+            "input": { "component": "processing_component", "port": "input_data" }
+        },
+        {
+            "output": { "component": "processing_component", "port": "processed_output" },
+            "input": { "nats": "nats://my_nats_server/some/subject", "subject": "nats_subject" }
+        }
+    ]
+}
+```
 
 ## Component Interface
 

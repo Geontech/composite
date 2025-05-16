@@ -96,8 +96,9 @@ public:
         m_port_set.add_port(port);
     }
 
-    auto get_port(std::string_view name) -> port* {
-        return m_port_set.get_port(name);
+    template <typename T>
+    auto get_port(std::string_view name) -> T* {
+        return m_port_set.get_port<T>(name);
     }
 
     auto ports() const -> const port_set::port_map_type& {
@@ -109,14 +110,14 @@ public:
       std::shared_ptr<component> other,
       std::string_view input_port_name
     ) -> bool {
-        auto out_port = get_port(output_port_name);
+        auto out_port = get_port<output_port_base>(output_port_name);
         if (out_port == nullptr) {
             return false;
         }
         if (other == nullptr) {
             return false;
         }
-        auto in_port = other->get_port(input_port_name);
+        auto in_port = other->get_port<input_port_base>(input_port_name);
         if (in_port == nullptr) {
             return false;
         }
