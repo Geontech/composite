@@ -26,7 +26,6 @@
 #include "port.hpp"
 #include "timestamp.hpp"
 
-#include <algorithm>
 #include <ranges>
 #include <string_view>
 #include <typeinfo>
@@ -35,12 +34,12 @@ namespace composite {
 
 template <traits::smart_ptr T>
 requires std::ranges::contiguous_range<typename T::element_type>
-class output_port : public port {
+class output_port : public output_port_base {
 public:
     using value_type = typename T::element_type;
     using buffer_type = T;
 
-    explicit output_port(std::string_view name) : port(name) {}
+    using output_port_base::output_port_base;
 
     ~output_port() override = default;
 
@@ -69,29 +68,6 @@ public:
         }
     }
 
-    auto send_metadata(const metadata& value) const -> void {
-        for (auto port : m_connected_ports) {
-            if (port == nullptr) {
-                continue;
-            }
-            if (port->is_unique_type()) {
-                auto dst = static_cast<input_port<std::unique_ptr<value_type>>*>(port);
-                dst->set_metadata(value);
-            } else {
-                auto dst = static_cast<input_port<std::shared_ptr<value_type>>*>(port);
-                dst->set_metadata(value);
-            }
-        }
-    }
-
-    auto connect(port* port) -> void override {
-        m_connected_ports.emplace_back(port);
-        // sort with unique_ptr ports at the back
-        std::ranges::sort(m_connected_ports, [](const auto a, const auto b) { 
-            return (!a->is_unique_type() && b->is_unique_type());
-        });
-    }
-
 #ifdef COMPOSITE_USE_NATS
     auto connect(std::string_view url, std::string_view subject) -> bool override {
         if (m_nats_client != nullptr) {
@@ -106,16 +82,7 @@ public:
     }
 #endif
 
-    auto disconnect() -> void {
-        m_connected_ports.clear();
-    }
-
-    auto is_connected() const -> bool {
-        return !m_connected_ports.empty();
-    }
-
 private:
-    std::vector<port*> m_connected_ports;
 #ifdef COMPOSITE_USE_NATS
     std::unique_ptr<nats::client> m_nats_client;
     std::vector<std::string> m_nats_subjects;

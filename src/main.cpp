@@ -244,7 +244,6 @@ auto main(int argc, char** argv) -> int {
             if (input_comp_ptr == nullptr) {
                 return conn_exit(std::format("input component {} null during connection: {}", input_comp, conn.dump()));
             }
-            spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
             if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
                 return conn_exit(std::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
             }

@@ -19,9 +19,13 @@
  
 #pragma once
 
+#include <algorithm>
 #include <concepts>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace composite {
 
@@ -55,10 +59,6 @@ public:
     virtual auto type_id() const noexcept -> std::size_t = 0;
     virtual auto is_unique_type() const noexcept -> bool = 0;
 
-    virtual auto connect(port* port) -> void {
-        // to be implemented by derived class
-    }
-
 #ifdef COMPOSITE_USE_NATS
     virtual auto connect(std::string_view url, std::string_view subject) -> bool {
         // to be implemented by derived class
@@ -70,5 +70,70 @@ private:
     std::string m_name;
 
 }; // class port
+
+class input_port_base : public port {
+public:
+    using port::port;
+    ~input_port_base() override {
+        m_cv.notify_all();
+    }
+
+    auto depth() const -> std::size_t {
+        const auto lock = std::scoped_lock{m_mtx};
+        return m_depth;
+    }
+
+    auto depth(std::size_t value) -> void {
+        const auto lock = std::scoped_lock{m_mtx};
+        m_depth = value;
+    }
+
+    auto metadata(const composite::metadata& md) -> void {
+        const auto lock = std::scoped_lock{m_mtx};
+        m_metadata = md;
+    }
+
+protected:
+    mutable std::mutex m_mtx;
+    std::condition_variable m_cv;
+    std::optional<composite::metadata> m_metadata;
+    std::size_t m_depth{std::numeric_limits<std::size_t>::max()};
+
+}; // class input_port_base
+
+class output_port_base : public port {
+public:
+    using port::port;
+    ~output_port_base() override = default;
+
+    auto connect(input_port_base* port) -> void {
+        m_connected_ports.emplace_back(port);
+        // sort with unique_ptr ports at the back
+        std::ranges::sort(m_connected_ports, [](const auto a, const auto b) { 
+            return (!a->is_unique_type() && b->is_unique_type());
+        });
+    }
+
+    auto disconnect() -> void {
+        m_connected_ports.clear();
+    }
+
+    auto is_connected() const -> bool {
+        return !m_connected_ports.empty();
+    }
+
+    auto send_metadata(const composite::metadata& value) const -> void {
+        for (auto port : m_connected_ports) {
+            if (port == nullptr) {
+                continue;
+            }
+            port->metadata(value);
+        }
+    }
+
+protected:
+    std::vector<input_port_base*> m_connected_ports;
+
+}; // class output_port_base
 
 } // namespace composite
