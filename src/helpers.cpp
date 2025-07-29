@@ -1,3 +1,22 @@
+/*
+ * Copyright (C) 2025 Geon Technologies, LLC
+ *
+ * This file is part of composite.
+ *
+ * composite is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Lesser General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * composite is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program. If not, see http://www.gnu.org/licenses/.
+ */
+
 #include "composite/application.hpp"
 #include "helpers.hpp"
 
@@ -109,6 +128,52 @@ auto validate_connection(const nlohmann::json& conn) -> std::tuple<std::string, 
         return validate_nats_connection(conn);
     }
     return {{}, {}, "missing connection type"};
+}
+
+auto build_props_lists(const nlohmann::json& properties)
+  -> std::tuple<
+       std::vector<std::pair<std::string, std::string>>,
+       std::vector<std::pair<std::string, std::vector<std::string>>>,
+       std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>
+     > {
+    auto props = std::vector<std::pair<std::string, std::string>>{};
+    auto list_props = std::vector<std::pair<std::string, std::vector<std::string>>>{};
+    auto struct_props = std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>{};
+    for (const auto& [key, value] : properties.items()) {
+        if (key == "enabled") {
+            continue;
+        } else if (value.is_array()) {
+            std::vector<std::string> obj_scalar_props;
+            for (const auto& [k, v] : value.items()) {
+                if (v.is_object()) {
+                    std::vector<std::pair<std::string, std::string>> obj_props;
+                    for (const auto& [ki, vi] : v.items()) {
+                        obj_props.emplace_back(ki, vi);
+                    }
+                    props.emplace_back(key, composite::properties::null_prop);
+                    struct_props.emplace_back(std::format("{}[]", key), obj_props);
+                } else {
+                    obj_scalar_props.emplace_back(v.get<std::string>());
+                }
+            }
+            if (!obj_scalar_props.empty()) {
+                list_props.emplace_back(key, obj_scalar_props);
+            }
+        } else if (value.is_object()) {
+            std::vector<std::pair<std::string, std::string>> obj_props;
+            for (const auto& [key, value] : value.items()) {
+                obj_props.emplace_back(key, value);
+            }
+            struct_props.emplace_back(key, obj_props);
+        } else {
+            if (value.is_null() || value.empty()) {
+                props.emplace_back(key, composite::properties::null_prop);
+            } else {
+                props.emplace_back(key, value.get<std::string>());
+            }
+        }
+    }
+    return {props, list_props, struct_props};
 }
 
 } // namespace composite

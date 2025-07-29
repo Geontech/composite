@@ -1,3 +1,22 @@
+/*
+ * Copyright (C) 2025 Geon Technologies, LLC
+ *
+ * This file is part of composite.
+ *
+ * composite is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Lesser General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * composite is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program. If not, see http://www.gnu.org/licenses/.
+ */
+
 #include "composite/application.hpp"
 #include "helpers.hpp"
 
@@ -38,14 +57,58 @@ auto to_json(nlohmann::json& json_obj, const std::vector<component::connection>&
 auto to_json(nlohmann::json& json_obj, const composite::property_set& set) -> void; // forward
 
 auto to_json(nlohmann::json& json_obj, const composite::property& prop) {
-    if (prop.is_structured()) {
+    auto type = prop.type();
+    json_obj["type"] = type;
+    json_obj["units"] = prop.units();
+    json_obj["configurability"] = (static_cast<int>(prop.configurability()) == 1) ? "runtime" : "initialize";
+    // Handle lists of structs
+    if (prop.is_list()) {
+        if (prop.type() == "[]struct") {
+            nlohmann::json value_array = nlohmann::json::array();
+            for (auto i = std::size_t{}; i < prop.struct_list_size(); ++i) {
+                nlohmann::json item_obj;
+                auto bound = property_set{};
+                auto* item_ptr = prop.struct_getter(i);
+                if (!item_ptr) {
+                    continue;
+                }
+                prop.struct_registration(bound, item_ptr);
+                to_json(item_obj, bound);
+                value_array.push_back(item_obj);
+            }
+            json_obj["value"] = value_array;
+        } else {
+            // Handle lists of scalar types. nlohmann::json can directly serialize std::vector of most types.
+            if (type == "[]bool") {
+                json_obj["value"] = *std::any_cast<std::vector<bool>*>(prop.value());
+            } else if (type == "[]string") {
+                json_obj["value"] = *std::any_cast<std::vector<std::string>*>(prop.value());
+            } else if (type == "[]int16") {
+                json_obj["value"] = *std::any_cast<std::vector<int16_t>*>(prop.value());
+            } else if (type == "[]uint16") {
+                json_obj["value"] = *std::any_cast<std::vector<uint16_t>*>(prop.value());
+            } else if (type == "[]int32") {
+                json_obj["value"] = *std::any_cast<std::vector<int32_t>*>(prop.value());
+            } else if (type == "[]uint32") {
+                json_obj["value"] = *std::any_cast<std::vector<uint32_t>*>(prop.value());
+            } else if (type == "[]int64") {
+                json_obj["value"] = *std::any_cast<std::vector<int64_t>*>(prop.value());
+            } else if (type == "[]uint64") {
+                json_obj["value"] = *std::any_cast<std::vector<uint64_t>*>(prop.value());
+            } else if (type == "[]float") {
+                json_obj["value"] = *std::any_cast<std::vector<float>*>(prop.value());
+            } else if (type == "[]double") {
+                json_obj["value"] = *std::any_cast<std::vector<double>*>(prop.value());
+            }
+            for (auto& v : json_obj["value"]) {
+                v = v.dump();
+            }
+        }
+    } else if (prop.is_structured()) {
         nlohmann::json nested;
         to_json(nested, prop.structured());
+        json_obj["value"] = nested;
     } else {
-        auto type = prop.type();
-        json_obj["type"] = type;
-        json_obj["units"] = prop.units();
-        json_obj["configurability"] = (static_cast<int>(prop.configurability()) == 1) ? "runtime" : "initialize";
         if (type == "bool") {
             json_obj["value"] = std::format("{}", *std::any_cast<bool*>(prop.value()));
         } else if (type == "bool?") {
@@ -152,11 +215,7 @@ auto to_json(nlohmann::json& json_obj, const component& comp) {
     auto props_obj = nlohmann::json{};
     for (const auto& [name, value] : comp.properties()) {
         auto prop_obj = nlohmann::json::object();
-        if (value.is_structured()) {
-            to_json(prop_obj, value.structured());
-        } else {
-            to_json(prop_obj, value);
-        }
+        to_json(prop_obj, value);
         props_obj[name] = prop_obj;
     }
     json_obj["properties"] = props_obj;
@@ -197,16 +256,27 @@ auto set_component_properties(
     auto content = nlohmann::json();
     try {
         spdlog::trace("patching component-level properties on {}", comp->id());
-        auto props = std::vector<std::pair<std::string,std::string>>{};
-        for (const auto& [name, value] : properties.get<std::map<std::string,std::string>>()) {
-            if (name == "enabled") {
+        for (const auto& [key, value] : properties.items()) {
+            if (key == "enabled") {
                 (value == "false" || value == "0") ? comp->stop() : comp->start();
-            } else {
-                props.emplace_back(name, value);
             }
         }
+        const auto& [props, list_props, struct_list_props] = build_props_lists(properties);
+        auto updates = false;
         if (!props.empty()) {
             comp->set_properties(props, composite::properties::config_type::RUNTIME);
+            updates = true;
+        }
+        if (!list_props.empty()) {
+            comp->set_properties(list_props, composite::properties::config_type::RUNTIME);
+            updates = true;
+        }
+        if (!struct_list_props.empty()) {
+            comp->set_properties(struct_list_props, composite::properties::config_type::RUNTIME);
+            updates = true;
+        }
+        if (updates) {
+            comp->property_change_handler();
         }
         content["success"] = std::format("successfully set properties on component {}", comp->id());
         res.set_content(content.dump(), "application/json");
@@ -241,7 +311,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
         res.set_header("Access-Control-Max-Age", "86400"); // cache preflight response for 1 day
         res.status = 204; // no content
     });
-    
+
     const auto APP = std::string{"app"};
     const auto COMPONENTS = std::string{"components"};
     const auto CONNECTIONS = std::string{"connections"};
@@ -258,7 +328,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
         set_cors_header(res);
         auto app_json = nlohmann::json(app);
-        res.set_content(app_json.dump(), "application/json");
+        res.set_content(app_json.dump(2), "application/json");
         res.status = httplib::OK_200;
     });
 
@@ -267,7 +337,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
         set_cors_header(res);
         auto comps_json = nlohmann::json(app.components());
-        res.set_content(comps_json.dump(), "application/json");
+        res.set_content(comps_json.dump(2), "application/json");
         res.status = httplib::OK_200;
     });
 

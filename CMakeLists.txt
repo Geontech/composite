@@ -161,3 +161,9 @@ if(COMPOSITE_INSTALL)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 endif(COMPOSITE_INSTALL)
+
+# Tests
+option(COMPOSITE_BUILD_TESTS "Build unit tests" OFF)
+if (COMPOSITE_BUILD_TESTS)
+    add_subdirectory(test)
+endif()

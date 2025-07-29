@@ -16,7 +16,7 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
- 
+
 #pragma once
 
 #include "input_port.hpp"
@@ -171,74 +171,114 @@ public:
     }
 
     template <typename T>
+    auto add_list_property(std::string_view name, std::vector<T>* vec) -> property& {
+        return m_prop_set.add_list_property(name, vec);
+    }
+
+    template <typename T, typename Func>
+    auto add_struct_list_property(std::string_view name, std::vector<T>* vec, Func&& register_fields) -> property& {
+        return m_prop_set.add_struct_list_property(name, vec, register_fields);
+    }
+
+    template <typename T>
     auto get_property(std::string_view name) const -> T {
         return m_prop_set.get_property<T>(name);
     }
 
     auto set_properties(
-      const std::vector<std::pair<std::string, std::string>>& prop_values,
+      const std::vector<std::pair<std::string, std::string>>& values,
       properties::config_type config=properties::config_type::INITIALIZE,
       bool allow_unknown_key=false) -> void {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         m_prop_change_requested = false;
-        for (const auto& [name, value] : prop_values) {
-            auto* prop = m_prop_set.resolve_property(name);
-            if (prop == nullptr) {
-                if (allow_unknown_key) {
-                    continue;
-                }
-                auto err = properties::key_error(m_id, name);
-                logger()->warn(err.what());
-                throw err;
-            }
-            using enum properties::config_type;
-            if ((config == RUNTIME) && (prop->configurability() == INITIALIZE)) {
-                auto err = properties::configurability_error(m_id, name);
-                logger()->warn(err.what());
-                throw err;
-            }
-            auto type = prop->type();
-            if (prop->is_optional()) {
-                type.pop_back();
-            }
-            auto res = properties::error::OK;
-            if (type == "bool") {
-                res = m_prop_set.set_property(name, (value == "1" || value == "true") ? true : false);
-            } else if (type == "string") {
-                res = m_prop_set.set_property(name, value);
-            } else if (type == "int16") {
-                res = m_prop_set.set_property(name, static_cast<int16_t>(std::stoi(value)));
-            } else if (type == "uint16") {
-                res = m_prop_set.set_property(name, static_cast<uint16_t>(std::stoul(value)));
-            } else if (type == "int32") {
-                res = m_prop_set.set_property(name, static_cast<int32_t>(std::stoi(value)));
-            } else if (type == "uint32") {
-                res = m_prop_set.set_property(name, static_cast<uint32_t>(std::stoul(value)));
-            } else if (type == "int64") {
-                res = m_prop_set.set_property(name, static_cast<int64_t>(std::stoll(value)));
-            } else if (type == "uint64") {
-                res = m_prop_set.set_property(name, static_cast<uint64_t>(std::stoull(value)));
-            } else if (type == "float") {
-                res = m_prop_set.set_property(name, std::stof(value));
-            } else if (type == "double") {
-                res = m_prop_set.set_property(name, std::stod(value));
-            } else {
-                auto err = properties::type_error(m_id, name, type);
-                logger()->warn(err.what());
-                throw err;
-            }
-            if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
-                auto err = properties::key_error(m_id, name);
-                logger()->warn(err.what());
-                throw err;
-            } else if (res == properties::error::INVALID_VALUE) {
-                auto err = properties::value_error(m_id, name, value);
-                logger()->warn(err.what());
-                throw err;
-            }
+
+        try {
+            m_prop_set.set_properties(values, config, allow_unknown_key);
+        } catch(const properties::key_error& err) {
+            auto throw_err = properties::key_error(m_id, err.prop);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::type_error& err) {
+            auto throw_err = properties::type_error(m_id, err.prop, err.type);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::value_error& err) {
+            auto throw_err = properties::value_error(m_id, err.prop, err.value);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::configurability_error& err) {
+            auto throw_err = properties::configurability_error(m_id, err.prop);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch (const std::exception& ex) {
+            logger()->error("{}: unexpected property error: {}", m_id, ex.what());
+            throw;
         }
-        property_change_handler();
+    }
+
+    auto set_properties(
+      const std::vector<std::pair<std::string, std::vector<std::string>>>& values,
+      properties::config_type config=properties::config_type::INITIALIZE,
+      bool allow_unknown_key=false) -> void {
+        m_prop_change_requested = true;
+        auto lk = std::scoped_lock{m_prop_mtx};
+        m_prop_change_requested = false;
+
+        try {
+            m_prop_set.set_properties(values, config, allow_unknown_key);
+        } catch(const properties::key_error& err) {
+            auto throw_err = properties::key_error(m_id, err.prop);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::type_error& err) {
+            auto throw_err = properties::type_error(m_id, err.prop, err.type);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::value_error& err) {
+            auto throw_err = properties::value_error(m_id, err.prop, err.value);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::configurability_error& err) {
+            auto throw_err = properties::configurability_error(m_id, err.prop);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch (const std::exception& ex) {
+            logger()->error("{}: unexpected property error: {}", m_id, ex.what());
+            throw;
+        }
+    }
+
+    auto set_properties(
+      const std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>& values,
+      properties::config_type config=properties::config_type::INITIALIZE,
+      bool allow_unknown_key=false) -> void {
+        m_prop_change_requested = true;
+        auto lk = std::scoped_lock{m_prop_mtx};
+        m_prop_change_requested = false;
+
+        try {
+            m_prop_set.set_properties(values, config, allow_unknown_key);
+        } catch(const properties::key_error& err) {
+            auto throw_err = properties::key_error(m_id, err.prop);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::type_error& err) {
+            auto throw_err = properties::type_error(m_id, err.prop, err.type);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::value_error& err) {
+            auto throw_err = properties::value_error(m_id, err.prop, err.value);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch(const properties::configurability_error& err) {
+            auto throw_err = properties::configurability_error(m_id, err.prop);
+            logger()->error(throw_err.what());
+            throw throw_err;
+        } catch (const std::exception& ex) {
+            logger()->error("{}: unexpected property error: {}", m_id, ex.what());
+            throw;
+        }
     }
 
     auto add_property_change_listener(std::string_view name, property_set::change_func_type func) -> void {
@@ -254,7 +294,7 @@ public:
         return m_prop_set.properties();
     }
 
-    auto log_level(spdlog::level::level_enum level) -> void {
+    auto log_level(spdlog::level::level_enum level) const -> void {
         m_logger->set_level(level);
     }
 
