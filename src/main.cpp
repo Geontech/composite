@@ -14,9 +14,9 @@
  * more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
- 
+
 #include "composite/application.hpp"
 #include "composite/version.hpp"
 #include "helpers.hpp"
@@ -51,21 +51,6 @@ auto make_server(application&, composite::component_handles_type&) -> std::uniqu
 #endif
 
 } // namespace composite
-
-inline void flatten_json_to_dot_pairs(
-    const nlohmann::json& j,
-    std::vector<std::pair<std::string, std::string>>& out,
-    const std::string& prefix = ""
-) {
-    for (auto it = j.begin(); it != j.end(); ++it) {
-        std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
-        if (it->is_object()) {
-            flatten_json_to_dot_pairs(*it, out, key);  // recurse
-        } else {
-            out.emplace_back(key, it->get<std::string>());  // stringify the value
-        }
-    }
-}
 
 auto main(int argc, char** argv) -> int {
     // Create argument parser with options
@@ -143,7 +128,7 @@ auto main(int argc, char** argv) -> int {
     auto config_ifstream = std::ifstream{config_file};
     auto app_json = nlohmann::json::parse(config_ifstream);
 
-    // Component handle holders    
+    // Component handle holders
     auto comp_handles = composite::component_handles_type{};
 
     // Create a new application object
@@ -165,20 +150,35 @@ auto main(int argc, char** argv) -> int {
         comp_ptr->log_level(level);
         // Set properties
         try {
-            // Set application-level properties
-            spdlog::trace("adding app-level properties to changeset for {}", comp_ptr->id());
-            auto props = std::vector<std::pair<std::string,std::string>>{};
+            // Merge application-level properties with component-level properties
+            auto props_json = nlohmann::json{};
             if (app_json.contains("properties")) {
-                flatten_json_to_dot_pairs(app_json["properties"], props);
+                spdlog::trace("adding app-level properties to changeset for {}", comp_ptr->id());
+                props_json.merge_patch(app_json["properties"]);
             }
-            // Set component-level properties
-            spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
             if (comp.contains("properties")) {
-                flatten_json_to_dot_pairs(comp["properties"], props);
+                spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
+                props_json.merge_patch(comp["properties"]);
             }
+            const auto& [props, list_props, struct_props] = composite::build_props_lists(props_json);
+            auto updates = false;
             if (!props.empty()) {
                 spdlog::trace("setting properties on component {}", comp_ptr->id());
                 comp_ptr->set_properties(props, composite::properties::config_type::INITIALIZE, true);
+                updates = true;
+            }
+            if (!list_props.empty()) {
+                spdlog::trace("setting list properties on component {}", comp_ptr->id());
+                comp_ptr->set_properties(list_props, composite::properties::config_type::INITIALIZE, true);
+                updates = true;
+            }
+            if (!struct_props.empty()) {
+                spdlog::trace("setting struct properties on component {}", comp_ptr->id());
+                comp_ptr->set_properties(struct_props, composite::properties::config_type::INITIALIZE, true);
+                updates = true;
+            }
+            if (updates) {
+                comp_ptr->property_change_handler();
             }
         } catch (const std::runtime_error& err) {
             spdlog::error(err.what());
@@ -214,7 +214,7 @@ auto main(int argc, char** argv) -> int {
         if (!ierror.empty()) {
             return conn_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
         }
-        
+
         spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
         if (input_comp.starts_with("nats://")) {
 #ifndef COMPOSITE_USE_NATS

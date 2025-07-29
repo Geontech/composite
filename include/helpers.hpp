@@ -14,9 +14,9 @@
  * more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
- 
+
 #pragma once
 
 #include "composite/component.hpp"
@@ -38,5 +38,12 @@ auto generate_app_name() -> std::string;
 auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component>;
 
 auto validate_connection(const nlohmann::json& conn_json) -> std::tuple<std::string, std::string, std::string>;
+
+auto build_props_lists(const nlohmann::json& properties)
+  -> std::tuple<
+       std::vector<std::pair<std::string, std::string>>,
+       std::vector<std::pair<std::string, std::vector<std::string>>>,
+       std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>
+     >;
 
 } // namespace composite
