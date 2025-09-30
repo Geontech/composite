@@ -68,7 +68,7 @@ public:
 
     auto id(std::string_view id) -> void {
         m_id = id;
-        auto pattern = std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
+        auto pattern = fmt::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
         m_logger->set_pattern(pattern);
     }
 

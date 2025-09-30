@@ -21,7 +21,7 @@
 #include "helpers.hpp"
 
 #include <iostream>
-#include <format>
+#include <fmt/core.h>
 #include <random>
 #include <spdlog/spdlog.h>
 
@@ -47,12 +47,12 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
     // Get component name
     auto name = comp_json["name"].get<std::string>();
     // Open component module
-    auto comp_str = std::format("lib{}.so", name);
+    auto comp_str = fmt::format("lib{}.so", name);
     spdlog::trace("component module: {}", comp_str);
     // Get component module handle
     auto comp_handle = std::unique_ptr<void, decltype(&close_func)>(dlopen(comp_str.c_str(), RTLD_NOW), close_func);
     if (!comp_handle) {
-        std::cerr << std::format("failed to open {}: {}\n", comp_str, dlerror());
+        std::cerr << fmt::format("failed to open {}: {}\n", comp_str, dlerror());
         return {};
     }
     dlerror(); // clear existing
@@ -66,7 +66,7 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
         using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view);
         auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
         if (auto err = dlerror(); err != nullptr) {
-            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+            std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
             return {};
         }
         dlerror(); // clear existing
@@ -77,7 +77,7 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
         using function_ptr = std::shared_ptr<composite::component> (*)();
         auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
         if (auto err = dlerror(); err != nullptr) {
-            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+            std::cerr << fmt::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
             return {};
         }
         dlerror(); // clear existing
@@ -151,7 +151,7 @@ auto build_props_lists(const nlohmann::json& properties)
                         obj_props.emplace_back(ki, vi);
                     }
                     props.emplace_back(key, composite::properties::null_prop);
-                    struct_props.emplace_back(std::format("{}[]", key), obj_props);
+                    struct_props.emplace_back(fmt::format("{}[]", key), obj_props);
                 } else {
                     obj_scalar_props.emplace_back(v.get<std::string>());
                 }

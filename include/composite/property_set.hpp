@@ -21,7 +21,7 @@
 
 #include <any>
 #include <cxxabi.h>
-#include <format>
+#include <fmt/core.h>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -81,7 +81,7 @@ public:
 class configurability_error : public properties_error {
 public:
     configurability_error(std::string_view comp_id, std::string_view prop) :
-      properties_error(std::format("property {} of component {} is not runtime configurable", prop, comp_id)),
+      properties_error(fmt::format("property {} of component {} is not runtime configurable", prop, comp_id)),
       prop(prop) {}
 
     std::string prop;
@@ -91,7 +91,7 @@ public:
 class type_error : public properties_error {
 public:
     type_error(std::string_view comp_id, std::string_view prop, std::string_view type) :
-      properties_error(std::format("unknown type {} for property {} of component {}", type, prop, comp_id)),
+      properties_error(fmt::format("unknown type {} for property {} of component {}", type, prop, comp_id)),
       prop(prop),
       type(type) {}
 
@@ -103,7 +103,7 @@ public:
 class key_error : public properties_error {
 public:
     key_error(std::string_view comp_id, std::string_view prop) :
-      properties_error(std::format("unknown property {} of component {}", prop, comp_id)),
+      properties_error(fmt::format("unknown property {} of component {}", prop, comp_id)),
       prop(prop) {}
 
     std::string prop;
@@ -113,7 +113,7 @@ public:
 class value_error : public properties_error {
 public:
     value_error(std::string_view comp_id, std::string_view prop, std::string_view value) :
-      properties_error(std::format("invalid value for property {} of component {}: {}", prop, comp_id, value)),
+      properties_error(fmt::format("invalid value for property {} of component {}: {}", prop, comp_id, value)),
       prop(prop),
       value(value) {}
 
@@ -337,7 +337,7 @@ public:
         } else if (typeid_name.find("basic_string") != std::string::npos) {
             typeid_name = "string";
         } else {
-            throw properties::properties_error(std::format("unknown type {} for property {}", typeid_name, name));
+            throw properties::properties_error(fmt::format("unknown type {} for property {}", typeid_name, name));
         }
         if constexpr (properties::is_optional_v<ValueT>) {
             typeid_name += "?";
@@ -386,9 +386,9 @@ public:
         } else if (typeid_name.find("basic_string") != std::string::npos) {
             typeid_name = "string";
         } else {
-            throw properties::properties_error(std::format("unknown type {} for property {}", typeid_name, std::string{name}));
+            throw properties::properties_error(fmt::format("unknown type {} for property {}", typeid_name, std::string{name}));
         }
-        auto p = property{std::format("[]{}", typeid_name), vec};
+        auto p = property{fmt::format("[]{}", typeid_name), vec};
         auto [iter, _] = m_properties.try_emplace(std::string{name}, std::move(p));
         return iter->second;
     }
@@ -800,7 +800,7 @@ public:
                     if (auto idx = prop->struct_emplace_back()) {
                         // Update the fields of the new struct
                         for (const auto& [k, v] : value) {
-                            auto struct_prop_name = std::format("{}.{}", name, k);
+                            auto struct_prop_name = fmt::format("{}.{}", name, k);
                             auto res = set_struct_field(prop, *idx, k, v);
                             if (res == properties::error::INVALID_KEY) {
                                 throw properties::key_error("", struct_prop_name);
@@ -817,11 +817,11 @@ public:
                             // TODO
                         }
                     } else {
-                        throw properties::properties_error(std::format("failed to emplace new struct for structured list property {}", p->base));
+                        throw properties::properties_error(fmt::format("failed to emplace new struct for structured list property {}", p->base));
                     }
                 } else { // update
                     for (const auto& [k, v] : value) {
-                        auto struct_prop_name = std::format("{}.{}", name, k);
+                        auto struct_prop_name = fmt::format("{}.{}", name, k);
                         auto res = set_struct_field(prop, *(p->index), k, v);
                         if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
                             throw properties::key_error("", struct_prop_name);
@@ -840,7 +840,7 @@ public:
                 }
             } else {
                 for (const auto& [k, v] : value) {
-                    auto struct_prop_name = std::format("{}.{}", name, k);
+                    auto struct_prop_name = fmt::format("{}.{}", name, k);
                     auto& struct_prop_set = prop->structured();
                     auto* struct_prop = struct_prop_set.resolve_property(k);
                     if (struct_prop == nullptr) {

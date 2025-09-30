@@ -16,7 +16,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
- 
+
 # Executable
 add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
@@ -53,6 +53,7 @@ target_link_libraries(composite-cli
     argparse
     nlohmann_json::nlohmann_json
     spdlog::spdlog_header_only
+    fmt::fmt
     httplib::httplib
     dl
 )

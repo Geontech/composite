@@ -16,12 +16,12 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
- 
+
 #pragma once
 
 #include <bit>
 #include <cstdint>
-#include <format>
+#include <fmt/core.h>
 #include <map>
 #include <sstream>
 #include <string>
@@ -47,7 +47,7 @@ auto to_string(data_type type) -> std::string {
 }
 
 [[nodiscard]]
-inline 
+inline
 auto to_string(std::endian e) -> std::string {
     if (e == std::endian::little) { return "little"; }
     if (e == std::endian::big) { return "big"; }
@@ -84,7 +84,7 @@ public:
     [[nodiscard]]
     inline
     auto to_string() const -> std::string {
-        return std::format(
+        return fmt::format(
             "data_format:\n"
             "  complex   : {}\n"
             "  type      : {}\n"
@@ -97,7 +97,7 @@ public:
         );
     }
 
-    friend 
+    friend
     auto operator<<(std::ostream& os, const data_format& df) -> std::ostream& {
         os << df.to_string();
         return os;
@@ -120,7 +120,7 @@ public:
     [[nodiscard]]
     inline
     auto to_string() const -> std::string {
-        auto s = std::format(
+        auto s = fmt::format(
             "metadata:\n"
             "  data_format:\n"
             "    complex   : {}\n"
@@ -146,14 +146,14 @@ public:
             s += "    (none)\n";
         } else {
             for (const auto& [key, value] : annotations) {
-                s += std::format("    {}: {}\n", key, value);
+                s += fmt::format("    {}: {}\n", key, value);
             }
         }
 
         return s;
     }
 
-    friend 
+    friend
     auto operator<<(std::ostream& os, const metadata& md) -> std::ostream& {
         os << md.to_string();
         return os;

@@ -21,7 +21,7 @@
 #include "helpers.hpp"
 
 #include <cstdlib>
-#include <format>
+#include <fmt/core.h>
 #include <httplib.h>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -110,11 +110,11 @@ auto to_json(nlohmann::json& json_obj, const composite::property& prop) {
         json_obj["value"] = nested;
     } else {
         if (type == "bool") {
-            json_obj["value"] = std::format("{}", *std::any_cast<bool*>(prop.value()));
+            json_obj["value"] = fmt::format("{}", *std::any_cast<bool*>(prop.value()));
         } else if (type == "bool?") {
             auto opt_val = *std::any_cast<std::optional<bool>*>(prop.value());
             if (opt_val.has_value()) {
-                json_obj["value"] = std::format("{}", opt_val.value());
+                json_obj["value"] = fmt::format("{}", opt_val.value());
             } else {
                 json_obj["value"] = nullptr;
             }
@@ -278,7 +278,7 @@ auto set_component_properties(
         if (updates) {
             comp->property_change_handler();
         }
-        content["success"] = std::format("successfully set properties on component {}", comp->id());
+        content["success"] = fmt::format("successfully set properties on component {}", comp->id());
         res.set_content(content.dump(), "application/json");
         res.status = httplib::OK_200;
     } catch (const std::exception& ex) {
@@ -317,14 +317,14 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     const auto CONNECTIONS = std::string{"connections"};
 
     // GET health
-    auto endpoint = std::format("/{}/healthz", APP);
+    auto endpoint = fmt::format("/{}/healthz", APP);
     server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
         set_cors_header(res);
         res.status = httplib::OK_200;
     });
 
     // GET application
-    endpoint = std::format("/{}", APP);
+    endpoint = fmt::format("/{}", APP);
     server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
         set_cors_header(res);
         auto app_json = nlohmann::json(app);
@@ -333,7 +333,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     });
 
     // GET components
-    endpoint = std::format("/{}/{}", APP, COMPONENTS);
+    endpoint = fmt::format("/{}/{}", APP, COMPONENTS);
     server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
         set_cors_header(res);
         auto comps_json = nlohmann::json(app.components());
@@ -342,7 +342,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     });
 
     // POST components
-    endpoint = std::format("/{}/{}", APP, COMPONENTS);
+    endpoint = fmt::format("/{}/{}", APP, COMPONENTS);
     server->Post(endpoint, [&app, &handles](const httplib::Request& req, httplib::Response& res) {
         set_cors_header(res);
         try {
@@ -359,7 +359,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             // Add component to application
             auto comp_ptr = composite::make_component(comp_json, handles);
             if (comp_ptr == nullptr) {
-                auto msg = std::format("failed to create component {}", comp_json["name"].get<std::string>());
+                auto msg = fmt::format("failed to create component {}", comp_json["name"].get<std::string>());
                 auto content = nlohmann::json::object();
                 content["error"] = msg;
                 spdlog::error(msg);
@@ -386,7 +386,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             }
             // Add to application
             app.add_component(comp_ptr);
-            auto msg = std::format("added {} to application '{}'", comp_ptr->id(), app.name());
+            auto msg = fmt::format("added {} to application '{}'", comp_ptr->id(), app.name());
             spdlog::trace(msg);
             auto content = nlohmann::json::object();
             content["success"] = msg;
@@ -401,7 +401,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     });
 
     // GET component by ID
-    endpoint = std::format("/{}/{}/:id", APP, COMPONENTS);
+    endpoint = fmt::format("/{}/{}/:id", APP, COMPONENTS);
     server->Get(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
         set_cors_header(res);
         auto comp_id = req.path_params.at("id");
@@ -411,14 +411,14 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             res.status = httplib::OK_200;
         } else {
             auto content = nlohmann::json::object();
-            content["error"] = std::format("component not found: {}", comp_id);
+            content["error"] = fmt::format("component not found: {}", comp_id);
             res.set_content(content.dump(), "application/json");
             res.status = httplib::BadRequest_400;
         }
     });
 
     // PATCH components
-    endpoint = std::format("/{}/{}", APP, COMPONENTS);
+    endpoint = fmt::format("/{}/{}", APP, COMPONENTS);
     server->Patch(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
         set_cors_header(res);
         auto content = nlohmann::json();
@@ -450,7 +450,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             auto comp_id = comp_json["id"].get<std::string>();
             // Check for properties key
             if (!comp_json.contains("properties")) {
-                content["error"] = std::format("component properties not provided for {}", comp_id);
+                content["error"] = fmt::format("component properties not provided for {}", comp_id);
                 res.set_content(content.dump(), "application/json");
                 res.status = httplib::BadRequest_400;
                 return;
@@ -459,7 +459,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             if (auto comp = app.get_component(comp_id); comp != nullptr) {
                 res = set_component_properties(comp, comp_json["properties"]);
             } else {
-                content["error"] = std::format("component not found: {}", comp_id);
+                content["error"] = fmt::format("component not found: {}", comp_id);
                 res.set_content(content.dump(), "application/json");
                 res.status = httplib::NotFound_404;
             }
@@ -467,7 +467,7 @@ auto make_server(application& app, composite::component_handles_type& handles) -
     });
 
     // PATCH component by ID
-    endpoint = std::format("/{}/{}/:id", APP, COMPONENTS);
+    endpoint = fmt::format("/{}/{}/:id", APP, COMPONENTS);
     server->Patch(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
         set_cors_header(res);
         auto content = nlohmann::json();
@@ -491,14 +491,14 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             }
             res = set_component_properties(comp, json_body["properties"]);
         } else {
-            content["error"] = std::format("component not found: {}", comp_id);
+            content["error"] = fmt::format("component not found: {}", comp_id);
             res.set_content(content.dump(), "application/json");
             res.status = httplib::NotFound_404;
         }
     });
 
     // POST connections
-    endpoint = std::format("/{}/{}", APP, CONNECTIONS);
+    endpoint = fmt::format("/{}/{}", APP, CONNECTIONS);
     server->Post(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
         set_cors_header(res);
         // TODO: get POST info

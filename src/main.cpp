@@ -26,7 +26,7 @@
 #include <csignal>
 #include <dlfcn.h>
 #include <filesystem>
-#include <format>
+#include <fmt/core.h>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -197,55 +197,55 @@ auto main(int argc, char** argv) -> int {
     };
     for (const auto& conn : app_json["connections"]) {
         if (!conn.contains("output")) {
-            return conn_exit(std::format("missing output for connection: {}", conn.dump()));
+            return conn_exit(fmt::format("missing output for connection: {}", conn.dump()));
         }
         if (!conn.contains("input")) {
-            return conn_exit(std::format("missing output for connection: {}", conn.dump()));
+            return conn_exit(fmt::format("missing output for connection: {}", conn.dump()));
         }
         // Validate output section
         auto output = conn["output"];
         auto [output_comp, output_port, oerror] = composite::validate_connection(output);
         if (!oerror.empty()) {
-            return conn_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
+            return conn_exit(fmt::format("invalid connection output: {}: {}", conn.dump(), oerror));
         }
         // Validate input section
         auto input = conn["input"];
         auto [input_comp, input_port, ierror] = composite::validate_connection(input);
         if (!ierror.empty()) {
-            return conn_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
+            return conn_exit(fmt::format("invalid connection input: {}: {}", conn.dump(), ierror));
         }
 
         spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
         if (input_comp.starts_with("nats://")) {
 #ifndef COMPOSITE_USE_NATS
-            return conn_exit(std::format("NATS support is not enabled: required for connection: {}", conn.dump()));
+            return conn_exit(fmt::format("NATS support is not enabled: required for connection: {}", conn.dump()));
 #endif
             // Get the output component port
             auto output_comp_ptr = app.get_component(output_comp);
             if (output_comp_ptr == nullptr) {
-                return conn_exit(std::format("output component {} null during connection: {}", output_comp, conn.dump()));
+                return conn_exit(fmt::format("output component {} null during connection: {}", output_comp, conn.dump()));
             }
 #ifdef COMPOSITE_USE_NATS
             if (!output_comp_ptr->connect(output_port, input_comp, input_port)) {
-                return conn_exit(std::format("Failed to connect {}:{} to {}", output_comp, output_port, input_comp));
+                return conn_exit(fmt::format("Failed to connect {}:{} to {}", output_comp, output_port, input_comp));
             }
 #endif
         } else if (output_comp.starts_with("nats://")) {
             // Future release will enable this support
-            return conn_exit(std::format("NATS support is not enabled: required for connection: {}", conn.dump()));
+            return conn_exit(fmt::format("NATS support is not enabled: required for connection: {}", conn.dump()));
         } else {
             // Get the output component port
             auto output_comp_ptr = app.get_component(output_comp);
             if (output_comp_ptr == nullptr) {
-                return conn_exit(std::format("output component {} null during connection: {}", output_comp, conn.dump()));
+                return conn_exit(fmt::format("output component {} null during connection: {}", output_comp, conn.dump()));
             }
             // Get the input component port
             auto input_comp_ptr = app.get_component(input_comp);
             if (input_comp_ptr == nullptr) {
-                return conn_exit(std::format("input component {} null during connection: {}", input_comp, conn.dump()));
+                return conn_exit(fmt::format("input component {} null during connection: {}", input_comp, conn.dump()));
             }
             if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-                return conn_exit(std::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+                return conn_exit(fmt::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
             }
         }
     }

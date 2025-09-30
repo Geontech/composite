@@ -17,6 +17,7 @@ target_link_libraries(test_properties
   composite::composite
   nlohmann_json::nlohmann_json
   spdlog::spdlog_header_only
+  fmt::fmt
   httplib::httplib
   Catch2::Catch2WithMain
   dl

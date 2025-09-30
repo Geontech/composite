@@ -57,14 +57,20 @@ FetchContent_Declare(spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG v1.14.1
 )
+# fmt dependency
+FetchContent_Declare(fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG 10.2.0
+)
 # httplib dependency
 FetchContent_Declare(httplib
     GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
     GIT_TAG v0.18.0
 )
 set(HTTPLIB_INSTALL OFF)
+
 # Make all deps available
-FetchContent_MakeAvailable(argparse json spdlog)
+FetchContent_MakeAvailable(argparse json spdlog fmt)
 
 # Options for enabling target RUNPATH
 option(COMPOSITE_EMBED_MODULE_RPATH "Enable embedding a RUNPATH in composite-cli to find modules" ON)
