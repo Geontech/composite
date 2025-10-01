@@ -16,7 +16,7 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
- 
+
 #pragma once
 
 #include <algorithm>
@@ -26,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <optional>
 
 namespace composite {
 
@@ -109,7 +110,7 @@ public:
     auto connect(input_port_base* port) -> void {
         m_connected_ports.emplace_back(port);
         // sort with unique_ptr ports at the back
-        std::ranges::sort(m_connected_ports, [](const auto a, const auto b) { 
+        std::ranges::sort(m_connected_ports, [](const auto a, const auto b) {
             return (!a->is_unique_type() && b->is_unique_type());
         });
     }
