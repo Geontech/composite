@@ -139,6 +139,42 @@ auto build_props_lists(const nlohmann::json& properties)
     auto props = std::vector<std::pair<std::string, std::string>>{};
     auto list_props = std::vector<std::pair<std::string, std::vector<std::string>>>{};
     auto struct_props = std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>{};
+    auto to_string_pair = [](const nlohmann::json& value) -> std::pair<bool, std::string> {
+        if (value.is_null()) {
+            return {true, {}};
+        }
+        if (value.is_string()) {
+            auto str = value.get<std::string>();
+            if (str.empty()) {
+                return {true, {}};
+            }
+            return {false, str};
+        }
+        return {false, value.dump()};
+    };
+
+    std::function<void(const nlohmann::json&, const std::string&, std::vector<std::pair<std::string, std::string>>&)>
+    flatten_struct = [&](const nlohmann::json& object,
+                         const std::string& prefix,
+                         std::vector<std::pair<std::string, std::string>>& out) {
+        for (const auto& [child_key, child_value] : object.items()) {
+            if (child_key == "enabled") {
+                continue;
+            }
+            auto dotted = prefix.empty() ? std::string{child_key} : std::format("{}.{}", prefix, child_key);
+            if (child_value.is_object()) {
+                flatten_struct(child_value, dotted, out);
+            } else {
+                const auto& [is_null, str_val] = to_string_pair(child_value);
+                if (is_null) {
+                    out.emplace_back(dotted, composite::properties::null_prop);
+                } else {
+                    out.emplace_back(dotted, str_val);
+                }
+            }
+        }
+    };
+
     for (const auto& [key, value] : properties.items()) {
         if (key == "enabled") {
             continue;
@@ -147,13 +183,14 @@ auto build_props_lists(const nlohmann::json& properties)
             for (const auto& [k, v] : value.items()) {
                 if (v.is_object()) {
                     std::vector<std::pair<std::string, std::string>> obj_props;
-                    for (const auto& [ki, vi] : v.items()) {
-                        obj_props.emplace_back(ki, vi);
-                    }
+                    flatten_struct(v, "", obj_props);
                     props.emplace_back(key, composite::properties::null_prop);
                     struct_props.emplace_back(std::format("{}[]", key), obj_props);
                 } else {
-                    obj_scalar_props.emplace_back(v.get<std::string>());
+                    const auto& [is_null, str_val] = to_string_pair(v);
+                    obj_scalar_props.emplace_back(
+                        is_null ? std::string{composite::properties::null_prop} : str_val
+                    );
                 }
             }
             if (!obj_scalar_props.empty()) {
@@ -161,9 +198,7 @@ auto build_props_lists(const nlohmann::json& properties)
             }
         } else if (value.is_object()) {
             std::vector<std::pair<std::string, std::string>> obj_props;
-            for (const auto& [key, value] : value.items()) {
-                obj_props.emplace_back(key, value);
-            }
+            flatten_struct(value, "", obj_props);
             struct_props.emplace_back(key, obj_props);
         } else {
             if (value.is_null() || value.empty()) {
