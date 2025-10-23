@@ -302,4 +302,42 @@ TEST_CASE("composite REST server set_properties") {
         REQUIRE(struct_props[*prop_idx].second[*internal_prop_idx].second == "struct_value_1");
     }
 
+    SECTION("build_props_lists handles nested structs") {
+        using namespace nlohmann::literals;
+        auto json_config = R"({
+            "signal_overrides": {
+                "center_frequency": "10e9",
+                "sample_rate": "10e6",
+                "data_format": {
+                    "is_complex": "true"
+                }
+            }
+        })"_json;
+        const auto& [props, list_props, struct_props] = build_props_lists(json_config);
+        REQUIRE(props.empty());
+        REQUIRE(list_props.empty());
+        REQUIRE(struct_props.size() == 1);
+        REQUIRE(struct_props.front().first == "signal_overrides");
+        REQUIRE(struct_props.front().second.size() == 3);
+        auto vec_contains = [](const auto& vec, const std::string& key) -> std::optional<std::size_t> {
+            auto i = std::size_t{};
+            for (const auto& [k, _] : vec) {
+                if (k == key) {
+                    return i;
+                }
+                ++i;
+            }
+            return std::nullopt;
+        };
+        auto idx = vec_contains(struct_props.front().second, "center_frequency");
+        REQUIRE(idx.has_value());
+        REQUIRE(struct_props.front().second[*idx].second == "10e9");
+        idx = vec_contains(struct_props.front().second, "sample_rate");
+        REQUIRE(idx.has_value());
+        REQUIRE(struct_props.front().second[*idx].second == "10e6");
+        idx = vec_contains(struct_props.front().second, "data_format.is_complex");
+        REQUIRE(idx.has_value());
+        REQUIRE(struct_props.front().second[*idx].second == "true");
+    }
+
 } // TEST_CASE("composite REST server set_properties")
