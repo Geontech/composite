@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite.
  *
@@ -302,6 +302,7 @@ protected:
     explicit component(std::string_view name) :
       m_name(name),
       m_id(m_name),
+      m_sink(std::make_shared<spdlog::sinks::stdout_color_sink_mt>()),
       m_logger(std::make_shared<spdlog::logger>(m_name, m_sink)) {
         add_property("noop_thread_delay", &m_delay).units("ns");
         using enum composite::properties::config_type;
@@ -315,7 +316,7 @@ protected:
 private:
     std::string m_name;
     std::string m_id;
-    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink;
     std::shared_ptr<spdlog::logger> m_logger;
     std::jthread m_thread;
     uint32_t m_delay{DEFAULT_DELAY};

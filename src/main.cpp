@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite.
  *
@@ -20,6 +20,7 @@
 #include "composite/application.hpp"
 #include "composite/version.hpp"
 #include "helpers.hpp"
+#include "property_changeset.hpp"
 
 #include <argparse/argparse.hpp>
 #include <atomic>
@@ -160,24 +161,24 @@ auto main(int argc, char** argv) -> int {
                 spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
                 props_json.merge_patch(comp["properties"]);
             }
-            const auto& [props, list_props, struct_props] = composite::build_props_lists(props_json);
-            auto updates = false;
-            if (!props.empty()) {
-                spdlog::trace("setting properties on component {}", comp_ptr->id());
-                comp_ptr->set_properties(props, composite::properties::config_type::INITIALIZE, true);
-                updates = true;
-            }
-            if (!list_props.empty()) {
-                spdlog::trace("setting list properties on component {}", comp_ptr->id());
-                comp_ptr->set_properties(list_props, composite::properties::config_type::INITIALIZE, true);
-                updates = true;
-            }
-            if (!struct_props.empty()) {
-                spdlog::trace("setting struct properties on component {}", comp_ptr->id());
-                comp_ptr->set_properties(struct_props, composite::properties::config_type::INITIALIZE, true);
-                updates = true;
-            }
-            if (updates) {
+
+            // Parse property changeset
+            auto changeset = composite::property_changeset::from_json(props_json);
+
+            // Apply changes if there are any
+            if (changeset.has_updates()) {
+                if (!changeset.scalar_properties().empty()) {
+                    spdlog::trace("setting scalar properties on component {}", comp_ptr->id());
+                    comp_ptr->set_properties(changeset.scalar_properties(), composite::properties::config_type::INITIALIZE, true);
+                }
+                if (!changeset.list_properties().empty()) {
+                    spdlog::trace("setting list properties on component {}", comp_ptr->id());
+                    comp_ptr->set_properties(changeset.list_properties(), composite::properties::config_type::INITIALIZE, true);
+                }
+                if (!changeset.struct_properties().empty()) {
+                    spdlog::trace("setting struct properties on component {}", comp_ptr->id());
+                    comp_ptr->set_properties(changeset.struct_properties(), composite::properties::config_type::INITIALIZE, true);
+                }
                 comp_ptr->property_change_handler();
             }
         } catch (const std::runtime_error& err) {
@@ -275,15 +276,15 @@ auto main(int argc, char** argv) -> int {
         spdlog::trace("initializing application '{}'", app.name());
         app.initialize();
 
-        // Start the application
-        spdlog::trace("starting application '{}'", app.name());
-        app.start();
-
         // Start REST server
         spdlog::trace("listening at {}:{}", server_addr, server_port);
         auto server_thread = std::jthread([&]() {
             server->listen(server_addr, server_port);
         });
+
+        // Start the application
+        spdlog::trace("starting application '{}'", app.name());
+        app.start();
 
         // Wait for signal to stop
         spdlog::trace("waiting for signal...");

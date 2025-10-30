@@ -18,7 +18,10 @@
  */
 
 #include "composite/application.hpp"
+#include "composite/properties/property_serializer.hpp"
 #include "helpers.hpp"
+#include "property_changeset.hpp"
+#include "property_rest_api.hpp"
 
 #include <cstdlib>
 #include <format>
@@ -54,157 +57,12 @@ auto to_json(nlohmann::json& json_obj, const std::vector<component::connection>&
     }
 }
 
-auto to_json(nlohmann::json& json_obj, const composite::property_set& set) -> void; // forward
-
 auto to_json(nlohmann::json& json_obj, const composite::property& prop) {
-    auto type = prop.type();
-    json_obj["type"] = type;
-    json_obj["units"] = prop.units();
-    json_obj["configurability"] = (static_cast<int>(prop.configurability()) == 1) ? "runtime" : "initialize";
-    // Handle lists of structs
-    if (prop.is_list()) {
-        if (prop.type() == "[]struct") {
-            nlohmann::json value_array = nlohmann::json::array();
-            for (auto i = std::size_t{}; i < prop.struct_list_size(); ++i) {
-                nlohmann::json item_obj;
-                auto bound = property_set{};
-                auto* item_ptr = prop.struct_getter(i);
-                if (!item_ptr) {
-                    continue;
-                }
-                prop.struct_registration(bound, item_ptr);
-                to_json(item_obj, bound);
-                value_array.push_back(item_obj);
-            }
-            json_obj["value"] = value_array;
-        } else {
-            // Handle lists of scalar types. nlohmann::json can directly serialize std::vector of most types.
-            if (type == "[]bool") {
-                json_obj["value"] = *std::any_cast<std::vector<bool>*>(prop.value());
-            } else if (type == "[]string") {
-                json_obj["value"] = *std::any_cast<std::vector<std::string>*>(prop.value());
-            } else if (type == "[]int16") {
-                json_obj["value"] = *std::any_cast<std::vector<int16_t>*>(prop.value());
-            } else if (type == "[]uint16") {
-                json_obj["value"] = *std::any_cast<std::vector<uint16_t>*>(prop.value());
-            } else if (type == "[]int32") {
-                json_obj["value"] = *std::any_cast<std::vector<int32_t>*>(prop.value());
-            } else if (type == "[]uint32") {
-                json_obj["value"] = *std::any_cast<std::vector<uint32_t>*>(prop.value());
-            } else if (type == "[]int64") {
-                json_obj["value"] = *std::any_cast<std::vector<int64_t>*>(prop.value());
-            } else if (type == "[]uint64") {
-                json_obj["value"] = *std::any_cast<std::vector<uint64_t>*>(prop.value());
-            } else if (type == "[]float") {
-                json_obj["value"] = *std::any_cast<std::vector<float>*>(prop.value());
-            } else if (type == "[]double") {
-                json_obj["value"] = *std::any_cast<std::vector<double>*>(prop.value());
-            }
-            for (auto& v : json_obj["value"]) {
-                v = v.dump();
-            }
-        }
-    } else if (prop.is_structured()) {
-        nlohmann::json nested;
-        to_json(nested, prop.structured());
-        json_obj["value"] = nested;
-    } else {
-        if (type == "bool") {
-            json_obj["value"] = std::format("{}", *std::any_cast<bool*>(prop.value()));
-        } else if (type == "bool?") {
-            auto opt_val = *std::any_cast<std::optional<bool>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::format("{}", opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "string") {
-            json_obj["value"] = *std::any_cast<std::string*>(prop.value());
-        } else if (type == "string?") {
-            auto opt_val = *std::any_cast<std::optional<std::string>*>(prop.value());
-            json_obj["value"] = opt_val.value_or(nullptr);
-        } else if (type == "int16") {
-            json_obj["value"] = std::to_string(*std::any_cast<int16_t*>(prop.value()));
-        } else if (type == "int16?") {
-            auto opt_val = *std::any_cast<std::optional<int16_t>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "uint16") {
-            json_obj["value"] = std::to_string(*std::any_cast<uint16_t*>(prop.value()));
-        } else if (type == "uint16?") {
-            auto opt_val = *std::any_cast<std::optional<uint16_t>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "int32") {
-            json_obj["value"] = std::to_string(*std::any_cast<int32_t*>(prop.value()));
-        } else if (type == "int32?") {
-            auto opt_val = *std::any_cast<std::optional<int32_t>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "uint32") {
-            json_obj["value"] = std::to_string(*std::any_cast<uint32_t*>(prop.value()));
-        } else if (type == "uint32?") {
-            auto opt_val = *std::any_cast<std::optional<uint32_t>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "int64") {
-            json_obj["value"] = std::to_string(*std::any_cast<int64_t*>(prop.value()));
-        } else if (type == "int64?") {
-            auto opt_val = *std::any_cast<std::optional<int64_t>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "uint64") {
-            json_obj["value"] = std::to_string(*std::any_cast<uint64_t*>(prop.value()));
-        } else if (type == "uint64?") {
-            auto opt_val = *std::any_cast<std::optional<uint64_t>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "float") {
-            json_obj["value"] = std::to_string(*std::any_cast<float*>(prop.value()));
-        } else if (type == "float?") {
-            auto opt_val = *std::any_cast<std::optional<float>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        } else if (type == "double") {
-            json_obj["value"] = std::to_string(*std::any_cast<double*>(prop.value()));
-        } else if (type == "double?") {
-            auto opt_val = *std::any_cast<std::optional<double>*>(prop.value());
-            if (opt_val.has_value()) {
-                json_obj["value"] = std::to_string(opt_val.value());
-            } else {
-                json_obj["value"] = nullptr;
-            }
-        }
-    }
+    property_serializer::to_json(json_obj, prop);
 }
 
 auto to_json(nlohmann::json& json_obj, const composite::property_set& set) -> void {
-    for (const auto& [name, prop] : set.properties()) {
-        auto prop_obj = nlohmann::json::object();
-        to_json(prop_obj, prop);
-        json_obj[name] = prop_obj;
-    }
+    property_serializer::to_json(json_obj, set);
 }
 
 auto to_json(nlohmann::json& json_obj, const component& comp) {
@@ -256,28 +114,31 @@ auto set_component_properties(
     auto content = nlohmann::json();
     try {
         spdlog::trace("patching component-level properties on {}", comp->id());
+
+        // Handle enabled flag separately
         for (const auto& [key, value] : properties.items()) {
             if (key == "enabled") {
                 (value == "false" || value == "0") ? comp->stop() : comp->start();
             }
         }
-        const auto& [props, list_props, struct_list_props] = build_props_lists(properties);
-        auto updates = false;
-        if (!props.empty()) {
-            comp->set_properties(props, composite::properties::config_type::RUNTIME);
-            updates = true;
-        }
-        if (!list_props.empty()) {
-            comp->set_properties(list_props, composite::properties::config_type::RUNTIME);
-            updates = true;
-        }
-        if (!struct_list_props.empty()) {
-            comp->set_properties(struct_list_props, composite::properties::config_type::RUNTIME);
-            updates = true;
-        }
-        if (updates) {
+
+        // Parse property changeset
+        auto changeset = property_changeset::from_json(properties);
+
+        // Apply changes if there are any
+        if (changeset.has_updates()) {
+            if (!changeset.scalar_properties().empty()) {
+                comp->set_properties(changeset.scalar_properties(), composite::properties::config_type::RUNTIME);
+            }
+            if (!changeset.list_properties().empty()) {
+                comp->set_properties(changeset.list_properties(), composite::properties::config_type::RUNTIME);
+            }
+            if (!changeset.struct_properties().empty()) {
+                comp->set_properties(changeset.struct_properties(), composite::properties::config_type::RUNTIME);
+            }
             comp->property_change_handler();
         }
+
         content["success"] = std::format("successfully set properties on component {}", comp->id());
         res.set_content(content.dump(), "application/json");
         res.status = httplib::OK_200;
@@ -494,6 +355,464 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             content["error"] = std::format("component not found: {}", comp_id);
             res.set_content(content.dump(), "application/json");
             res.status = httplib::NotFound_404;
+        }
+    });
+
+    // GET /app/components/:id/properties
+    endpoint = std::format("/{}/{}/:id/properties", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto path = std::format("/{}/{}/{}/properties", APP, COMPONENTS, comp_id);
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_properties_collection(comp.get(), req, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // GET /app/components/:id/properties/:name
+    endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_property(comp.get(), prop_name, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // PUT /app/components/:id/properties/:name
+    endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+    server->Put(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::put_property(comp.get(), prop_name, json_body, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // PATCH /app/components/:id/properties/:name
+    endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+    server->Patch(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::patch_property(comp.get(), prop_name, json_body, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // DELETE /app/components/:id/properties/:name
+    endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+    server->Delete(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::delete_property(comp.get(), prop_name, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // ========================================================================
+    // List Property Operations
+    // ========================================================================
+
+    // GET /app/components/:id/properties/:name/items
+    endpoint = std::format("/{}/{}/:id/properties/:name/items", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}/items", APP, COMPONENTS, comp_id, prop_name);
+        auto base_path = path;
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_list_items(comp.get(), prop_name, path, base_path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // GET /app/components/:id/properties/:name/items/:index
+    endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto index_str = req.path_params.at("index");
+        auto path = std::format("/{}/{}/{}/properties/{}/items/{}", APP, COMPONENTS, comp_id, prop_name, index_str);
+
+        // Parse index
+        std::size_t index;
+        try {
+            index = std::stoull(index_str);
+        } catch (const std::exception&) {
+            auto details = nlohmann::json::object();
+            details["index"] = index_str;
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::INVALID_INDEX,
+                std::format("Invalid index: {}", index_str),
+                path,
+                details
+            );
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_list_item(comp.get(), prop_name, index, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // POST /app/components/:id/properties/:name/items (append)
+    endpoint = std::format("/{}/{}/:id/properties/:name/items", APP, COMPONENTS);
+    server->Post(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}/items", APP, COMPONENTS, comp_id, prop_name);
+        auto base_path = path;
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::post_list_item(comp.get(), prop_name, json_body, path, base_path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // PUT /app/components/:id/properties/:name/items/:index
+    endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS);
+    server->Put(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto index_str = req.path_params.at("index");
+        auto path = std::format("/{}/{}/{}/properties/{}/items/{}", APP, COMPONENTS, comp_id, prop_name, index_str);
+
+        // Parse index
+        std::size_t index;
+        try {
+            index = std::stoull(index_str);
+        } catch (const std::exception&) {
+            auto details = nlohmann::json::object();
+            details["index"] = index_str;
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::INVALID_INDEX,
+                std::format("Invalid index: {}", index_str),
+                path,
+                details
+            );
+            return;
+        }
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::put_list_item(comp.get(), prop_name, index, json_body, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // DELETE /app/components/:id/properties/:name/items/:index
+    endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS);
+    server->Delete(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto index_str = req.path_params.at("index");
+        auto path = std::format("/{}/{}/{}/properties/{}/items/{}", APP, COMPONENTS, comp_id, prop_name, index_str);
+
+        // Parse index
+        std::size_t index;
+        try {
+            index = std::stoull(index_str);
+        } catch (const std::exception&) {
+            auto details = nlohmann::json::object();
+            details["index"] = index_str;
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::INVALID_INDEX,
+                std::format("Invalid index: {}", index_str),
+                path,
+                details
+            );
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::delete_list_item(comp.get(), prop_name, index, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // ========================================================================
+    // Struct Property Operations
+    // ========================================================================
+
+    // GET /app/components/:id/properties/:name/fields
+    endpoint = std::format("/{}/{}/:id/properties/:name/fields", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}/fields", APP, COMPONENTS, comp_id, prop_name);
+        auto base_path = path;
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_struct_fields(comp.get(), prop_name, path, base_path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // GET /app/components/:id/properties/:name/fields/:field
+    endpoint = std::format("/{}/{}/:id/properties/:name/fields/:field", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto field_name = req.path_params.at("field");
+        auto path = std::format("/{}/{}/{}/properties/{}/fields/{}", APP, COMPONENTS, comp_id, prop_name, field_name);
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_struct_field(comp.get(), prop_name, field_name, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // PATCH /app/components/:id/properties/:name/fields/:field
+    endpoint = std::format("/{}/{}/:id/properties/:name/fields/:field", APP, COMPONENTS);
+    server->Patch(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto field_name = req.path_params.at("field");
+        auto path = std::format("/{}/{}/{}/properties/{}/fields/{}", APP, COMPONENTS, comp_id, prop_name, field_name);
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::patch_struct_field(comp.get(), prop_name, field_name, json_body, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // GET /app/components/:id/properties/:name/items/:index/fields
+    endpoint = std::format("/{}/{}/:id/properties/:name/items/:index/fields", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto index_str = req.path_params.at("index");
+        auto path = std::format("/{}/{}/{}/properties/{}/items/{}/fields", APP, COMPONENTS, comp_id, prop_name, index_str);
+        auto base_path = path;
+
+        // Parse index
+        std::size_t index;
+        try {
+            index = std::stoull(index_str);
+        } catch (const std::exception&) {
+            auto details = nlohmann::json::object();
+            details["index"] = index_str;
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::INVALID_INDEX,
+                std::format("Invalid index: {}", index_str),
+                path,
+                details
+            );
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_struct_list_item_fields(comp.get(), prop_name, index, path, base_path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // PATCH /app/components/:id/properties/:name/items/:index/fields/:field
+    endpoint = std::format("/{}/{}/:id/properties/:name/items/:index/fields/:field", APP, COMPONENTS);
+    server->Patch(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto index_str = req.path_params.at("index");
+        auto field_name = req.path_params.at("field");
+        auto path = std::format("/{}/{}/{}/properties/{}/items/{}/fields/{}", APP, COMPONENTS, comp_id, prop_name, index_str, field_name);
+
+        // Parse index
+        std::size_t index;
+        try {
+            index = std::stoull(index_str);
+        } catch (const std::exception&) {
+            auto details = nlohmann::json::object();
+            details["index"] = index_str;
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::INVALID_INDEX,
+                std::format("Invalid index: {}", index_str),
+                path,
+                details
+            );
+            return;
+        }
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::patch_struct_list_item_field(comp.get(), prop_name, index, field_name, json_body, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // ========================================================================
+    // Validation & Discovery Operations
+    // ========================================================================
+
+    // POST /app/components/:id/properties/:name/validate
+    endpoint = std::format("/{}/{}/:id/properties/:name/validate", APP, COMPONENTS);
+    server->Post(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}/validate", APP, COMPONENTS, comp_id, prop_name);
+
+        // Parse JSON body
+        auto [json_body, parse_error] = properties::rest::rest_helpers::parse_json_body(req.body, path);
+        if (parse_error) {
+            res = *parse_error;
+            return;
+        }
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::validate_property_value(comp.get(), prop_name, json_body, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
+        }
+    });
+
+    // GET /app/components/:id/properties/:name/schema
+    endpoint = std::format("/{}/{}/:id/properties/:name/schema", APP, COMPONENTS);
+    server->Get(endpoint, [&app, &APP, &COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+        auto comp_id = req.path_params.at("id");
+        auto prop_name = req.path_params.at("name");
+        auto path = std::format("/{}/{}/{}/properties/{}/schema", APP, COMPONENTS, comp_id, prop_name);
+
+        if (auto comp = app.get_component(comp_id); comp != nullptr) {
+            res = properties::rest::property_handlers::get_property_schema(comp.get(), prop_name, path);
+        } else {
+            res = properties::rest::rest_helpers::error_response_obj(
+                properties::rest::error_code::COMPONENT_NOT_FOUND,
+                std::format("Component '{}' not found", comp_id),
+                path
+            );
         }
     });
 

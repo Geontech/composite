@@ -1,0 +1,936 @@
+/*
+ * Copyright (C) 2025 Geon Technologies, LLC
+ *
+ * This file is part of composite.
+ *
+ * composite is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Lesser General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * composite is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program. If not, see http://www.gnu.org/licenses/.
+ */
+
+#include "composite/component.hpp"
+#include "composite/application.hpp"
+#include "property_rest_api.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <thread>
+#include <chrono>
+
+using namespace composite;
+using namespace composite::properties::rest;
+using namespace std::chrono_literals;
+
+using composite::properties::config_type;
+
+namespace {
+
+// Test configuration structures
+struct test_config {
+    int32_t sample_rate = 48000;
+    int32_t buffer_size = 1024;
+    bool enabled = true;
+    std::string name = "test_component";
+    std::vector<std::string> channels{"left", "right"};
+
+    struct network_config {
+        std::string host = "localhost";
+        uint16_t port = 8080;
+    } network;
+
+    std::vector<network_config> connections{
+        {"host1", 9001},
+        {"host2", 9002}
+    };
+};
+
+// Test component with various property types
+class test_component : public component {
+public:
+    test_component(std::string_view id) : component(id) {
+        // Scalar properties
+        add_property("sample_rate", &m_config.sample_rate)
+            .units("Hz")
+            .configurability(config_type::RUNTIME);
+
+        add_property("buffer_size", &m_config.buffer_size)
+            .units("samples")
+            .configurability(config_type::INITIALIZE);
+
+        add_property("enabled", &m_config.enabled)
+            .configurability(config_type::RUNTIME);
+
+        add_property("name", &m_config.name)
+            .configurability(config_type::RUNTIME);
+
+        // List property
+        add_list_property("channels", &m_config.channels)
+            .configurability(config_type::RUNTIME);
+
+        // Struct property
+        add_struct_property("network", &m_config.network, [](property_set& ps, test_config::network_config* cfg) {
+            ps.add_property("host", &cfg->host).configurability(config_type::RUNTIME);
+            ps.add_property("port", &cfg->port).configurability(config_type::RUNTIME);
+        }).configurability(config_type::RUNTIME);
+
+        // Struct list property
+        add_struct_list_property("connections", &m_config.connections, [](property_set& ps, test_config::network_config* cfg) {
+            ps.add_property("host", &cfg->host).configurability(config_type::RUNTIME);
+            ps.add_property("port", &cfg->port).configurability(config_type::RUNTIME);
+        }).configurability(config_type::RUNTIME);
+    }
+
+    auto process() -> retval override {
+        return retval::FINISH;
+    }
+
+    auto get_config() -> test_config& {
+        return m_config;
+    }
+
+private:
+    test_config m_config;
+};
+
+// Server fixture that starts an HTTP server with a test component
+class test_server {
+public:
+    test_server() : m_port(18080), m_server(std::make_unique<httplib::Server>()) {
+        // Create test application with one component
+        auto comp = std::make_shared<test_component>("test_comp");
+        m_app.add_component(comp);
+
+        // Register property REST API endpoints
+        setup_property_endpoints();
+
+        // Start server in background thread
+        m_server_thread = std::thread([this]() {
+            m_server->listen("localhost", m_port);
+        });
+
+        // Wait for server to be ready
+        std::this_thread::sleep_for(100ms);
+    }
+
+    ~test_server() {
+        m_server->stop();
+        if (m_server_thread.joinable()) {
+            m_server_thread.join();
+        }
+    }
+
+    auto port() const -> int { return m_port; }
+    auto base_url() const -> std::string {
+        return std::format("http://localhost:{}", m_port);
+    }
+
+    // Return paths only (not full URLs) for use with httplib::Client
+    auto component_path(std::string_view comp_id) const -> std::string {
+        return std::format("/app/components/{}", comp_id);
+    }
+
+    auto property_path(std::string_view comp_id, std::string_view prop_name) const -> std::string {
+        return std::format("/app/components/{}/properties/{}", comp_id, prop_name);
+    }
+
+private:
+    void setup_property_endpoints() {
+        const std::string APP = "app";
+        const std::string COMPONENTS = "components";
+
+        // GET /app/components/:id/properties
+        auto endpoint = std::format("/{}/{}/:id/properties", APP, COMPONENTS);
+        m_server->Get(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto base_path = std::format("/{}/{}/{}/properties", APP, COMPONENTS, comp_id);
+            auto response = property_handlers::get_properties_collection(comp.get(), req, base_path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // GET /app/components/:id/properties/:name
+        endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+        m_server->Get(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::get_property(comp.get(), prop_name, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // PUT /app/components/:id/properties/:name
+        endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+        m_server->Put(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
+            if (request_body.is_discarded()) {
+                res.status = httplib::BadRequest_400;
+                res.set_content(R"({"error": "Invalid JSON"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::put_property(comp.get(), prop_name, request_body, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // DELETE /app/components/:id/properties/:name
+        endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
+        m_server->Delete(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::delete_property(comp.get(), prop_name, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // List operations
+        // GET /app/components/:id/properties/:name/items
+        endpoint = std::format("/{}/{}/:id/properties/:name/items", APP, COMPONENTS);
+        m_server->Get(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/items", APP, COMPONENTS, comp_id, prop_name);
+            auto base_path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::get_list_items(comp.get(), prop_name, path, base_path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // GET /app/components/:id/properties/:name/items/:index
+        endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS);
+        m_server->Get(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto index_str = req.path_params.at("index");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            size_t index = std::stoull(index_str);
+            auto path = std::format("/{}/{}/{}/properties/{}/items/{}", APP, COMPONENTS, comp_id, prop_name, index);
+            auto response = property_handlers::get_list_item(comp.get(), prop_name, index, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // POST /app/components/:id/properties/:name/items
+        m_server->Post(endpoint = std::format("/{}/{}/:id/properties/:name/items", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
+            if (request_body.is_discarded()) {
+                res.status = httplib::BadRequest_400;
+                res.set_content(R"({"error": "Invalid JSON"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/items", APP, COMPONENTS, comp_id, prop_name);
+            auto base_path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::post_list_item(comp.get(), prop_name, request_body, path, base_path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // PUT /app/components/:id/properties/:name/items/:index
+        m_server->Put(endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto index_str = req.path_params.at("index");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
+            if (request_body.is_discarded()) {
+                res.status = httplib::BadRequest_400;
+                res.set_content(R"({"error": "Invalid JSON"})", "application/json");
+                return;
+            }
+
+            size_t index = std::stoull(index_str);
+            auto path = std::format("/{}/{}/{}/properties/{}/items/{}", APP, COMPONENTS, comp_id, prop_name, index);
+            auto response = property_handlers::put_list_item(comp.get(), prop_name, index, request_body, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // DELETE /app/components/:id/properties/:name/items/:index
+        m_server->Delete(endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto index_str = req.path_params.at("index");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            size_t index = std::stoull(index_str);
+            auto path = std::format("/{}/{}/{}/properties/{}/items/{}", APP, COMPONENTS, comp_id, prop_name, index);
+            auto response = property_handlers::delete_list_item(comp.get(), prop_name, index, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // Struct operations
+        // GET /app/components/:id/properties/:name/fields
+        m_server->Get(endpoint = std::format("/{}/{}/:id/properties/:name/fields", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/fields", APP, COMPONENTS, comp_id, prop_name);
+            auto base_path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::get_struct_fields(comp.get(), prop_name, path, base_path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // GET /app/components/:id/properties/:name/fields/:field
+        m_server->Get(endpoint = std::format("/{}/{}/:id/properties/:name/fields/:field", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto field_name = req.path_params.at("field");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/fields/{}", APP, COMPONENTS, comp_id, prop_name, field_name);
+            auto response = property_handlers::get_struct_field(comp.get(), prop_name, field_name, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // PATCH /app/components/:id/properties/:name/fields/:field
+        m_server->Patch(endpoint = std::format("/{}/{}/:id/properties/:name/fields/:field", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto field_name = req.path_params.at("field");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
+            if (request_body.is_discarded()) {
+                res.status = httplib::BadRequest_400;
+                res.set_content(R"({"error": "Invalid JSON"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/fields/{}", APP, COMPONENTS, comp_id, prop_name, field_name);
+            auto response = property_handlers::patch_struct_field(comp.get(), prop_name, field_name, request_body, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // Struct list operations
+        // GET /app/components/:id/properties/:name/items/:index/fields
+        m_server->Get(endpoint = std::format("/{}/{}/:id/properties/:name/items/:index/fields", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto index_str = req.path_params.at("index");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            size_t index = std::stoull(index_str);
+            auto path = std::format("/{}/{}/{}/properties/{}/items/{}/fields", APP, COMPONENTS, comp_id, prop_name, index);
+            auto base_path = std::format("/{}/{}/{}/properties/{}", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::get_struct_list_item_fields(comp.get(), prop_name, index, path, base_path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // PATCH /app/components/:id/properties/:name/items/:index/fields/:field
+        m_server->Patch(endpoint = std::format("/{}/{}/:id/properties/:name/items/:index/fields/:field", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto index_str = req.path_params.at("index");
+            auto field_name = req.path_params.at("field");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
+            if (request_body.is_discarded()) {
+                res.status = httplib::BadRequest_400;
+                res.set_content(R"({"error": "Invalid JSON"})", "application/json");
+                return;
+            }
+
+            size_t index = std::stoull(index_str);
+            auto path = std::format("/{}/{}/{}/properties/{}/items/{}/fields/{}", APP, COMPONENTS, comp_id, prop_name, index, field_name);
+            auto response = property_handlers::patch_struct_list_item_field(comp.get(), prop_name, index, field_name, request_body, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // Validation endpoint
+        // POST /app/components/:id/properties/:name/validate
+        m_server->Post(endpoint = std::format("/{}/{}/:id/properties/:name/validate", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
+            if (request_body.is_discarded()) {
+                res.status = httplib::BadRequest_400;
+                res.set_content(R"({"error": "Invalid JSON"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/validate", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::validate_property_value(comp.get(), prop_name, request_body, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+
+        // Schema endpoint
+        // GET /app/components/:id/properties/:name/schema
+        m_server->Get(endpoint = std::format("/{}/{}/:id/properties/:name/schema", APP, COMPONENTS),
+            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto prop_name = req.path_params.at("name");
+            auto comp = m_app.get_component(comp_id);
+            if (!comp) {
+                res.status = httplib::NotFound_404;
+                res.set_content(R"({"error": "Component not found"})", "application/json");
+                return;
+            }
+
+            auto path = std::format("/{}/{}/{}/properties/{}/schema", APP, COMPONENTS, comp_id, prop_name);
+            auto response = property_handlers::get_property_schema(comp.get(), prop_name, path);
+            res.status = response.status;
+            res.body = response.body;
+            res.set_header("Content-Type", "application/json");
+        });
+    }
+
+    int m_port;
+    application m_app{"test_app"};
+    std::unique_ptr<httplib::Server> m_server;
+    std::thread m_server_thread;
+};
+
+} // anonymous namespace
+
+TEST_CASE("HTTP Integration - Server Health Check") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Verify server is running") {
+        // Try a simple root path that should 404 but prove server is responding
+        auto result = client.Get("/");
+        REQUIRE(result); // Connection successful
+        INFO("Server is responding on " << server.base_url());
+    }
+}
+
+TEST_CASE("HTTP Integration - Property GET") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Debug - Check URL construction") {
+        auto path = server.property_path("test_comp", "sample_rate");
+        INFO("Testing path: " << path);
+        INFO("Expected: /app/components/test_comp/properties/sample_rate");
+    }
+
+    SECTION("Get single property via HTTP") {
+        auto path = server.property_path("test_comp", "sample_rate");
+        INFO("Requesting: " << path);
+
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        if (result->status != httplib::OK_200) {
+            INFO("Response status: " << result->status);
+            INFO("Response body: " << result->body);
+        }
+        REQUIRE(result->status == httplib::OK_200);
+        REQUIRE(result->get_header_value("Content-Type") == "application/json");
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["name"].get<std::string>() == "sample_rate");
+        REQUIRE(json["type"].get<std::string>() == "int32");
+        REQUIRE(json["value"].get<std::string>() == "48000");
+    }
+
+    SECTION("Get non-existent property returns 404") {
+        auto result = client.Get(server.property_path("test_comp", "does_not_exist"));
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::NotFound_404);
+    }
+
+    SECTION("Get properties collection with query parameters") {
+        auto path = std::format("/app/components/test_comp/properties?type=int32");
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("properties"));
+
+        // All returned properties should be int32
+        for (const auto& [name, prop] : json["properties"].items()) {
+            REQUIRE(prop["type"].get<std::string>() == "int32");
+        }
+    }
+}
+
+TEST_CASE("HTTP Integration - Property PUT") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Update property via HTTP PUT") {
+        auto body = nlohmann::json{{"value", 96000}}.dump();
+        auto result = client.Put(
+            server.property_path("test_comp", "sample_rate"),
+            body,
+            "application/json"
+        );
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["value"].get<std::string>() == "96000");
+
+        // Verify change persisted with GET
+        auto get_result = client.Get(server.property_path("test_comp", "sample_rate"));
+        REQUIRE(get_result);
+        auto get_json = nlohmann::json::parse(get_result->body);
+        REQUIRE(get_json["value"].get<std::string>() == "96000");
+    }
+
+    SECTION("Cannot update non-runtime-configurable property") {
+        auto body = nlohmann::json{{"value", 2048}}.dump();
+        auto result = client.Put(
+            server.property_path("test_comp", "buffer_size"),
+            body,
+            "application/json"
+        );
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::Forbidden_403);
+    }
+}
+
+TEST_CASE("HTTP Integration - Property DELETE") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Reset property to zero via HTTP DELETE") {
+        // First change the value
+        auto put_body = nlohmann::json{{"value", 96000}}.dump();
+        client.Put(
+            server.property_path("test_comp", "sample_rate"),
+            put_body,
+            "application/json"
+        );
+
+        // Then delete (reset)
+        auto result = client.Delete(server.property_path("test_comp", "sample_rate"));
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        // Verify reset to zero (properties don't track constructor defaults)
+        auto get_result = client.Get(server.property_path("test_comp", "sample_rate"));
+        REQUIRE(get_result);
+        auto json = nlohmann::json::parse(get_result->body);
+        REQUIRE(json["value"].get<std::string>() == "0"); // zero-initialized
+    }
+}
+
+TEST_CASE("HTTP Integration - Full Property Lifecycle") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Complete CRUD workflow via HTTP") {
+        // 1. Get initial value
+        auto get1 = client.Get(server.property_path("test_comp", "sample_rate"));
+        REQUIRE(get1);
+        REQUIRE(get1->status == httplib::OK_200);
+        auto json1 = nlohmann::json::parse(get1->body);
+        REQUIRE(json1["value"].get<std::string>() == "48000");
+
+        // 2. Update value
+        auto put_body = nlohmann::json{{"value", 96000}}.dump();
+        auto put_result = client.Put(
+            server.property_path("test_comp", "sample_rate"),
+            put_body,
+            "application/json"
+        );
+        REQUIRE(put_result);
+        REQUIRE(put_result->status == httplib::OK_200);
+
+        // 3. Verify update
+        auto get2 = client.Get(server.property_path("test_comp", "sample_rate"));
+        REQUIRE(get2);
+        auto json2 = nlohmann::json::parse(get2->body);
+        REQUIRE(json2["value"].get<std::string>() == "96000");
+
+        // 4. Reset to zero
+        auto delete_result = client.Delete(server.property_path("test_comp", "sample_rate"));
+        REQUIRE(delete_result);
+        REQUIRE(delete_result->status == httplib::OK_200);
+
+        // 5. Verify reset to zero (properties don't track constructor defaults)
+        auto get3 = client.Get(server.property_path("test_comp", "sample_rate"));
+        REQUIRE(get3);
+        auto json3 = nlohmann::json::parse(get3->body);
+        REQUIRE(json3["value"].get<std::string>() == "0");
+    }
+}
+
+TEST_CASE("HTTP Integration - Error Handling") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Invalid JSON returns 400") {
+        auto result = client.Put(
+            server.property_path("test_comp", "sample_rate"),
+            "{invalid json}",
+            "application/json"
+        );
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::BadRequest_400);
+    }
+
+    SECTION("Missing value field returns error") {
+        auto body = nlohmann::json{{"foo", "bar"}}.dump();
+        auto result = client.Put(
+            server.property_path("test_comp", "sample_rate"),
+            body,
+            "application/json"
+        );
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::BadRequest_400);
+    }
+
+    SECTION("Non-existent component returns 404") {
+        auto result = client.Get("/app/components/fake_comp/properties/sample_rate");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::NotFound_404);
+    }
+}
+
+TEST_CASE("HTTP Integration - List Operations") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Get list items") {
+        auto path = "/app/components/test_comp/properties/channels/items";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("items"));
+        REQUIRE(json.contains("count"));
+        REQUIRE(json["count"].get<size_t>() == 2);
+        REQUIRE(json["items"].is_array());
+    }
+
+    SECTION("Get single list item") {
+        auto path = "/app/components/test_comp/properties/channels/items/0";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("index"));
+        REQUIRE(json.contains("value"));
+        REQUIRE(json["index"].get<size_t>() == 0);
+        REQUIRE(json["value"].get<std::string>() == "left");
+    }
+
+    SECTION("Append to list via POST") {
+        auto path = "/app/components/test_comp/properties/channels/items";
+        auto body = nlohmann::json{{"value", "center"}}.dump();
+        auto result = client.Post(path, body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::Created_201);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("index"));
+        REQUIRE(json.contains("value"));
+        REQUIRE(json["value"].get<std::string>() == "center");
+
+        // Verify it was added
+        auto get_result = client.Get(path);
+        REQUIRE(get_result);
+        auto get_json = nlohmann::json::parse(get_result->body);
+        REQUIRE(get_json["count"].get<size_t>() == 3);
+    }
+
+    SECTION("Update list item via PUT") {
+        auto path = "/app/components/test_comp/properties/channels/items/0";
+        auto body = nlohmann::json{{"value", "front_left"}}.dump();
+        auto result = client.Put(path, body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["value"].get<std::string>() == "front_left");
+
+        // Verify the update
+        auto get_result = client.Get(path);
+        REQUIRE(get_result);
+        auto get_json = nlohmann::json::parse(get_result->body);
+        REQUIRE(get_json["value"].get<std::string>() == "front_left");
+    }
+
+    SECTION("Delete list item") {
+        auto path = "/app/components/test_comp/properties/channels/items/1";
+        auto result = client.Delete(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        // Verify it was deleted
+        auto get_result = client.Get("/app/components/test_comp/properties/channels/items");
+        REQUIRE(get_result);
+        auto json = nlohmann::json::parse(get_result->body);
+        REQUIRE(json["count"].get<size_t>() == 1);
+    }
+}
+
+TEST_CASE("HTTP Integration - Struct Operations") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Get struct fields") {
+        auto path = "/app/components/test_comp/properties/network/fields";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("fields"));
+        REQUIRE(json["fields"].contains("host"));
+        REQUIRE(json["fields"].contains("port"));
+    }
+
+    SECTION("Get single struct field") {
+        auto path = "/app/components/test_comp/properties/network/fields/host";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("value"));
+        REQUIRE(json["value"].get<std::string>() == "localhost");
+    }
+
+    SECTION("Update struct field via PATCH") {
+        auto path = "/app/components/test_comp/properties/network/fields/host";
+        auto body = nlohmann::json{{"value", "192.168.1.1"}}.dump();
+        auto result = client.Patch(path, body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["value"].get<std::string>() == "192.168.1.1");
+
+        // Verify the update
+        auto get_result = client.Get(path);
+        REQUIRE(get_result);
+        auto get_json = nlohmann::json::parse(get_result->body);
+        REQUIRE(get_json["value"].get<std::string>() == "192.168.1.1");
+    }
+}
+
+TEST_CASE("HTTP Integration - Struct List Operations") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Get struct list item fields") {
+        auto path = "/app/components/test_comp/properties/connections/items/0/fields";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("fields"));
+        REQUIRE(json["fields"].contains("host"));
+        REQUIRE(json["fields"].contains("port"));
+    }
+
+    SECTION("Update struct list item field") {
+        auto path = "/app/components/test_comp/properties/connections/items/0/fields/host";
+        auto body = nlohmann::json{{"value", "10.0.0.1"}}.dump();
+        auto result = client.Patch(path, body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["value"].get<std::string>() == "10.0.0.1");
+    }
+}
+
+TEST_CASE("HTTP Integration - Validation") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Validate valid property value") {
+        auto path = "/app/components/test_comp/properties/sample_rate/validate";
+        auto body = nlohmann::json{{"value", 96000}}.dump();
+        auto result = client.Post(path, body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("valid"));
+        REQUIRE(json["valid"].get<bool>() == true);
+    }
+}
+
+TEST_CASE("HTTP Integration - Schema") {
+    test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Get property schema") {
+        auto path = "/app/components/test_comp/properties/sample_rate/schema";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("name"));
+        REQUIRE(json.contains("type"));
+        REQUIRE(json.contains("units"));
+        REQUIRE(json.contains("configurability"));
+        REQUIRE(json["name"].get<std::string>() == "sample_rate");
+        REQUIRE(json["type"].get<std::string>() == "int32");
+        REQUIRE(json["units"].get<std::string>() == "Hz");
+        REQUIRE(json["configurability"].get<std::string>() == "runtime");
+    }
+}
