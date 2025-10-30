@@ -22,6 +22,7 @@ add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/property_rest_api.cpp
 )
 # Set RPATH property
 if(COMPOSITE_EMBED_MODULE_RPATH)

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite.
  *
@@ -19,288 +19,18 @@
 
 #pragma once
 
-#include <any>
-#include <cxxabi.h>
+#include "properties/property_metadata.hpp"
+#include "properties/property_operations.hpp"
+#include "properties/property.hpp"
 #include <format>
-#include <functional>
 #include <map>
 #include <numeric>
-#include <stdexcept>
+#include <optional>
 #include <string>
 #include <string_view>
-#include <type_traits>
-#include <variant>
 #include <vector>
-#include <iostream>
 
 namespace composite {
-
-namespace properties {
-
-constexpr std::string_view null_prop = "composite::properties::null";
-
-template <typename T>
-T convert_string_to(const std::string& value);
-
-#define CONVERT_STRING_SPECIALIZATION(TYPE, FUNC) \
-template <> inline TYPE convert_string_to<TYPE>(const std::string& value) { return FUNC(value); }
-
-CONVERT_STRING_SPECIALIZATION(bool, [](const std::string& v){ return v == "1" || v == "true"; })
-CONVERT_STRING_SPECIALIZATION(int16_t, [](const std::string& v){ return static_cast<int16_t>(std::stoi(v)); })
-CONVERT_STRING_SPECIALIZATION(uint16_t, [](const std::string& v){ return static_cast<uint16_t>(std::stoul(v)); })
-CONVERT_STRING_SPECIALIZATION(int32_t, [](const std::string& v){ return static_cast<int32_t>(std::stoi(v)); })
-CONVERT_STRING_SPECIALIZATION(uint32_t, [](const std::string& v){ return static_cast<uint32_t>(std::stoul(v)); })
-CONVERT_STRING_SPECIALIZATION(int64_t, [](const std::string& v){ return static_cast<int64_t>(std::stoll(v)); })
-CONVERT_STRING_SPECIALIZATION(uint64_t, [](const std::string& v){ return static_cast<uint64_t>(std::stoull(v)); })
-CONVERT_STRING_SPECIALIZATION(float, std::stof)
-CONVERT_STRING_SPECIALIZATION(double, std::stod)
-CONVERT_STRING_SPECIALIZATION(std::string, [](const std::string& v){ return v; })
-
-template <typename T> struct is_optional : std::false_type {};
-template <typename T> struct is_optional<std::optional<T>> : std::true_type {};
-template <typename T> inline constexpr bool is_optional_v = is_optional<T>::value;
-
-enum class config_type {
-    INITIALIZE,
-    RUNTIME
-}; // enum class config_type
-
-enum class error {
-    OK,
-    INVALID_TYPE,
-    INVALID_KEY,
-    INVALID_VALUE
-}; // enum class error
-
-class properties_error : public std::runtime_error {
-public:
-    explicit properties_error(std::string_view msg) : std::runtime_error(std::string{msg}) {}
-
-}; // class properties_error
-
-class configurability_error : public properties_error {
-public:
-    configurability_error(std::string_view comp_id, std::string_view prop) :
-      properties_error(std::format("property {} of component {} is not runtime configurable", prop, comp_id)),
-      prop(prop) {}
-
-    std::string prop;
-
-}; // class configurability_error
-
-class type_error : public properties_error {
-public:
-    type_error(std::string_view comp_id, std::string_view prop, std::string_view type) :
-      properties_error(std::format("unknown type {} for property {} of component {}", type, prop, comp_id)),
-      prop(prop),
-      type(type) {}
-
-    std::string prop;
-    std::string type;
-
-}; // class type_error
-
-class key_error : public properties_error {
-public:
-    key_error(std::string_view comp_id, std::string_view prop) :
-      properties_error(std::format("unknown property {} of component {}", prop, comp_id)),
-      prop(prop) {}
-
-    std::string prop;
-
-}; // class key_error
-
-class value_error : public properties_error {
-public:
-    value_error(std::string_view comp_id, std::string_view prop, std::string_view value) :
-      properties_error(std::format("invalid value for property {} of component {}: {}", prop, comp_id, value)),
-      prop(prop),
-      value(value) {}
-
-    std::string prop;
-    std::string value;
-
-}; // class key_error
-
-} // namespace properties
-
-class property_set; // forward declaration
-
-class property {
-public:
-    using change_func_type = std::function<bool()>;
-    using indexed_change_func_type = std::function<bool(std::size_t)>;
-    using any_change_listener = std::variant<std::monostate, change_func_type, indexed_change_func_type>;
-    using struct_reset_func = std::function<void(std::any&)>;
-    using struct_emplace_back_func = std::function<std::size_t(std::any&)>;
-    using struct_erase_func = std::function<void(std::any&, std::size_t)>;
-    using struct_registration_func = std::function<void(property_set&, void*)>;
-    using struct_getter_func = std::function<void*(const std::any&, std::size_t)>;
-    using struct_list_size_func = std::function<std::size_t(const std::any&)>;
-
-    property(std::string_view type, std::any value) :
-      m_type(type),
-      m_value(value) {
-    }
-
-    auto type() const -> std::string {
-        return m_type;
-    }
-
-    auto type(std::string_view value) -> void {
-        m_type = value;
-    }
-
-    auto is_optional() const -> bool {
-        return m_type.ends_with('?');
-    }
-
-    auto value() const -> const std::any& {
-        return m_value;
-    }
-
-    auto value() -> std::any& {
-        return m_value;
-    }
-
-    auto value(std::any value) -> void {
-        m_value = value;
-    }
-
-    auto units() const -> std::string {
-        return m_units;
-    }
-
-    auto units(std::string_view u) -> property& {
-        m_units = std::string{u};
-        return *this;
-    }
-
-    auto configurability() const -> properties::config_type {
-        return m_configurability;
-    }
-
-    auto configurability(properties::config_type value) -> property& {
-        m_configurability = value;
-        return *this;
-    }
-
-    auto change_listener() const -> any_change_listener {
-        return m_change_func;
-    }
-
-    auto change_listener(change_func_type value) -> void {
-        if (this->is_list()) {
-            throw std::runtime_error("list properties must use indexed change listener");
-        }
-        m_change_func = value;
-    }
-
-    auto change_listener(indexed_change_func_type value) -> void {
-        if (!this->is_list()) {
-            throw std::runtime_error("non-list properties must use non-indexed change listener");
-        }
-        m_change_func = value;
-    }
-
-    auto is_structured() const -> bool{
-        return m_struct != nullptr;
-    }
-
-    auto structured() -> property_set& {
-        return *m_struct;
-    }
-
-    auto structured() const -> const property_set& {
-        return *m_struct;
-    }
-
-    auto structured(std::shared_ptr<property_set> s) -> void {
-        m_struct = std::move(s);
-    }
-
-    auto struct_registration(struct_registration_func func) -> void {
-        m_struct_registration = std::move(func);
-    }
-
-    auto struct_registration(property_set& set, void* ptr) const -> void {
-        if (m_struct_registration) {
-            return m_struct_registration(set, ptr);
-        }
-    }
-
-    auto struct_reset(struct_reset_func func) -> void {
-        m_struct_reset = std::move(func);
-    }
-
-    auto struct_reset() -> void {
-        if (m_struct_reset) {
-            m_struct_reset(m_value);
-        }
-    }
-
-    auto struct_emplace_back(struct_emplace_back_func func) -> void {
-        m_struct_emplace_back = std::move(func);
-    }
-
-    auto struct_emplace_back() -> std::optional<std::size_t> {
-        if (m_struct_emplace_back) {
-            return {m_struct_emplace_back(m_value)};
-        }
-        return std::nullopt;
-    }
-
-    auto struct_erase(struct_erase_func func) -> void {
-        m_struct_erase = std::move(func);
-    }
-
-    auto struct_erase(std::size_t index) -> void {
-        if (m_struct_erase) {
-            m_struct_erase(m_value, index);
-        }
-    }
-
-    auto struct_getter(struct_getter_func func) -> void {
-        m_struct_getter = std::move(func);
-    }
-
-    auto struct_getter(std::size_t index) const -> void* {
-        if (!m_struct_getter) {
-            return nullptr;
-        }
-        return m_struct_getter(m_value, index);
-    }
-
-    auto struct_list_size(struct_list_size_func func) -> void {
-        m_struct_list_size = std::move(func);
-    }
-
-    auto struct_list_size() const -> std::size_t {
-        if (!m_struct_list_size) {
-            return {};
-        }
-        return m_struct_list_size(m_value);
-    }
-
-    auto is_list() const -> bool {
-        return m_type.starts_with("[]");
-    }
-
-private:
-    std::string m_type;
-    std::any m_value;
-    std::string m_units;
-    properties::config_type m_configurability{};
-    any_change_listener m_change_func;
-    std::shared_ptr<property_set> m_struct; // optional
-    struct_reset_func m_struct_reset;
-    struct_emplace_back_func m_struct_emplace_back;
-    struct_erase_func m_struct_erase;
-    struct_registration_func m_struct_registration;
-    struct_getter_func m_struct_getter;
-    struct_list_size_func m_struct_list_size;
-
-}; // class property
 
 class property_set {
 public:
@@ -308,87 +38,65 @@ public:
     using change_func_type = property::change_func_type;
     using indexed_change_func_type = property::indexed_change_func_type;
 
+    /**
+     * @brief Registers a scalar property with the property set
+     * @tparam T The property value type (must be registered in type_registry)
+     * @param name The property name (must be unique within this property set)
+     * @param prop Pointer to the member variable storing the property value
+     * @return Reference to the property for chaining .units() and .configurability()
+     * @throws std::runtime_error if name already exists
+     */
     template <typename T>
     auto add_property(std::string_view name, T* prop) -> property& {
         using ValueT = std::remove_cvref_t<T>;
-        auto typeid_name = std::string{typeid(ValueT).name()};
+        auto type_name = properties::type_registry::get_type_name<ValueT>();
+
         if constexpr (properties::is_optional_v<ValueT>) {
-            typeid_name = std::string{typeid(typename ValueT::value_type).name()};
+            type_name += "?";
         }
-        auto status = int{};
-        if (auto demangled_name = abi::__cxa_demangle(typeid_name.c_str(), nullptr, nullptr, &status); status == 0) {
-            typeid_name = demangled_name;
-            std::free(demangled_name);
-        }
-        if (typeid_name == "bool" || typeid_name == "float" || typeid_name == "double") {
-            // noop
-        } else if (typeid_name == "short") {
-            typeid_name = "int16";
-        } else if (typeid_name == "unsigned short") {
-            typeid_name = "uint16";
-        } else if (typeid_name == "int") {
-            typeid_name = "int32";
-        } else if (typeid_name == "unsigned int") {
-            typeid_name = "uint32";
-        } else if (typeid_name == "long") {
-            typeid_name = "int64";
-        } else if (typeid_name == "unsigned long") {
-            typeid_name = "uint64";
-        } else if (typeid_name.find("basic_string") != std::string::npos) {
-            typeid_name = "string";
-        } else {
-            throw properties::properties_error(std::format("unknown type {} for property {}", typeid_name, name));
-        }
-        if constexpr (properties::is_optional_v<ValueT>) {
-            typeid_name += "?";
-        }
-        auto [iter, res] = m_properties.try_emplace(std::string{name}, property{typeid_name, prop});
+
+        auto [iter, res] = m_properties.try_emplace(std::string{name}, property{type_name, prop});
         return iter->second;
     }
 
+    /**
+     * @brief Registers a structured property with nested fields
+     * @tparam T The struct type
+     * @tparam Func Callable type for field registration
+     * @param name The property name
+     * @param obj Pointer to the struct instance
+     * @param register_fields Lambda/function to register nested fields (signature: void(property_set&, T*))
+     * @return Reference to the property for chaining
+     */
     template <typename T, typename Func>
     auto add_struct_property(std::string_view name, T* obj, Func&& register_fields) -> property& {
         auto nested_set = std::make_shared<property_set>();
-        register_fields(*nested_set, obj);  // caller defined mechanism to bind fields
+        register_fields(*nested_set, obj);
+
         auto p = property{"struct", obj};
         p.structured(nested_set);
         p.struct_reset([](std::any& s) {
             auto* tmp = std::any_cast<T*>(s);
             *tmp = T{};
         });
+
         auto [iter, _] = m_properties.try_emplace(std::string{name}, std::move(p));
         return iter->second;
     }
 
+    /**
+     * @brief Registers a list property (vector of scalar values)
+     * @tparam T The element type
+     * @param name The property name
+     * @param vec Pointer to the vector storing the list
+     * @return Reference to the property for chaining
+     */
     template <typename T>
     auto add_list_property(std::string_view name, std::vector<T>* vec) -> property& {
         using ValueT = std::remove_cvref_t<T>;
-        auto typeid_name = std::string{typeid(ValueT).name()};
-        auto status = int{};
-        if (auto demangled_name = abi::__cxa_demangle(typeid_name.c_str(), nullptr, nullptr, &status); status == 0) {
-            typeid_name = demangled_name;
-            std::free(demangled_name);
-        }
-        if (typeid_name == "bool" || typeid_name == "float" || typeid_name == "double") {
-            // noop
-        } else if (typeid_name == "short") {
-            typeid_name = "int16";
-        } else if (typeid_name == "unsigned short") {
-            typeid_name = "uint16";
-        } else if (typeid_name == "int") {
-            typeid_name = "int32";
-        } else if (typeid_name == "unsigned int") {
-            typeid_name = "uint32";
-        } else if (typeid_name == "long") {
-            typeid_name = "int64";
-        } else if (typeid_name == "unsigned long") {
-            typeid_name = "uint64";
-        } else if (typeid_name.find("basic_string") != std::string::npos) {
-            typeid_name = "string";
-        } else {
-            throw properties::properties_error(std::format("unknown type {} for property {}", typeid_name, std::string{name}));
-        }
-        auto p = property{std::format("[]{}", typeid_name), vec};
+        auto type_name = properties::type_registry::get_type_name<ValueT>();
+
+        auto p = property{std::format("[]{}", type_name), vec};
         auto [iter, _] = m_properties.try_emplace(std::string{name}, std::move(p));
         return iter->second;
     }
@@ -426,237 +134,77 @@ public:
         return iter->second;
     }
 
+    // ========================================================================
+    // Property Setting
+    // ========================================================================
+    //
+    // Error Handling Pattern:
+    // - set_properties() throws exceptions on validation failures (key_error, value_error, type_error)
+    // - Individual set_*() methods return properties::error codes for programmatic error handling
+    // - Getters throw exceptions on invalid access (failed pre-conditions)
+
+    /**
+     * @brief Sets multiple scalar properties from string values
+     * @param values Vector of (name, value) pairs where value is a string representation
+     * @param config Configurability requirement (INITIALIZE or RUNTIME)
+     * @param allow_unknown_key If true, silently skip unknown property names; if false, throw
+     * @throws properties::key_error if property name not found (and allow_unknown_key is false)
+     * @throws properties::type_error if type conversion fails
+     * @throws properties::value_error if change listener rejects the value
+     * @throws properties::configurability_error if property doesn't allow runtime changes
+     */
     auto set_properties(
       const std::vector<std::pair<std::string, std::string>>& values,
       properties::config_type config=properties::config_type::INITIALIZE,
       bool allow_unknown_key=false) -> void {
+
         for (const auto& [name, value] : values) {
-            auto* prop = resolve_property(name);
-            if (prop == nullptr) {
-                if (allow_unknown_key) {
-                    continue;
+            // Check if path is a struct list field access (e.g., "scaling[0].h_scale")
+            if (auto struct_list_field = parse_struct_list_field_path(name)) {
+                auto* list_prop = resolve_property(struct_list_field->list_name);
+                if (!list_prop) {
+                    if (allow_unknown_key) { continue; }
+                    throw properties::key_error("", name);
                 }
-                throw properties::key_error("", name);
-            }
-            using enum properties::config_type;
-            if ((config == RUNTIME) && (prop->configurability() == INITIALIZE)) {
-                throw properties::configurability_error("", name);
+
+                validate_configurability(list_prop, name, config);
+
+                auto res = set_struct_field(list_prop, struct_list_field->index, struct_list_field->field_name, value);
+                handle_property_result(res, name, value, allow_unknown_key);
+                continue;
             }
 
-            auto res = properties::error::OK;
-            auto type = prop->type();
-            if (prop->is_optional()) {
-                type.pop_back(); // remove ?
+            auto* prop = resolve_property(name);
+            if (prop == nullptr) {
+                if (allow_unknown_key) { continue; }
+                throw properties::key_error("", name);
             }
+
+            validate_configurability(prop, name, config);
+
+            auto type = get_base_type(prop);
+            auto is_null = (value == properties::null_prop);
+
+            // Handle structured properties
+            if (type == "struct") {
+                handle_struct_property(prop, name, value, is_null);
+                continue;
+            }
+
+            // Parse list index if applicable
             std::string list_name;
             std::optional<std::size_t> list_idx;
             if (prop->is_list()) {
-                type = type.substr(2); // remove []
-                // Get the list name and index value
                 if (const auto& p = parse_list_index_path(name)) {
                     list_name = p->base;
                     list_idx = p->index;
                 }
             }
 
-            // Set property value
-            if (type == "bool") {
-                auto v = bool{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<bool>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<bool>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "string") {
-                auto v = std::string{};
-                if (value != composite::properties::null_prop) {
-                    v = value;
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<std::string>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "int16") {
-                auto v = int16_t{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<int16_t>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<int16_t>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "uint16") {
-                auto v = uint16_t{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<uint16_t>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<uint16_t>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "int32") {
-                auto v = int32_t{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<int32_t>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<int32_t>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "uint32") {
-                auto v = uint32_t{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<uint32_t>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<uint32_t>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "int64") {
-                auto v = int64_t{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<int64_t>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<int64_t>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "uint64") {
-                auto v = uint64_t{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<uint64_t>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<uint64_t>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "float") {
-                auto v = float{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<float>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<float>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "double") {
-                auto v = double{};
-                if (value != composite::properties::null_prop) {
-                    v = properties::convert_string_to<double>(value);
-                }
-                if (prop->is_list()) {
-                    if (list_idx.has_value()) {
-                        if (value == composite::properties::null_prop) {
-                            res = erase_list_property_item<double>(list_name, *list_idx);
-                        } else {
-                            res = set_list_property_item(list_name, *list_idx, v);
-                        }
-                    } else {
-                        res = append_list_property_item(list_name, v);
-                    }
-                } else {
-                    res = set_property(name, v, value == composite::properties::null_prop);
-                }
-            } else if (type == "struct") {
-                if (prop->is_list()) {
-                    if (list_idx.has_value() && (value == composite::properties::null_prop)) {
-                        res = erase_struct_list_property_item(prop, *list_idx);
-                    }
-                } else {
-                    res = set_property(name, value, value == composite::properties::null_prop);
-                }
-            } else {
-                throw properties::type_error("", name, type);
-            }
+            // Dispatch based on type
+            auto res = dispatch_set_property(type, prop, name, list_name, value, is_null, list_idx);
 
-            if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
-                throw properties::key_error("", name);
-            } else if (res == properties::error::INVALID_VALUE) {
-                throw properties::value_error("", name, value);
-            }
+            handle_property_result(res, name, value, allow_unknown_key);
         }
     }
 
@@ -664,105 +212,27 @@ public:
       const std::vector<std::pair<std::string, std::vector<std::string>>>& values,
       properties::config_type config=properties::config_type::INITIALIZE,
       bool allow_unknown_key=false) -> void {
+
         for (const auto& [name, value] : values) {
             auto* prop = resolve_property(name);
             if (prop == nullptr) {
-                if (allow_unknown_key) {
-                    continue;
-                }
+                if (allow_unknown_key) { continue; }
                 throw properties::key_error("", name);
             }
-            using enum properties::config_type;
-            if ((config == RUNTIME) && (prop->configurability() == INITIALIZE)) {
-                throw properties::configurability_error("", name);
+
+            validate_configurability(prop, name, config);
+
+            if (!prop->is_list()) {
+                throw properties::type_error("", name, prop->type());
             }
 
-            auto res = properties::error::OK;
-            auto type = prop->type();
-            if (prop->is_optional()) {
-                type.pop_back(); // remove ?
-            }
-
-            // Full list assignment
-            if (prop->is_list()) {
-                type = type.substr(2); // remove []
-                if (type == "bool") {
-                    std::vector<bool> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<bool>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "string") {
-                    res = set_list_property(name, value);
-                } else if (type == "int16") {
-                    std::vector<int16_t> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<int16_t>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "uint16") {
-                    std::vector<uint16_t> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<uint16_t>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "int32") {
-                    std::vector<int32_t> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<int32_t>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "uint32") {
-                    std::vector<uint32_t> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<uint32_t>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "int64") {
-                    std::vector<int64_t> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<int64_t>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "uint64") {
-                    std::vector<uint64_t> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<uint64_t>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "float") {
-                    std::vector<float> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<float>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else if (type == "double") {
-                    std::vector<double> vals;
-                    for (const auto& v : value) {
-                        vals.push_back(properties::convert_string_to<double>(v));
-                    }
-                    res = set_list_property(name, vals);
-                } else {
-                    throw properties::type_error("", name, type);
-                }
-            } else {
-                // this override only supports listed types
-                throw properties::type_error("", name, type);
-            }
+            auto type = get_base_type(prop);
+            auto res = dispatch_set_list_property(type, name, value);
 
             if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
                 throw properties::key_error("", name);
             } else if (res == properties::error::INVALID_VALUE) {
-                auto value_str = std::string{"["};
-                value_str = std::accumulate(
-                    value.begin(),
-                    value.end(),
-                    value_str,
-                    [](const std::string& acc, std::string val) {
-                        return acc + val + ", ";
-                    }
-                );
-                value_str.back() = ']';
+                auto value_str = format_list_value(value);
                 throw properties::value_error("", name, value_str);
             }
         }
@@ -772,127 +242,31 @@ public:
       const std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>& values,
       properties::config_type config=properties::config_type::INITIALIZE,
       bool allow_unknown_key=false) -> void {
+
         for (const auto& [name, value] : values) {
             auto* prop = resolve_property(name);
             if (prop == nullptr) {
-                if (allow_unknown_key) {
-                    continue;
-                }
+                if (allow_unknown_key) { continue; }
                 throw properties::key_error("", name);
             }
-            using enum properties::config_type;
-            if ((config == RUNTIME) && (prop->configurability() == INITIALIZE)) {
-                throw properties::configurability_error("", name);
-            }
+
+            validate_configurability(prop, name, config);
 
             if (!prop->is_structured()) {
                 throw properties::type_error("", name, prop->type());
             }
 
-            // Set structured fields
             if (prop->is_list()) {
-                const auto& p = parse_list_index_path(name);
-                if (!p.has_value()) {
-                    throw properties::key_error("", name);
-                }
-                if (!p->index.has_value()) { // append
-                    // Construct a new struct type in the list
-                    if (auto idx = prop->struct_emplace_back()) {
-                        // Update the fields of the new struct
-                        for (const auto& [k, v] : value) {
-                            auto struct_prop_name = std::format("{}.{}", name, k);
-                            auto res = set_struct_field(prop, *idx, k, v);
-                            if (res == properties::error::INVALID_KEY) {
-                                throw properties::key_error("", struct_prop_name);
-                            } else if (res == properties::error::INVALID_VALUE) {
-                                throw properties::value_error("", struct_prop_name, v);
-                            }
-                        }
-                        auto valid_value = true;
-                        auto cl = prop->change_listener();
-                        if (std::holds_alternative<indexed_change_func_type>(cl)) {
-                            valid_value = std::get<indexed_change_func_type>(cl)(*idx);
-                        }
-                        if (!valid_value) {
-                            // TODO
-                        }
-                    } else {
-                        throw properties::properties_error(std::format("failed to emplace new struct for structured list property {}", p->base));
-                    }
-                } else { // update
-                    for (const auto& [k, v] : value) {
-                        auto struct_prop_name = std::format("{}.{}", name, k);
-                        auto res = set_struct_field(prop, *(p->index), k, v);
-                        if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
-                            throw properties::key_error("", struct_prop_name);
-                        } else if (res == properties::error::INVALID_VALUE) {
-                            throw properties::value_error("", struct_prop_name, v);
-                        }
-                    }
-                    auto valid_value = true;
-                    auto cl = prop->change_listener();
-                    if (std::holds_alternative<indexed_change_func_type>(cl)) {
-                        valid_value = std::get<indexed_change_func_type>(cl)(*(p->index));
-                    }
-                    if (!valid_value) {
-                        // TODO
-                    }
-                }
+                handle_struct_list_update(prop, name, value, allow_unknown_key);
             } else {
-                for (const auto& [k, v] : value) {
-                    auto struct_prop_name = std::format("{}.{}", name, k);
-                    auto& struct_prop_set = prop->structured();
-                    auto* struct_prop = struct_prop_set.resolve_property(k);
-                    if (struct_prop == nullptr) {
-                        if (allow_unknown_key) {
-                            continue;
-                        }
-                        throw properties::key_error("", struct_prop_name);
-                    }
-                    using enum properties::config_type;
-                    if ((config == RUNTIME) && (struct_prop->configurability() == INITIALIZE)) {
-                        throw properties::configurability_error("", struct_prop_name);
-                    }
-
-                    auto res = properties::error::OK;
-                    auto type = struct_prop->type();
-                    if (struct_prop->is_optional()) {
-                        type.pop_back(); // remove ?
-                    }
-
-                    // Set property value
-                    if (type == "bool") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<bool>(v));
-                    } else if (type == "string") {
-                        res = struct_prop_set.set_property(k, v);
-                    } else if (type == "int16") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<int16_t>(v));
-                    } else if (type == "uint16") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<uint16_t>(v));
-                    } else if (type == "int32") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<int32_t>(v));
-                    } else if (type == "uint32") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<uint32_t>(v));
-                    } else if (type == "int64") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<int64_t>(v));
-                    } else if (type == "uint64") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<uint64_t>(v));
-                    } else if (type == "float") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<float>(v));
-                    } else if (type == "double") {
-                        res = struct_prop_set.set_property(k, properties::convert_string_to<double>(v));
-                    } else {
-                        throw properties::type_error("", struct_prop_name, type);
-                    }
-                    if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
-                        throw properties::key_error("", struct_prop_name);
-                    } else if (res == properties::error::INVALID_VALUE) {
-                        throw properties::value_error("", struct_prop_name, v);
-                    }
-                }
+                handle_struct_update(prop, name, value, config, allow_unknown_key);
             }
         }
     }
+
+    // ========================================================================
+    // Individual Property Operations
+    // ========================================================================
 
     template <typename T>
     auto set_property(std::string_view name, T value, bool null_value=false) -> properties::error {
@@ -906,90 +280,14 @@ public:
                 return properties::error::INVALID_VALUE;
             }
             prop->struct_reset();
-        } else if (prop->is_optional()) {
-            auto val_ptr = *std::any_cast<std::optional<T>*>(&(prop->value()));
-            auto prev_value = std::optional<T>{};
-            if (val_ptr->has_value()) {
-                prev_value = val_ptr->value();
-                if (null_value) {
-                    val_ptr->reset();
-                }
-            }
-            if (!null_value) {
-                *val_ptr = value;
-            }
-            auto valid_value = true;
-            auto cl = prop->change_listener();
-            if (std::holds_alternative<change_func_type>(cl)) {
-                valid_value = std::get<change_func_type>(cl)();
-            }
-            if (!valid_value) {
-                *val_ptr = prev_value;
-                return properties::error::INVALID_VALUE;
-            }
-        } else {
-            auto val_ptr = *std::any_cast<T*>(&(prop->value()));
-            auto prev_value = *val_ptr;
-            *val_ptr = value;
-            auto valid_value = true;
-            auto cl = prop->change_listener();
-            if (std::holds_alternative<change_func_type>(cl)) {
-                valid_value = std::get<change_func_type>(cl)();
-            }
-            if (!valid_value) {
-                *val_ptr = prev_value;
-                return properties::error::INVALID_VALUE;
-            }
-        }
-        return properties::error::OK;
-    }
-
-    auto set_struct_field(property* list_prop, size_t index, std::string_view field, const std::string& value_str) -> properties::error {
-        if (!list_prop->is_structured()) {
-            return properties::error::INVALID_TYPE;
+            return properties::error::OK;
         }
 
-        auto bound = std::make_unique<property_set>();
-        auto* item_ptr = list_prop->struct_getter(index);
-        if (!item_ptr) {
-            return properties::error::INVALID_VALUE;
-        }
-        list_prop->struct_registration(*bound, item_ptr);
-
-        // parse field type from schema
-        const auto* prop = bound->resolve_property(field);
-        if (!prop) {
-            return properties::error::INVALID_KEY;
-        }
-
-        auto type = prop->type();
         if (prop->is_optional()) {
-            type.pop_back();
+            return set_optional_property(prop, value, null_value);
+        } else {
+            return set_scalar_property(prop, value);
         }
-
-        if (type == "bool") {
-            return bound->set_property(field, properties::convert_string_to<bool>(value_str));
-        } else if (type == "string") {
-           return bound->set_property(field, value_str);
-        } else if (type == "int16") {
-            return bound->set_property(field, properties::convert_string_to<int16_t>(value_str));
-        } else if (type == "uint16") {
-            return bound->set_property(field, properties::convert_string_to<uint16_t>(value_str));
-        } else if (type == "int32") {
-            return bound->set_property(field, properties::convert_string_to<int32_t>(value_str));
-        } else if (type == "uint32") {
-            return bound->set_property(field, properties::convert_string_to<uint32_t>(value_str));
-        } else if (type == "int64") {
-            return bound->set_property(field, properties::convert_string_to<int64_t>(value_str));
-        } else if (type == "uint64") {
-            return bound->set_property(field, properties::convert_string_to<uint64_t>(value_str));
-        } else if (type == "float") {
-            return bound->set_property(field, properties::convert_string_to<float>(value_str));
-        } else if (type == "double") {
-            return bound->set_property(field, properties::convert_string_to<double>(value_str));
-        }
-
-        return properties::error::INVALID_TYPE;
     }
 
     template <typename T>
@@ -1004,14 +302,15 @@ public:
     template <typename T>
     auto try_get_property(std::string_view name) const -> std::optional<T> {
         const auto* prop = resolve_property(name);
-        if (!prop) {
+        if (!prop || !prop->is_optional()) {
             return std::nullopt;
         }
-        if (prop->is_optional()) {
-            return *std::any_cast<std::optional<T>*>(prop->value());
-        }
-        return std::nullopt;
+        return *std::any_cast<std::optional<T>*>(prop->value());
     }
+
+    // ========================================================================
+    // List Property Operations
+    // ========================================================================
 
     template <typename T>
     auto get_list_property(std::string_view name) const -> const std::vector<T>& {
@@ -1023,26 +322,20 @@ public:
     }
 
     template <typename T>
-    auto set_list_property(std::string_view name, const std::vector<T>& value) -> properties::error {
+    [[nodiscard]] auto set_list_property(std::string_view name, const std::vector<T>& value) -> properties::error {
         const auto* prop = resolve_property(name);
-        if (!prop) {
-            return properties::error::INVALID_KEY;
-        }
-        if (!prop->is_list()) {
-            return properties::error::INVALID_TYPE;
-        }
+        if (!prop) { return properties::error::INVALID_KEY; }
+        if (!prop->is_list()) { return properties::error::INVALID_TYPE; }
+
         auto& list = *std::any_cast<std::vector<T>*>(prop->value());
         auto old_value = list;
         list = value;
-        auto valid_value = true;
-        auto cl = prop->change_listener();
-        if (std::holds_alternative<change_func_type>(cl)) {
-            valid_value = std::get<change_func_type>(cl)();
-        }
-        if (!valid_value) {
+
+        if (!invoke_change_listener(prop->change_listener())) {
             list = old_value;
             return properties::error::INVALID_VALUE;
         }
+
         return properties::error::OK;
     }
 
@@ -1057,87 +350,62 @@ public:
     }
 
     template <typename T>
-    auto set_list_property_item(std::string_view name, std::size_t index, T value) -> properties::error {
+    [[nodiscard]] auto set_list_property_item(std::string_view name, std::size_t index, T value) -> properties::error {
         auto* prop = resolve_property(name);
-        if (!prop) {
-            return properties::error::INVALID_KEY;
-        }
-        if (!prop->is_list()) {
-            return properties::error::INVALID_TYPE;
-        }
+        if (!prop) { return properties::error::INVALID_KEY; }
+        if (!prop->is_list()) { return properties::error::INVALID_TYPE; }
+
         auto& list = *std::any_cast<std::vector<T>*>(prop->value());
         auto old_value = list.at(index);
         list.at(index) = value;
-        auto valid_value = true;
-        auto cl = prop->change_listener();
-        if (std::holds_alternative<indexed_change_func_type>(cl)) {
-            valid_value = std::get<indexed_change_func_type>(cl)(index);
-        }
-        if (!valid_value) {
+
+        if (!invoke_indexed_change_listener(prop->change_listener(), index)) {
             list.at(index) = old_value;
             return properties::error::INVALID_VALUE;
         }
+
         return properties::error::OK;
     }
 
     template <typename T>
-    auto append_list_property_item(std::string_view name, T value) -> properties::error {
-        using enum properties::error;
+    [[nodiscard]] auto append_list_property_item(std::string_view name, T value) -> properties::error {
         const auto* prop = resolve_property(name);
-        if (!prop) {
-            return INVALID_KEY;
-        }
-        if (!prop->is_list()) {
-            return INVALID_TYPE;
-        }
+        if (!prop) { return properties::error::INVALID_KEY; }
+        if (!prop->is_list()) { return properties::error::INVALID_TYPE; }
+
         auto& list = *std::any_cast<std::vector<T>*>(prop->value());
         auto old_value = list;
         list.push_back(value);
-        auto valid_value = true;
-        auto cl = prop->change_listener();
-        if (std::holds_alternative<indexed_change_func_type>(cl)) {
-            valid_value = std::get<indexed_change_func_type>(cl)(list.size() - 1);
-        }
-        if (!valid_value) {
+
+        if (!invoke_indexed_change_listener(prop->change_listener(), list.size() - 1)) {
             list = old_value;
-            return INVALID_VALUE;
+            return properties::error::INVALID_VALUE;
         }
-        return OK;
+
+        return properties::error::OK;
     }
 
     template<typename T>
-    auto erase_list_property_item(std::string_view name, std::size_t index) -> properties::error {
+    [[nodiscard]] auto erase_list_property_item(std::string_view name, std::size_t index) -> properties::error {
         const auto* prop = resolve_property(name);
         if (!prop || !prop->is_list()) {
             throw properties::key_error("unknown", name);
         }
+
         auto& list = *std::any_cast<std::vector<T>*>(prop->value());
-        if (index >= list.size()) { // range error
+        if (index >= list.size()) {
             return properties::error::INVALID_KEY;
         }
+
         list.erase(list.begin() + index);
-        auto cl = prop->change_listener();
-        if (std::holds_alternative<indexed_change_func_type>(cl)) {
-            auto valid_value = std::get<indexed_change_func_type>(cl)(index);
-        }
+        invoke_indexed_change_listener(prop->change_listener(), index);
+
         return properties::error::OK;
     }
 
-    auto erase_struct_list_property_item(property* prop, size_t index) -> properties::error {
-        if (!prop->is_structured()) {
-            return properties::error::INVALID_TYPE;
-        }
-        auto size = prop->struct_list_size();
-        if (index >= size) { // range error
-            return properties::error::INVALID_KEY;
-        }
-        prop->struct_erase(index);
-        auto cl = prop->change_listener();
-        if (std::holds_alternative<indexed_change_func_type>(cl)) {
-            auto valid_value = std::get<indexed_change_func_type>(cl)(index);
-        }
-        return properties::error::INVALID_TYPE;
-    }
+    // ========================================================================
+    // Public Accessors
+    // ========================================================================
 
     auto properties() const -> const property_map_type& {
         return m_properties;
@@ -1152,57 +420,499 @@ public:
 private:
     property_map_type m_properties;
 
-    auto resolve_property(std::string_view path) -> property* {
+    // ========================================================================
+    // Type Dispatch Helpers
+    // ========================================================================
+
+    template <typename T>
+    auto dispatch_scalar_operation(
+        property* prop,
+        std::string_view name,
+        const std::string& value_str,
+        bool is_null) -> properties::error {
+
+        T value{};
+        if (!is_null) {
+            value = properties::convert_string_to<T>(value_str);
+        }
+        return set_property(name, value, is_null);
+    }
+
+    template <typename T>
+    auto dispatch_list_operation(
+        std::string_view list_name,
+        std::optional<std::size_t> list_idx,
+        const std::string& value_str,
+        bool is_null) -> properties::error {
+
+        if (list_idx.has_value()) {
+            if (is_null) {
+                return erase_list_property_item<T>(list_name, *list_idx);
+            } else {
+                T value = properties::convert_string_to<T>(value_str);
+                return set_list_property_item(list_name, *list_idx, value);
+            }
+        } else {
+            T value{};
+            if (!is_null) {
+                value = properties::convert_string_to<T>(value_str);
+            }
+            return append_list_property_item(list_name, value);
+        }
+    }
+
+    auto dispatch_set_property(
+        std::string_view type,
+        property* prop,
+        std::string_view name,
+        std::string_view list_name,
+        const std::string& value,
+        bool is_null,
+        std::optional<std::size_t> list_idx) -> properties::error {
+
+        if (prop->is_list()) {
+            // Dispatch to list operation based on type
+            if (type == "bool") { return dispatch_list_operation<bool>(list_name, list_idx, value, is_null); }
+            if (type == "string") { return dispatch_list_operation<std::string>(list_name, list_idx, value, is_null); }
+            if (type == "int16") { return dispatch_list_operation<int16_t>(list_name, list_idx, value, is_null); }
+            if (type == "uint16") { return dispatch_list_operation<uint16_t>(list_name, list_idx, value, is_null); }
+            if (type == "int32") { return dispatch_list_operation<int32_t>(list_name, list_idx, value, is_null); }
+            if (type == "uint32") { return dispatch_list_operation<uint32_t>(list_name, list_idx, value, is_null); }
+            if (type == "int64") { return dispatch_list_operation<int64_t>(list_name, list_idx, value, is_null); }
+            if (type == "uint64") { return dispatch_list_operation<uint64_t>(list_name, list_idx, value, is_null); }
+            if (type == "float") { return dispatch_list_operation<float>(list_name, list_idx, value, is_null); }
+            if (type == "double") { return dispatch_list_operation<double>(list_name, list_idx, value, is_null); }
+        } else {
+            // Dispatch to scalar operation based on type
+            if (type == "bool") { return dispatch_scalar_operation<bool>(prop, name, value, is_null); }
+            if (type == "string") { return dispatch_scalar_operation<std::string>(prop, name, value, is_null); }
+            if (type == "int16") { return dispatch_scalar_operation<int16_t>(prop, name, value, is_null); }
+            if (type == "uint16") { return dispatch_scalar_operation<uint16_t>(prop, name, value, is_null); }
+            if (type == "int32") { return dispatch_scalar_operation<int32_t>(prop, name, value, is_null); }
+            if (type == "uint32") { return dispatch_scalar_operation<uint32_t>(prop, name, value, is_null); }
+            if (type == "int64") { return dispatch_scalar_operation<int64_t>(prop, name, value, is_null); }
+            if (type == "uint64") { return dispatch_scalar_operation<uint64_t>(prop, name, value, is_null); }
+            if (type == "float") { return dispatch_scalar_operation<float>(prop, name, value, is_null); }
+            if (type == "double") { return dispatch_scalar_operation<double>(prop, name, value, is_null); }
+        }
+
+        throw properties::type_error("", std::string{name}, std::string{type});
+    }
+
+    auto dispatch_set_list_property(
+        std::string_view type,
+        std::string_view name,
+        const std::vector<std::string>& values) -> properties::error {
+
+        if (type == "bool") {
+            std::vector<bool> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<bool>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "string") {
+            return set_list_property(name, values);
+        }
+        if (type == "int16") {
+            std::vector<int16_t> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<int16_t>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "uint16") {
+            std::vector<uint16_t> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<uint16_t>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "int32") {
+            std::vector<int32_t> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<int32_t>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "uint32") {
+            std::vector<uint32_t> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<uint32_t>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "int64") {
+            std::vector<int64_t> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<int64_t>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "uint64") {
+            std::vector<uint64_t> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<uint64_t>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "float") {
+            std::vector<float> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<float>(v)); }
+            return set_list_property(name, vals);
+        }
+        if (type == "double") {
+            std::vector<double> vals;
+            for (const auto& v : values) { vals.push_back(properties::convert_string_to<double>(v)); }
+            return set_list_property(name, vals);
+        }
+
+        throw properties::type_error("", std::string{name}, std::string{type});
+    }
+
+    // ========================================================================
+    // Structured Property Helpers
+    // ========================================================================
+
+    auto set_struct_field(property* list_prop, size_t index, std::string_view field, const std::string& value_str) -> properties::error {
+        if (!list_prop->is_structured()) {
+            return properties::error::INVALID_TYPE;
+        }
+
+        auto bound = std::make_unique<property_set>();
+        auto* item_ptr = list_prop->struct_getter(index);
+        if (!item_ptr) {
+            return properties::error::INVALID_VALUE;
+        }
+        list_prop->struct_registration(*bound, item_ptr);
+
+        const auto* prop = bound->resolve_property(field);
+        if (!prop) {
+            return properties::error::INVALID_KEY;
+        }
+
+        auto type = get_base_type(prop);
+        return dispatch_set_struct_field(*bound, field, type, value_str);
+    }
+
+    auto dispatch_set_struct_field(
+        property_set& bound,
+        std::string_view field,
+        std::string_view type,
+        const std::string& value_str) -> properties::error {
+
+        if (type == "bool") { return bound.set_property(field, properties::convert_string_to<bool>(value_str)); }
+        if (type == "string") { return bound.set_property(field, value_str); }
+        if (type == "int16") { return bound.set_property(field, properties::convert_string_to<int16_t>(value_str)); }
+        if (type == "uint16") { return bound.set_property(field, properties::convert_string_to<uint16_t>(value_str)); }
+        if (type == "int32") { return bound.set_property(field, properties::convert_string_to<int32_t>(value_str)); }
+        if (type == "uint32") { return bound.set_property(field, properties::convert_string_to<uint32_t>(value_str)); }
+        if (type == "int64") { return bound.set_property(field, properties::convert_string_to<int64_t>(value_str)); }
+        if (type == "uint64") { return bound.set_property(field, properties::convert_string_to<uint64_t>(value_str)); }
+        if (type == "float") { return bound.set_property(field, properties::convert_string_to<float>(value_str)); }
+        if (type == "double") { return bound.set_property(field, properties::convert_string_to<double>(value_str)); }
+
+        return properties::error::INVALID_TYPE;
+    }
+
+    auto handle_struct_property(property* prop, std::string_view name, const std::string& value, bool is_null) -> void {
+        if (prop->is_list()) {
+            if (const auto& p = parse_list_index_path(name)) {
+                if (p->index.has_value() && is_null) {
+                    erase_struct_list_property_item(prop, *(p->index));
+                }
+            } else if (is_null) {
+                // No bracket means clear the entire list
+                // We need to get the vector type and clear it
+                // The struct_reset operation needs special handling for lists
+                clear_struct_list(prop);
+            }
+        } else if (is_null) {
+            prop->struct_reset();
+        }
+    }
+
+    auto clear_struct_list(property* prop) -> void {
+        // For struct lists, we can't use struct_reset because it's not configured for lists
+        // Instead, we need to manually clear the vector
+        // The list size function gives us access to the underlying vector
+        auto size = prop->struct_list_size();
+        // Delete all items from the end to avoid index shifts
+        for (size_t i = size; i > 0; --i) {
+            prop->struct_erase(i - 1);
+        }
+    }
+
+    auto handle_struct_list_update(
+        property* prop,
+        std::string_view name,
+        const std::vector<std::pair<std::string, std::string>>& value,
+        bool allow_unknown_key) -> void {
+
+        const auto& p = parse_list_index_path(name);
+        if (!p.has_value()) {
+            throw properties::key_error("", name);
+        }
+
+        if (!p->index.has_value()) {
+            // Append new struct
+            if (auto idx = prop->struct_emplace_back()) {
+                update_struct_fields(prop, name, *idx, value, allow_unknown_key);
+                validate_indexed_change(*prop, *idx);
+            } else {
+                throw properties::properties_error(std::format("failed to emplace new struct for structured list property {}", p->base));
+            }
+        } else {
+            // Update existing struct
+            update_struct_fields(prop, name, *(p->index), value, allow_unknown_key);
+            validate_indexed_change(*prop, *(p->index));
+        }
+    }
+
+    auto handle_struct_update(
+        property* prop,
+        std::string_view name,
+        const std::vector<std::pair<std::string, std::string>>& value,
+        properties::config_type config,
+        bool allow_unknown_key) -> void {
+
+        for (const auto& [k, v] : value) {
+            auto struct_prop_name = std::format("{}.{}", name, k);
+            auto& struct_prop_set = prop->structured();
+            auto* struct_prop = struct_prop_set.resolve_property(k);
+
+            if (struct_prop == nullptr) {
+                if (allow_unknown_key) { continue; }
+                throw properties::key_error("", struct_prop_name);
+            }
+
+            validate_configurability(struct_prop, struct_prop_name, config);
+
+            auto type = get_base_type(struct_prop);
+            auto res = dispatch_set_struct_field(struct_prop_set, k, type, v);
+
+            if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
+                throw properties::key_error("", struct_prop_name);
+            } else if (res == properties::error::INVALID_VALUE) {
+                throw properties::value_error("", struct_prop_name, v);
+            }
+        }
+    }
+
+    auto update_struct_fields(
+        property* prop,
+        std::string_view name,
+        std::size_t idx,
+        const std::vector<std::pair<std::string, std::string>>& fields,
+        bool allow_unknown_key) -> void {
+
+        for (const auto& [k, v] : fields) {
+            auto struct_prop_name = std::format("{}.{}", name, k);
+            auto res = set_struct_field(prop, idx, k, v);
+
+            if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
+                throw properties::key_error("", struct_prop_name);
+            } else if (res == properties::error::INVALID_VALUE) {
+                throw properties::value_error("", struct_prop_name, v);
+            }
+        }
+    }
+
+    auto erase_struct_list_property_item(property* prop, size_t index) -> properties::error {
+        if (!prop->is_structured()) {
+            return properties::error::INVALID_TYPE;
+        }
+
+        auto size = prop->struct_list_size();
+        if (index >= size) {
+            return properties::error::INVALID_KEY;
+        }
+
+        prop->struct_erase(index);
+        invoke_indexed_change_listener(prop->change_listener(), index);
+
+        return properties::error::OK;
+    }
+
+    // ========================================================================
+    // Validation and Helper Methods
+    // ========================================================================
+
+    auto validate_configurability(
+        const property* prop,
+        std::string_view name,
+        properties::config_type config) -> void {
+
+        using enum properties::config_type;
+        if ((config == RUNTIME) && (prop->configurability() == INITIALIZE)) {
+            throw properties::configurability_error("", name);
+        }
+    }
+
+    auto get_base_type(const property* prop) -> std::string {
+        auto type = prop->type();
+        if (prop->is_optional()) {
+            type.pop_back(); // remove ?
+        }
+        if (prop->is_list()) {
+            type = type.substr(2); // remove []
+        }
+        return type;
+    }
+
+    auto handle_property_result(
+        properties::error res,
+        std::string_view name,
+        const std::string& value,
+        bool allow_unknown_key) -> void {
+
+        if (res == properties::error::INVALID_KEY && !allow_unknown_key) {
+            throw properties::key_error("", name);
+        } else if (res == properties::error::INVALID_VALUE) {
+            throw properties::value_error("", name, value);
+        }
+    }
+
+    auto format_list_value(const std::vector<std::string>& values) -> std::string {
+        auto value_str = std::string{"["};
+        value_str = std::accumulate(
+            values.begin(),
+            values.end(),
+            value_str,
+            [](const std::string& acc, const std::string& val) {
+                return acc + val + ", ";
+            }
+        );
+        if (value_str.size() > 1) {
+            value_str.pop_back(); // remove space
+            value_str.back() = ']';
+        } else {
+            value_str += "]";
+        }
+        return value_str;
+    }
+
+    template <typename T>
+    auto set_optional_property(property* prop, T value, bool null_value) -> properties::error {
+        auto val_ptr = *std::any_cast<std::optional<T>*>(&(prop->value()));
+        auto prev_value = std::optional<T>{};
+
+        if (val_ptr->has_value()) {
+            prev_value = val_ptr->value();
+            if (null_value) {
+                val_ptr->reset();
+            }
+        }
+
+        if (!null_value) {
+            *val_ptr = value;
+        }
+
+        if (!invoke_change_listener(prop->change_listener())) {
+            *val_ptr = prev_value;
+            return properties::error::INVALID_VALUE;
+        }
+
+        return properties::error::OK;
+    }
+
+    template <typename T>
+    auto set_scalar_property(property* prop, T value) -> properties::error {
+        auto val_ptr = *std::any_cast<T*>(&(prop->value()));
+        auto prev_value = *val_ptr;
+        *val_ptr = value;
+
+        if (!invoke_change_listener(prop->change_listener())) {
+            *val_ptr = prev_value;
+            return properties::error::INVALID_VALUE;
+        }
+
+        return properties::error::OK;
+    }
+
+    auto invoke_change_listener(const property::any_change_listener& listener) -> bool {
+        if (std::holds_alternative<change_func_type>(listener)) {
+            return std::get<change_func_type>(listener)();
+        }
+        return true;
+    }
+
+    auto invoke_indexed_change_listener(const property::any_change_listener& listener, std::size_t index) -> bool {
+        if (std::holds_alternative<indexed_change_func_type>(listener)) {
+            return std::get<indexed_change_func_type>(listener)(index);
+        }
+        return true;
+    }
+
+    auto validate_indexed_change(property& prop, std::size_t index) -> void {
+        if (!invoke_indexed_change_listener(prop.change_listener(), index)) {
+            // Rollback would be complex here, so we log the issue
+            // In production, you might want to handle this differently
+        }
+    }
+
+    // ========================================================================
+    // Path Resolution
+    // ========================================================================
+
+    [[nodiscard]] auto resolve_property(std::string_view path) -> property* {
         auto dot = path.find('.');
         auto bracket = path.find('[');
+
+        // Simple case: no dots or brackets
         if (dot == std::string_view::npos && bracket == std::string_view::npos) {
             auto it = m_properties.find(std::string{path});
             return it != m_properties.end() ? &it->second : nullptr;
         }
 
+        // Handle list indexing
         if (bracket != std::string_view::npos && (dot == std::string_view::npos || (bracket < dot))) {
-            auto name = path.substr(0, bracket);
-            auto it = m_properties.find(std::string{name});
-            if (it == m_properties.end() || !it->second.is_list()) {
-                return nullptr;
-            }
+            return resolve_list_property(path, bracket);
+        }
 
-            auto end_bracket = path.find(']', bracket);
-            if (end_bracket == std::string_view::npos) {
-                return nullptr; // malformed
-            }
+        // Handle structured property
+        return resolve_structured_property(path, dot);
+    }
 
-            if (it->second.is_structured()) {
-                if (it->second.is_list()) {
-                    return &it->second;
-                }
-                auto tail_start = end_bracket + 1;
-                while (tail_start < path.size() && path[tail_start] == '.') {
-                    ++tail_start; // skip dots
-                }
-                if (tail_start >= path.size()) {
-                    return nullptr;
-                }
-                auto tail = path.substr(tail_start);
-                return it->second.structured().resolve_property(tail);
-            } else if (dot == std::string_view::npos) {
-                return &it->second;
-            }
+    [[nodiscard]] auto resolve_property(std::string_view path) const -> const property* {
+        return const_cast<property_set*>(this)->resolve_property(path);
+    }
 
+    auto resolve_list_property(std::string_view path, std::size_t bracket) -> property* {
+        auto name = path.substr(0, bracket);
+        auto it = m_properties.find(std::string{name});
+        if (it == m_properties.end() || !it->second.is_list()) {
             return nullptr;
         }
 
+        auto end_bracket = path.find(']', bracket);
+        if (end_bracket == std::string_view::npos) {
+            return nullptr; // malformed
+        }
+
+        if (it->second.is_structured()) {
+            // Check if there's a tail after the bracket (e.g., "scaling[0].h_scale")
+            auto tail = extract_tail_after_bracket(path, end_bracket);
+            if (!tail.empty()) {
+                // For structured lists with a tail, resolve the field within the schema
+                return it->second.structured().resolve_property(tail);
+            }
+            // No tail means we want the list property itself (e.g., "scaling[0]")
+            return &it->second;
+        } else if (path.find('.') == std::string_view::npos) {
+            return &it->second;
+        }
+
+        return nullptr;
+    }
+
+    auto resolve_structured_property(std::string_view path, std::size_t dot) -> property* {
         auto head = path.substr(0, dot);
         auto tail = path.substr(dot + 1);
         auto it = m_properties.find(std::string{head});
+
         if (it == m_properties.end() || !it->second.is_structured()) {
             return nullptr;
         }
+
         return it->second.structured().resolve_property(tail);
     }
 
-    auto resolve_property(std::string_view path) const -> const property* {
-        return const_cast<property_set*>(this)->resolve_property(path);
+    auto extract_tail_after_bracket(std::string_view path, std::size_t end_bracket) -> std::string_view {
+        auto tail_start = end_bracket + 1;
+        while (tail_start < path.size() && path[tail_start] == '.') {
+            ++tail_start; // skip dots
+        }
+        if (tail_start >= path.size()) {
+            return {};
+        }
+        return path.substr(tail_start);
     }
 
     struct list_path_info {
@@ -1210,47 +920,69 @@ private:
         std::optional<size_t> index;
     };
 
-    inline auto parse_list_index_path(std::string_view name) -> std::optional<list_path_info> {
+    struct struct_list_field_info {
+        std::string list_name;
+        std::size_t index;
+        std::string field_name;
+    };
+
+    auto parse_list_index_path(std::string_view name) -> std::optional<list_path_info> {
         auto bracket_pos = name.find('[');
         if (bracket_pos == std::string_view::npos) {
             return std::nullopt;
         }
+
         auto end_bracket = name.find(']', bracket_pos);
         if (end_bracket == std::string_view::npos) {
             return std::nullopt;
         }
+
         auto base = name.substr(0, bracket_pos);
-        auto content = name.substr(bracket_pos +1, end_bracket - bracket_pos - 1);
-        auto tail_start = end_bracket + 1;
-        if (tail_start < name.size() && name[tail_start] == '.') {
-            ++tail_start; // skip dots
-        }
-        auto tail = name.substr(tail_start);
+        auto content = name.substr(bracket_pos + 1, end_bracket - bracket_pos - 1);
+
         if (content.empty()) {
             return list_path_info{base, std::nullopt}; // append
         }
+
         try {
             auto idx = std::stoul(std::string{content});
             return list_path_info{base, idx}; // update
-        } catch (...) {/*noop*/}
-        return std::nullopt;
+        } catch (...) {
+            return std::nullopt;
+        }
     }
 
-    inline auto split_list_values(const std::string& value) const -> std::vector<std::string> {
-        auto tmp = value;
-        if (tmp.starts_with('[')) {
-            tmp = tmp.substr(1);
+    auto parse_struct_list_field_path(std::string_view name) -> std::optional<struct_list_field_info> {
+        // Look for pattern: list_name[index].field_name
+        auto bracket_pos = name.find('[');
+        if (bracket_pos == std::string_view::npos) {
+            return std::nullopt;
         }
-        if (tmp.ends_with(']')) {
-            tmp.pop_back();
+
+        auto end_bracket = name.find(']', bracket_pos);
+        if (end_bracket == std::string_view::npos) {
+            return std::nullopt;
         }
-        std::vector<std::string> tokens;
-        std::string token;
-        std::istringstream stream(tmp);
-        while (std::getline(stream, token, ',')) {
-            tokens.push_back(token);
+
+        // Check if there's a dot after the bracket (indicating a field access)
+        if (end_bracket + 1 >= name.size() || name[end_bracket + 1] != '.') {
+            return std::nullopt;
         }
-        return tokens;
+
+        auto list_name = name.substr(0, bracket_pos);
+        auto index_str = name.substr(bracket_pos + 1, end_bracket - bracket_pos - 1);
+        auto field_name = name.substr(end_bracket + 2); // skip "]."
+
+        if (index_str.empty() || field_name.empty()) {
+            return std::nullopt;
+        }
+
+        try {
+            auto idx = std::stoul(std::string{index_str});
+            return struct_list_field_info{std::string{list_name}, idx, std::string{field_name}};
+        } catch (...) {
+            return std::nullopt;
+        }
     }
 
 }; // class property_set

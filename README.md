@@ -285,6 +285,43 @@ private:
 - **Pointers**: Properties are registered by passing a pointer to the component's member variable that will store the actual value.
   The `property_set` directly manipulates this memory location.
 
+#### List Properties
+
+For properties that represent collections of values, use `add_list_property()`. List properties support indexing, appending, and clearing operations.
+
+```cpp
+#include <composite/component.hpp>
+#include <vector>
+
+class MyComponentWithList : public composite::component {
+public:
+    MyComponentWithList() : composite::component("MyComponentWithList") {
+        // Define a list property
+        add_property("thresholds", &m_thresholds)
+            .configurability(composite::properties::config_type::RUNTIME);
+
+        // Add an indexed change listener for validation
+        add_property_change_listener("thresholds",
+            [this](std::size_t index) -> bool {
+                // Validate the value at the specified index
+                if (m_thresholds[index] < 0.0f || m_thresholds[index] > 100.0f) {
+                    logger()->warn("Threshold at index {} is out of range", index);
+                    return false; // Reject change
+                }
+                return true; // Accept change
+            });
+    }
+    // ... other methods and members ...
+private:
+    std::vector<float> m_thresholds{};
+};
+```
+
+**Accessing List Items in JSON:**
+- Replace entire list: `"thresholds": ["10.5", "20.0", "30.5"]`
+- Modify specific item: `"thresholds[0]": "15.0"`
+- Append new item: `"thresholds[]": "40.0"`
+
 #### Structured Properties
 
 For more complex configurations, properties can be grouped into structures using `add_struct_property()`. This allows for namespaced properties
@@ -317,6 +354,56 @@ private:
     NetworkConfig m_net_config;
 };
 ```
+
+**Accessing Struct Fields in JSON:**
+- Set individual field: `"network.host": "192.168.1.1"`
+- Set multiple fields: `"network": {"host": "192.168.1.1", "port": "9000"}`
+
+#### List-of-Structs Properties
+
+For advanced use cases, you can combine lists and structures using `add_struct_list_property()`. This creates a vector of structured objects.
+
+```cpp
+#include <composite/component.hpp>
+#include <vector>
+
+struct Connection {
+    std::string host{"localhost"};
+    uint16_t port{8080};
+};
+
+class MyComponentWithStructList : public composite::component {
+public:
+    MyComponentWithStructList() : composite::component("MyComponentWithStructList") {
+        add_struct_list_property("connections", &m_connections,
+            [](auto& ps, auto* conn) {
+                ps.add_property("host", &conn->host);
+                ps.add_property("port", &conn->port);
+            }
+        ).configurability(composite::properties::config_type::RUNTIME);
+
+        // Indexed change listener receives the index of modified/added item
+        add_property_change_listener("connections",
+            [this](std::size_t index) -> bool {
+                auto& conn = m_connections[index];
+                if (conn.port == 0) {
+                    logger()->error("Invalid port 0 at index {}", index);
+                    return false;
+                }
+                logger()->info("Connection {} validated: {}:{}", index, conn.host, conn.port);
+                return true;
+            });
+    }
+    // ... other methods and members ...
+private:
+    std::vector<Connection> m_connections{};
+};
+```
+
+**Accessing List-of-Structs in JSON:**
+- Replace entire list: `"connections": [{"host": "server1", "port": "8080"}, {"host": "server2", "port": "8081"}]`
+- Append new struct: `"connections[]": {"host": "server3", "port": "8082"}`
+- Modify field in item: `"connections[0].host": "new-server1"`
 
 #### Setting and Retrieving Property Values
 
@@ -355,6 +442,20 @@ Components can react to changes in their properties in two main ways:
            return true; // Accept change
        });
    ```
+
+   For **list properties**, change listeners receive the index of the modified/added item:
+   ```cpp
+   add_property_change_listener("thresholds",
+       [this](std::size_t index) -> bool {
+           // Validate the item at the specified index
+           if (m_thresholds[index] < 0.0f) {
+               return false; // Reject
+           }
+           logger()->info("Item {} updated to {}", index, m_thresholds[index]);
+           return true; // Accept
+       });
+   ```
+
 2. **`property_change_handler()`**: The `component` class provides a `virtual void property_change_handler()` method. This method is called
    once at the end of a successful `set_properties()` call, after all specified properties have been updated and their individual change listeners
    (if any) have approved the changes. Subclasses can override this method to perform more complex or coordinated reconfigurations based on the
@@ -370,6 +471,84 @@ Components can react to changes in their properties in two main ways:
        // this->update_processing_parameters();
    }
    ```
+
+#### Runtime Property Control via REST API
+
+The **composite-cli** application provides a REST API for runtime property inspection and modification. The server runs on `localhost:5000` by default
+(configurable via `--server` and `--port` command-line arguments).
+
+**Key Endpoints:**
+
+- `GET /app` - Get full application state including all components and properties
+- `GET /app/components/:id` - Get specific component state
+- `PATCH /app/components/:id` - Update multiple properties atomically
+- `GET /app/components/:id/properties` - List all properties for a component
+- `GET /app/components/:id/properties/:name` - Get specific property value and metadata
+- `PUT /app/components/:id/properties/:name` - Update a scalar property
+- `DELETE /app/components/:id/properties/:name` - Reset property to default (null)
+
+**List Property Operations:**
+
+- `GET /app/components/:id/properties/:name/items` - Get all list items
+- `GET /app/components/:id/properties/:name/items/:index` - Get specific list item
+- `POST /app/components/:id/properties/:name/items` - Append new item to list
+- `PUT /app/components/:id/properties/:name/items/:index` - Update specific list item
+- `DELETE /app/components/:id/properties/:name/items/:index` - Remove list item
+
+**Struct Property Operations:**
+
+- `GET /app/components/:id/properties/:name/fields` - Get all struct fields
+- `GET /app/components/:id/properties/:name/fields/:field` - Get specific field value
+- `PATCH /app/components/:id/properties/:name/fields/:field` - Update specific field
+
+**Example REST API Usage:**
+
+```bash
+# Get all properties for a component
+curl http://localhost:5000/app/components/my_component/properties
+
+# Update a single scalar property
+curl -X PUT http://localhost:5000/app/components/my_component/properties/threshold \
+  -H "Content-Type: application/json" \
+  -d '{"value": "75.5"}'
+
+# Update multiple properties atomically (single lock, single property_change_handler call)
+curl -X PATCH http://localhost:5000/app/components/my_component \
+  -H "Content-Type: application/json" \
+  -d '{"properties": {"threshold": "75.5", "enabled": "true"}}'
+
+# Replace entire list property
+curl -X PATCH http://localhost:5000/app/components/my_component \
+  -H "Content-Type: application/json" \
+  -d '{"properties": {"thresholds": ["10.0", "20.0", "30.0"]}}'
+
+# Append item to list property
+curl -X POST http://localhost:5000/app/components/my_component/properties/thresholds/items \
+  -H "Content-Type: application/json" \
+  -d '{"value": "40.0"}'
+
+# Update struct field
+curl -X PATCH http://localhost:5000/app/components/my_component/properties/network/fields/host \
+  -H "Content-Type: application/json" \
+  -d '{"value": "192.168.1.100"}'
+
+# Batch update list-of-structs (clears list first, then adds both items)
+curl -X PATCH http://localhost:5000/app/components/my_component \
+  -H "Content-Type: application/json" \
+  -d '{"properties": {"connections": [
+    {"host": "server1", "port": "8080"},
+    {"host": "server2", "port": "8081"}
+  ]}}'
+```
+
+**Notes on REST API Behavior:**
+
+- Only properties marked with `config_type::RUNTIME` can be modified via REST API
+- PATCH requests are atomic - all properties updated under a single mutex lock
+- `property_change_handler()` is called once after all property changes validated
+- For list properties, each individual POST creates a separate update (multiple handler calls)
+- PATCH with array replaces entire list (clears first, then adds items) - single handler call
+- Error responses include detailed information about validation failures
 
 ### Implementing a Component
 
