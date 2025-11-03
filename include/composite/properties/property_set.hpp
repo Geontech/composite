@@ -19,9 +19,10 @@
 
 #pragma once
 
-#include "properties/property_metadata.hpp"
-#include "properties/property_operations.hpp"
-#include "properties/property.hpp"
+#include "property_metadata.hpp"
+#include "property_operations.hpp"
+#include "property.hpp"
+
 #include <format>
 #include <map>
 #include <numeric>

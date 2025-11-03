@@ -121,6 +121,6 @@ private:
         m_msg_cv.notify_one();
     }
 
-}; // class message
+}; // class subscription
 
-} // namespcae composite::nats
+} // namespace composite::nats

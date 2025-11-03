@@ -21,6 +21,7 @@
 
 #include "property_metadata.hpp"
 #include "property_operations.hpp"
+
 #include <any>
 #include <functional>
 #include <memory>

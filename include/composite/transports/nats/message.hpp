@@ -19,8 +19,10 @@
 
 #pragma once
 
+#include <format>
 #include <nats/nats.h>
 #include <span>
+#include <stdexcept>
 #include <string>
 
 namespace composite::nats {
@@ -37,12 +39,16 @@ public:
      * @brief Creation constructor
      * @param subject The name of the subject on which the message will be published
      * @param data The data to be carried by the message
+     * @throws std::runtime_error if message creation fails
      */
     message(const std::string& subject, std::span<const char> data) {
         auto res = natsMsg_Create(&m_message, subject.c_str(), nullptr, data.data(), data.size());
         if (res != NATS_OK) {
-            natsMsg_Destroy(m_message);
-            m_message = nullptr;
+            m_message = nullptr;  // Don't destroy, just set null (wasn't created)
+            throw std::runtime_error(std::format(
+              "Failed to create NATS message: {} ({})",
+                natsStatus_GetText(res), static_cast<int>(res)
+            ));
         }
     }
 

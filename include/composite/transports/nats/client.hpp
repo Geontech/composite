@@ -19,10 +19,12 @@
 
 #pragma once
 
+#include <format>
 #include <map>
 #include <memory>
 #include <nats/nats.h>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -40,9 +42,17 @@ public:
 
     /**
      * @brief URL constructor
+     * @param url The NATS server URL (e.g., "nats://localhost:4222")
+     * @throws std::runtime_error if connection fails
      */
     explicit client(const std::string& url) {
-        natsConnection_ConnectTo(&m_connection, url.c_str());
+        auto status = natsConnection_ConnectTo(&m_connection, url.c_str());
+        if (status != NATS_OK) {
+            throw std::runtime_error(std::format(
+              "Failed to connect to NATS server {}: {} ({})",
+              url, natsStatus_GetText(status), static_cast<int>(status)
+            ));
+        }
     }
     
     /**
@@ -55,8 +65,41 @@ public:
     }
 
     /**
+     * @brief Deleted copy constructor (exclusive ownership of connection)
+     */
+    client(const client&) = delete;
+
+    /**
+     * @brief Deleted copy assignment (exclusive ownership of connection)
+     */
+    client& operator=(const client&) = delete;
+
+    /**
+     * @brief Move constructor
+     */
+    client(client&& other) noexcept :
+      m_connection(std::exchange(other.m_connection, nullptr)),
+      m_subscriptions(std::move(other.m_subscriptions)) {}
+
+    /**
+     * @brief Move assignment operator
+     */
+    client& operator=(client&& other) noexcept {
+        if (this != &other) {
+            // Clean up current connection
+            if (m_connection != nullptr) {
+                natsConnection_Destroy(m_connection);
+            }
+            // Transfer ownership
+            m_connection = std::exchange(other.m_connection, nullptr);
+            m_subscriptions = std::move(other.m_subscriptions);
+        }
+        return *this;
+    }
+
+    /**
      * @brief Returns whether or not the client is in a connected state
-     * @return true if client is connected, otherwise false 
+     * @return true if client is connected, otherwise false
      */
     auto is_connected() const -> bool {
         return natsConnection_Status(m_connection) == NATS_CONN_STATUS_CONNECTED;
@@ -65,28 +108,39 @@ public:
     /**
      * @brief Connect to a NATS server
      * @param url The URL of the NATS server
+     * @return NATS status code
+     *
+     * If already connected, closes existing connection before connecting to new server.
      */
     auto connect(const std::string& url) -> natsStatus {
+        // Close existing connection if any
+        if (m_connection != nullptr) {
+            natsConnection_Destroy(m_connection);
+            m_connection = nullptr;
+        }
         return natsConnection_ConnectTo(&m_connection, url.c_str());
     }
 
     /**
      * @brief Return the NATS server url
-     * @return The URL of the NATS server
+     * @return The URL of the NATS server, or empty string if not connected
      */
     auto url() const -> std::string {
-        std::string retval;
-        std::array<char, 256> url_str;
-        if (auto res = natsConnection_GetConnectedUrl(m_connection, url_str.data(), sizeof(url_str)); res == NATS_OK) {
-            retval = std::string{url_str.begin(), url_str.end()};
+        std::array<char, 256> url_str{};
+        auto res = natsConnection_GetConnectedUrl(m_connection, url_str.data(), url_str.size());
+        if (res != NATS_OK) {
+            return "";
         }
-        return retval;
+
+        return std::string{url_str.data()};
     }
 
     /**
      * @brief Publish data bytes on the subject
      * @param subject Name of the subject data is sent to
      * @param data Data bytes to be sent
+     * @param reply Optional reply subject
+     * @return NATS status code (library handles null connection)
      */
     auto publish(const std::string& subject, std::span<const std::byte> data, const std::string& reply="") -> natsStatus {
         if (!reply.empty()) {
@@ -96,17 +150,24 @@ public:
     }
 
     /**
-     * @brief Susbcribe to a subject
+     * @brief Subscribe to a subject
      * @param subject Name of the subject to subscribe to
+     * @return NATS status code (library handles null connection and invalid subject)
      */
     auto subscribe(const std::string& subject) -> natsStatus {
         if (subject.empty()) {
             return NATS_INVALID_SUBJECT;
         }
+
         auto sub = std::make_unique<subscription>();
         auto sub_ptr = sub->get();
         auto res = natsConnection_Subscribe(&sub_ptr, m_connection, subject.c_str(), &subscription::on_msg, sub.get());
-        m_subscriptions.emplace(std::make_pair(subject, std::move(sub)));
+
+        // Only add subscription if successful
+        if (res == NATS_OK) {
+            m_subscriptions.emplace(subject, std::move(sub));
+        }
+
         return res;
     }
 
