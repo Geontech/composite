@@ -19,14 +19,15 @@
 
 #pragma once
 
-#include "input_port.hpp"
+#include "composite/ports/input_port.hpp"
+#include "composite/ports/output_port.hpp"
+#include "composite/ports/port_set.hpp"
+#include "composite/properties/property_set.hpp"
 #include "lifecycle.hpp"
-#include "output_port.hpp"
-#include "port_set.hpp"
-#include "property_set.hpp"
 
 #include <concepts>
 #include <mutex>
+#include <optional>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 #include <string>
@@ -53,6 +54,7 @@ public:
     };
 
     virtual ~component() override {
+        stop();
         if (m_logger) {
             m_logger->flush();
         }
@@ -77,22 +79,20 @@ public:
     }
 
     auto start() -> void override {
-        m_thread = std::jthread(&component::thread_func, this);
-        pthread_setname_np(m_thread.native_handle(), m_id.c_str());
+        m_thread.reset();
         m_enabled = true;
+        m_thread.emplace(&component::thread_func, this);
+        pthread_setname_np(m_thread->native_handle(), m_id.c_str());
     }
 
     auto stop() -> void override {
         m_enabled = false;
-        m_thread.request_stop();
-        if (m_thread.joinable()) {
-            m_thread.join();
-        }
+        m_thread.reset();
     }
 
     virtual auto process() -> retval = 0;
 
-    auto add_port(port* port) {
+    auto add_port(port_base* port) {
         m_port_set.add_port(port);
     }
 
@@ -105,56 +105,71 @@ public:
         return m_port_set.ports();
     }
 
+    /**
+     * @brief Connect this component's output port to another's input port
+     *
+     * @param output_port_name Name of output port on this component
+     * @param other Target component
+     * @param input_port_name Name of input port on target component
+     * @return true if connection successful, false otherwise
+     */
     auto connect(
       std::string_view output_port_name,
       std::shared_ptr<component> other,
       std::string_view input_port_name
     ) -> bool {
-        auto out_port = get_port<output_port_base>(output_port_name);
+        // Get output port from this component
+        auto* out_port = get_port<output_port_base>(output_port_name);
         if (out_port == nullptr) {
+            m_logger->error("output port '{}' not found", output_port_name);
             return false;
         }
+
+        // Get input port from target component
         if (other == nullptr) {
+            m_logger->error("invalid input component pointer");
             return false;
         }
-        auto in_port = other->get_port<input_port_base>(input_port_name);
+        auto* in_port = other->get_port<input_port_base>(input_port_name);
         if (in_port == nullptr) {
+            m_logger->error("input port '{}' not found", input_port_name);
             return false;
         }
-        if (out_port->type_id() != in_port->type_id()) {
+
+        // Check element type compatibility
+        if (out_port->element_type_id() != in_port->element_type_id()) {
+            m_logger->error(
+              "type mismatch connecting {}:{} to {}:{}",
+              id(), output_port_name,
+              other->id(), input_port_name,
+              out_port->element_type_id(), in_port->element_type_id()
+            );
             return false;
         }
+
+        // Log mutability information for transfer optimization transparency
+        m_logger->trace(
+          "connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})",
+          id(), output_port_name, out_port->is_mutable() ? "mutable" : "immutable",
+          other->id(), input_port_name, in_port->is_mutable() ? "mutable" : "immutable"
+        );
+
+        // Make the connection
         out_port->connect(in_port);
+
+        // Record connection for tracking
         m_connections.push_back({
-            .output = std::make_pair(id(), std::string{output_port_name}),
-            .input = std::make_pair(other->id(), std::string{input_port_name})
+          .output = std::make_pair(id(), std::string{output_port_name}),
+          .input = std::make_pair(other->id(), std::string{input_port_name})
         });
+        m_logger->debug(
+          "connected {}:{} -> {}:{}",
+          id(), output_port_name,
+          other->id(), input_port_name
+        );
+
         return true;
     }
-
-#ifdef COMPOSITE_USE_NATS
-    auto connect(std::string_view port_name, std::string_view url, std::string_view subject, bool input=false) -> bool {
-        auto port = get_port(port_name);
-        if (port == nullptr) {
-            return false;
-        }
-        auto res = port->connect(std::string{url}, std::string{subject});
-        if (res) {
-            if (input) {
-                m_connections.push_back({
-                    .output = std::make_pair(std::string{url}, std::string{subject}),
-                    .input = std::make_pair(id(), std::string{port_name}),
-                });
-            } else {
-                m_connections.push_back({
-                    .output = std::make_pair(id(), std::string{port_name}),
-                    .input = std::make_pair(std::string{url}, std::string{subject})
-                });
-            }
-        }
-        return res;
-    }
-#endif
 
     auto connections() const -> const std::vector<connection>& {
         return m_connections;
@@ -298,6 +313,34 @@ public:
         m_logger->set_level(level);
     }
 
+    /**
+     * @brief Apply pending lifecycle changes based on enabled property
+     *
+     * Must be called after set_properties() completes to avoid deadlock.
+     * Checks if enabled property changed and starts/stops component accordingly,
+     * managing input port depths to prevent memory bloat.
+     */
+    auto apply_lifecycle_changes() -> void {
+        if (!m_lifecycle_change_pending) {
+            return;
+        }
+        m_lifecycle_change_pending = false;
+
+        bool is_running = m_thread.has_value();
+
+        if (m_enabled && !is_running) {
+            // Need to start
+            logger()->debug("Enabling component '{}'", m_id);
+            resume_input_ports();
+            start();
+        } else if (!m_enabled && is_running) {
+            // Need to stop
+            logger()->debug("Disabling component '{}'", m_id);
+            pause_input_ports();  // Pause ports first to prevent new data
+            stop();  // Then stop the thread
+        }
+    }
+
 protected:
     explicit component(std::string_view name) :
       m_name(name),
@@ -305,8 +348,14 @@ protected:
       m_sink(std::make_shared<spdlog::sinks::stdout_color_sink_mt>()),
       m_logger(std::make_shared<spdlog::logger>(m_name, m_sink)) {
         add_property("noop_thread_delay", &m_delay).units("ns");
-        using enum composite::properties::config_type;
-        add_property("enabled", &m_enabled).configurability(RUNTIME);
+        add_property("enabled", &m_enabled)
+            .configurability(composite::properties::config_type::RUNTIME)
+            .change_listener([this]() -> bool {
+                // Just mark that lifecycle change is pending
+                // Calling start()/stop() here causes deadlock
+                m_lifecycle_change_pending = true;
+                return true;
+            });
     }
 
     auto logger() const -> std::shared_ptr<spdlog::logger> {
@@ -318,14 +367,52 @@ private:
     std::string m_id;
     std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink;
     std::shared_ptr<spdlog::logger> m_logger;
-    std::jthread m_thread;
+    std::optional<std::jthread> m_thread;
     uint32_t m_delay{DEFAULT_DELAY};
     bool m_enabled{true};
     port_set m_port_set;
     property_set m_prop_set;
     std::mutex m_prop_mtx;
     std::atomic_bool m_prop_change_requested{};
+    std::atomic_bool m_lifecycle_change_pending{false};
     std::vector<connection> m_connections;
+    std::map<std::string, std::size_t> m_saved_input_depths;
+
+    /**
+     * @brief Pause all input ports by setting their queue depth to 0
+     *
+     * Saves current depth values and sets all input port depths to 0,
+     * preventing queue growth and memory bloat when component is stopped.
+     * Depths can be restored via resume_input_ports().
+     */
+    auto pause_input_ports() -> void {
+        m_saved_input_depths.clear();
+        for (const auto& [name, port] : m_port_set.ports()) {
+            if (auto* input_port = dynamic_cast<input_port_base*>(port)) {
+                // Save current depth
+                m_saved_input_depths[name] = input_port->depth();
+                // Set to 0 to drop all incoming data
+                input_port->depth(0);
+                logger()->debug("Paused input port '{}' (saved depth: {})", name, m_saved_input_depths[name]);
+            }
+        }
+    }
+
+    /**
+     * @brief Resume all input ports by restoring their saved queue depths
+     *
+     * Restores depths that were saved by pause_input_ports(). If no saved
+     * depth exists for a port, it remains at its current depth.
+     */
+    auto resume_input_ports() -> void {
+        for (const auto& [name, saved_depth] : m_saved_input_depths) {
+            if (auto* input_port = dynamic_cast<input_port_base*>(m_port_set.get_port<input_port_base>(name))) {
+                input_port->depth(saved_depth);
+                logger()->debug("Resumed input port '{}' (restored depth: {})", name, saved_depth);
+            }
+        }
+        m_saved_input_depths.clear();
+    }
 
     auto thread_func(std::stop_token token) -> void {
         using enum retval;

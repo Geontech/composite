@@ -18,7 +18,8 @@
  */
 
 #include "property_rest_api.hpp"
-#include "composite/properties/property_serializer.hpp"
+#include "property_serializer.hpp"
+
 #include <format>
 #include <spdlog/spdlog.h>
 

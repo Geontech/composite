@@ -19,7 +19,8 @@
 
 #pragma once
 
-#include "composite/property_set.hpp"
+#include "composite/properties/property_set.hpp"
+
 #include <format>
 #include <nlohmann/json.hpp>
 #include <string>

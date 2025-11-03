@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2024 Geon Technologies, LLC
+# Copyright (C) 2024-2025 Geon Technologies, LLC
 #
 # This file is part of composite.
 #
@@ -78,7 +78,7 @@ option(COMPOSITE_USE_NATS "Compile with NATS functionality" OFF)
 if(COMPOSITE_USE_NATS)
     FetchContent_Declare(cnats
         GIT_REPOSITORY https://github.com/nats-io/nats.c.git
-        GIT_TAG v3.9.2
+        GIT_TAG v3.11.0
     )
     set(NATS_BUILD_WITH_TLS OFF)
     set(NATS_BUILD_STREAMING OFF)
@@ -165,5 +165,6 @@ endif(COMPOSITE_INSTALL)
 # Tests
 option(COMPOSITE_BUILD_TESTS "Build unit tests" OFF)
 if (COMPOSITE_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(test)
 endif()

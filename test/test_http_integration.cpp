@@ -17,8 +17,8 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "composite/component.hpp"
-#include "composite/application.hpp"
+#include "composite/core/application.hpp"
+#include "composite/core/component.hpp"
 #include "property_rest_api.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -932,5 +932,518 @@ TEST_CASE("HTTP Integration - Schema") {
         REQUIRE(json["type"].get<std::string>() == "int32");
         REQUIRE(json["units"].get<std::string>() == "Hz");
         REQUIRE(json["configurability"].get<std::string>() == "runtime");
+    }
+}
+
+// Test components with ports for connection tests
+class source_component : public component {
+public:
+    source_component(std::string_view id) : component(id) {
+        add_port(&output);
+    }
+    auto process() -> retval override { return retval::FINISH; }
+    output_port<mutable_buffer<float>> output{"data_out"};
+};
+
+class sink_component : public component {
+public:
+    sink_component(std::string_view id) : component(id) {
+        add_port(&input);
+    }
+    auto process() -> retval override { return retval::FINISH; }
+    input_port<mutable_buffer<float>> input{"data_in"};
+};
+
+// Test server with port components
+class port_test_server {
+public:
+    port_test_server() : m_port(18081), m_app("port_test_app"), m_server(std::make_unique<httplib::Server>()) {
+        // Create test application with components that have ports
+        auto source = std::make_shared<source_component>("source");
+        auto sink = std::make_shared<sink_component>("sink");
+        m_app.add_component(source);
+        m_app.add_component(sink);
+
+        // Setup REST API endpoints
+        setup_port_endpoints();
+
+        // Start server in background thread
+        m_server_thread = std::thread([this]() {
+            m_server->listen("localhost", m_port);
+        });
+
+        // Wait for server to be ready
+        std::this_thread::sleep_for(100ms);
+    }
+
+    ~port_test_server() {
+        m_server->stop();
+        if (m_server_thread.joinable()) {
+            m_server_thread.join();
+        }
+    }
+
+    auto port() const -> int { return m_port; }
+    auto base_url() const -> std::string {
+        return std::format("http://localhost:{}", m_port);
+    }
+
+    auto get_application() -> composite::application& { return m_app; }
+
+private:
+    void setup_port_endpoints() {
+        // GET /app/components/:id/ports
+        m_server->Get("/app/components/:id/ports", [this](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto content = nlohmann::json();
+
+            if (auto comp = m_app.get_component(comp_id); comp != nullptr) {
+                auto ports_json = nlohmann::json::array();
+
+                for (const auto& [port_name, port_ptr] : comp->ports()) {
+                    if (port_ptr == nullptr) { continue; }
+
+                    auto port_obj = nlohmann::json::object();
+                    port_obj["name"] = port_name;
+
+                    if (auto* output_port = dynamic_cast<output_port_base*>(port_ptr)) {
+                        port_obj["type"] = "output";
+                        port_obj["is_connected"] = output_port->is_connected();
+                        port_obj["connection_count"] = output_port->connection_count();
+                        port_obj["connected_ports"] = output_port->connected_ports();
+                    } else if (dynamic_cast<input_port_base*>(port_ptr)) {
+                        port_obj["type"] = "input";
+                    }
+
+                    ports_json.push_back(port_obj);
+                }
+
+                content["component_id"] = comp_id;
+                content["ports"] = ports_json;
+                res.set_content(content.dump(2), "application/json");
+                res.status = httplib::OK_200;
+            } else {
+                content["error"] = std::format("component not found: {}", comp_id);
+                res.set_content(content.dump(), "application/json");
+                res.status = httplib::NotFound_404;
+            }
+        });
+
+        // POST /app/connections
+        m_server->Post("/app/connections", [this](const httplib::Request& req, httplib::Response& res) {
+            auto content = nlohmann::json();
+
+            try {
+                auto conn_json = nlohmann::json::parse(req.body);
+
+                if (!conn_json.contains("output") || !conn_json.contains("input")) {
+                    content["error"] = "connection must specify both 'output' and 'input'";
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                auto& output = conn_json["output"];
+                auto& input = conn_json["input"];
+
+                if (!output.contains("component") || !output.contains("port")) {
+                    content["error"] = "output must specify 'component' and 'port'";
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                if (!input.contains("component") || !input.contains("port")) {
+                    content["error"] = "input must specify 'component' and 'port'";
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                auto source_comp_id = output["component"].get<std::string>();
+                auto source_port_name = output["port"].get<std::string>();
+                auto target_comp_id = input["component"].get<std::string>();
+                auto target_port_name = input["port"].get<std::string>();
+
+                auto source_comp = m_app.get_component(source_comp_id);
+                if (!source_comp) {
+                    content["error"] = std::format("source component not found: {}", source_comp_id);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                    return;
+                }
+
+                auto target_comp = m_app.get_component(target_comp_id);
+                if (!target_comp) {
+                    content["error"] = std::format("target component not found: {}", target_comp_id);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                    return;
+                }
+
+                bool success = source_comp->connect(source_port_name, target_comp, target_port_name);
+
+                if (success) {
+                    content["success"] = std::format("connected {}:{} to {}:{}",
+                                                     source_comp_id, source_port_name,
+                                                     target_comp_id, target_port_name);
+                    content["connection"] = {
+                        {"output", {{"component", source_comp_id}, {"port", source_port_name}}},
+                        {"input", {{"component", target_comp_id}, {"port", target_port_name}}}
+                    };
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::Created_201;
+                } else {
+                    content["error"] = std::format("failed to connect {}:{} to {}:{}",
+                                                   source_comp_id, source_port_name,
+                                                   target_comp_id, target_port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                }
+            } catch (const std::exception& ex) {
+                content["error"] = ex.what();
+                res.set_content(content.dump(), "application/json");
+                res.status = httplib::BadRequest_400;
+            }
+        });
+
+        // DELETE /app/components/:id/ports/:port_name/connections
+        m_server->Delete("/app/components/:id/ports/:port_name/connections",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+            auto comp_id = req.path_params.at("id");
+            auto port_name = req.path_params.at("port_name");
+            auto content = nlohmann::json();
+
+            if (auto comp = m_app.get_component(comp_id); comp != nullptr) {
+                const auto& ports = comp->ports();
+                auto port_it = ports.find(port_name);
+
+                if (port_it != ports.end() && port_it->second != nullptr) {
+                    if (auto* output_port = dynamic_cast<output_port_base*>(port_it->second)) {
+                        auto disconnected_count = output_port->disconnect();
+                        content["success"] = std::format("disconnected {} connections from port '{}'",
+                                                         disconnected_count, port_name);
+                        content["disconnected_count"] = disconnected_count;
+                        res.set_content(content.dump(), "application/json");
+                        res.status = httplib::OK_200;
+                    } else {
+                        content["error"] = std::format("port '{}' is not an output port", port_name);
+                        res.set_content(content.dump(), "application/json");
+                        res.status = httplib::BadRequest_400;
+                    }
+                } else {
+                    content["error"] = std::format("port not found: {}", port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                }
+            } else {
+                content["error"] = std::format("component not found: {}", comp_id);
+                res.set_content(content.dump(), "application/json");
+                res.status = httplib::NotFound_404;
+            }
+        });
+
+        // DELETE /app/connections
+        m_server->Delete("/app/connections",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+            auto content = nlohmann::json();
+
+            try {
+                // Parse JSON body
+                auto conn_json = nlohmann::json::parse(req.body);
+
+                // Validate required fields
+                if (!conn_json.contains("output") || !conn_json.contains("input")) {
+                    content["error"] = "connection must specify both 'output' and 'input'";
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                auto& output = conn_json["output"];
+                auto& input = conn_json["input"];
+
+                // Validate output structure
+                if (!output.contains("component") || !output.contains("port")) {
+                    content["error"] = "output must specify 'component' and 'port'";
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                // Validate input structure
+                if (!input.contains("component") || !input.contains("port")) {
+                    content["error"] = "input must specify 'component' and 'port'";
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                auto source_comp_id = output["component"].get<std::string>();
+                auto source_port_name = output["port"].get<std::string>();
+                auto target_comp_id = input["component"].get<std::string>();
+                auto target_port_name = input["port"].get<std::string>();
+
+                auto source_comp = m_app.get_component(source_comp_id);
+                if (!source_comp) {
+                    content["error"] = std::format("source component not found: {}", source_comp_id);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                    return;
+                }
+
+                auto target_comp = m_app.get_component(target_comp_id);
+                if (!target_comp) {
+                    content["error"] = std::format("target component not found: {}", target_comp_id);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                    return;
+                }
+
+                const auto& source_ports = source_comp->ports();
+                auto source_port_it = source_ports.find(source_port_name);
+                if (source_port_it == source_ports.end() || source_port_it->second == nullptr) {
+                    content["error"] = std::format("source port not found: {}", source_port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                    return;
+                }
+
+                auto* output_port = dynamic_cast<output_port_base*>(source_port_it->second);
+                if (!output_port) {
+                    content["error"] = std::format("source port '{}' is not an output port", source_port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                const auto& target_ports = target_comp->ports();
+                auto target_port_it = target_ports.find(target_port_name);
+                if (target_port_it == target_ports.end() || target_port_it->second == nullptr) {
+                    content["error"] = std::format("target port not found: {}", target_port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::NotFound_404;
+                    return;
+                }
+
+                auto* input_port = dynamic_cast<input_port_base*>(target_port_it->second);
+                if (!input_port) {
+                    content["error"] = std::format("target port '{}' is not an input port", target_port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                    return;
+                }
+
+                bool was_connected = output_port->disconnect(input_port);
+                if (was_connected) {
+                    content["success"] = std::format("disconnected {}:{} from {}:{}",
+                                                     source_comp_id, source_port_name,
+                                                     target_comp_id, target_port_name);
+                    content["connection"] = {
+                        {"output", {{"component", source_comp_id}, {"port", source_port_name}}},
+                        {"input", {{"component", target_comp_id}, {"port", target_port_name}}}
+                    };
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::OK_200;
+                } else {
+                    content["error"] = std::format("ports were not connected: {}:{} -> {}:{}",
+                                                   source_comp_id, source_port_name,
+                                                   target_comp_id, target_port_name);
+                    res.set_content(content.dump(), "application/json");
+                    res.status = httplib::BadRequest_400;
+                }
+            } catch (const nlohmann::json::exception& e) {
+                content["error"] = std::format("invalid JSON in request body: {}", e.what());
+                res.set_content(content.dump(), "application/json");
+                res.status = httplib::BadRequest_400;
+            }
+        });
+    }
+
+    int m_port;
+    composite::application m_app;
+    std::unique_ptr<httplib::Server> m_server;
+    std::thread m_server_thread;
+};
+
+TEST_CASE("HTTP Integration - Port Information") {
+    port_test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Get all ports for component") {
+        auto path = "/app/components/source/ports";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("component_id"));
+        REQUIRE(json["component_id"].get<std::string>() == "source");
+        REQUIRE(json.contains("ports"));
+        REQUIRE(json["ports"].is_array());
+        REQUIRE(json["ports"].size() == 1);
+        REQUIRE(json["ports"][0]["name"].get<std::string>() == "data_out");
+        REQUIRE(json["ports"][0]["type"].get<std::string>() == "output");
+        REQUIRE(json["ports"][0]["is_connected"].get<bool>() == false);
+        REQUIRE(json["ports"][0]["connection_count"].get<int>() == 0);
+    }
+
+    SECTION("Get ports for non-existent component") {
+        auto path = "/app/components/invalid/ports";
+        auto result = client.Get(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::NotFound_404);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("error"));
+    }
+}
+
+TEST_CASE("HTTP Integration - Port Connections") {
+    port_test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Create connection between components") {
+        auto body = nlohmann::json{
+            {"output", {{"component", "source"}, {"port", "data_out"}}},
+            {"input", {{"component", "sink"}, {"port", "data_in"}}}
+        }.dump();
+
+        auto result = client.Post("/app/connections", body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::Created_201);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("success"));
+        REQUIRE(json.contains("connection"));
+        REQUIRE(json["connection"]["output"]["component"].get<std::string>() == "source");
+        REQUIRE(json["connection"]["output"]["port"].get<std::string>() == "data_out");
+        REQUIRE(json["connection"]["input"]["component"].get<std::string>() == "sink");
+        REQUIRE(json["connection"]["input"]["port"].get<std::string>() == "data_in");
+
+        // Verify connection was made
+        auto ports_result = client.Get("/app/components/source/ports");
+        REQUIRE(ports_result);
+        auto ports_json = nlohmann::json::parse(ports_result->body);
+        REQUIRE(ports_json["ports"][0]["is_connected"].get<bool>() == true);
+        REQUIRE(ports_json["ports"][0]["connection_count"].get<int>() == 1);
+    }
+
+    SECTION("Create connection with invalid component") {
+        auto body = nlohmann::json{
+            {"output", {{"component", "invalid"}, {"port", "data_out"}}},
+            {"input", {{"component", "sink"}, {"port", "data_in"}}}
+        }.dump();
+
+        auto result = client.Post("/app/connections", body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::NotFound_404);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("error"));
+    }
+
+    SECTION("Create connection with missing fields") {
+        auto body = nlohmann::json{
+            {"output", {{"component", "source"}}}
+        }.dump();
+
+        auto result = client.Post("/app/connections", body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::BadRequest_400);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("error"));
+    }
+}
+
+TEST_CASE("HTTP Integration - Port Disconnections") {
+    port_test_server server;
+    httplib::Client client(server.base_url());
+
+    // First create a connection
+    auto conn_body = nlohmann::json{
+        {"output", {{"component", "source"}, {"port", "data_out"}}},
+        {"input", {{"component", "sink"}, {"port", "data_in"}}}
+    }.dump();
+    auto conn_result = client.Post("/app/connections", conn_body, "application/json");
+    REQUIRE(conn_result);
+    REQUIRE(conn_result->status == httplib::Created_201);
+
+    SECTION("Disconnect specific connection") {
+        auto body = nlohmann::json{
+            {"output", {{"component", "source"}, {"port", "data_out"}}},
+            {"input", {{"component", "sink"}, {"port", "data_in"}}}
+        }.dump();
+
+        auto result = client.Delete("/app/connections", body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("success"));
+        REQUIRE(json.contains("connection"));
+
+        // Verify disconnection
+        auto ports_result = client.Get("/app/components/source/ports");
+        REQUIRE(ports_result);
+        auto ports_json = nlohmann::json::parse(ports_result->body);
+        REQUIRE(ports_json["ports"][0]["is_connected"].get<bool>() == false);
+        REQUIRE(ports_json["ports"][0]["connection_count"].get<int>() == 0);
+    }
+
+    SECTION("Disconnect all connections from port") {
+        auto path = "/app/components/source/ports/data_out/connections";
+        auto result = client.Delete(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("success"));
+        REQUIRE(json.contains("disconnected_count"));
+        REQUIRE(json["disconnected_count"].get<int>() == 1);
+
+        // Verify disconnection
+        auto ports_result = client.Get("/app/components/source/ports");
+        REQUIRE(ports_result);
+        auto ports_json = nlohmann::json::parse(ports_result->body);
+        REQUIRE(ports_json["ports"][0]["is_connected"].get<bool>() == false);
+    }
+
+    SECTION("Disconnect non-existent connection") {
+        // First disconnect the actual connection
+        client.Delete("/app/components/source/ports/data_out/connections");
+
+        // Try to disconnect again using body-based DELETE
+        auto body = nlohmann::json{
+            {"output", {{"component", "source"}, {"port", "data_out"}}},
+            {"input", {{"component", "sink"}, {"port", "data_in"}}}
+        }.dump();
+
+        auto result = client.Delete("/app/connections", body, "application/json");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::BadRequest_400);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("error"));
+    }
+
+    SECTION("Disconnect from invalid port") {
+        auto path = "/app/components/source/ports/invalid/connections";
+        auto result = client.Delete(path);
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::NotFound_404);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("error"));
     }
 }

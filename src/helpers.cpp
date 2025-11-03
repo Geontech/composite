@@ -17,11 +17,17 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "composite/application.hpp"
+#include "composite/core/application.hpp"
+#include "composite/ports/input_port.hpp"
+#include "composite/ports/output_port.hpp"
 #include "helpers.hpp"
 
-#include <iostream>
+#ifdef COMPOSITE_USE_NATS
+#include "composite/transports/nats/transport.hpp"
+#endif
+
 #include <format>
+#include <iostream>
 #include <random>
 #include <spdlog/spdlog.h>
 
@@ -209,6 +215,145 @@ auto build_props_lists(const nlohmann::json& properties)
         }
     }
     return {props, list_props, struct_props};
+}
+
+auto parse_transports(const nlohmann::json& transports_json)
+  -> std::tuple<transport_registry, std::string> {
+    transport_registry registry;
+
+    if (!transports_json.is_array()) {
+        return {std::move(registry), "transports must be an array"};
+    }
+
+    for (const auto& transport_json : transports_json) {
+        // Validate required fields
+        if (!transport_json.contains("id")) {
+            return {std::move(registry), "transport missing 'id' field"};
+        }
+        if (!transport_json.contains("type")) {
+            return {std::move(registry), std::format("transport '{}' missing 'type' field",
+                transport_json["id"].get<std::string>())};
+        }
+
+        auto id = transport_json["id"].get<std::string>();
+        auto type_str = transport_json["type"].get<std::string>();
+
+        // Convert string to transport_type enum
+        auto type_opt = from_string(type_str);
+        if (!type_opt.has_value()) {
+            return {std::move(registry), std::format("unknown transport type '{}' for transport '{}'", type_str, id)};
+        }
+
+        // Check for duplicate IDs
+        if (registry.contains(id)) {
+            return {std::move(registry), std::format("duplicate transport id: '{}'", id)};
+        }
+
+        // Store transport definition
+        transport_definition def;
+        def.id = id;
+        def.type = *type_opt;
+        def.config = transport_json;  // Store full JSON for later instantiation
+
+        registry[id] = def;
+    }
+
+    return {std::move(registry), ""};
+}
+
+auto create_transport(const transport_definition& def)
+  -> std::tuple<std::unique_ptr<transport_base>, std::string> {
+    if (def.type == transport_type::nats) {
+#ifndef COMPOSITE_USE_NATS
+        return {nullptr, std::format("NATS support not enabled for transport '{}'", def.id)};
+#else
+        // Validate NATS-specific fields
+        if (!def.config.contains("url")) {
+            return {nullptr, std::format("NATS transport '{}' missing 'url' field", def.id)};
+        }
+        if (!def.config.contains("subject")) {
+            return {nullptr, std::format("NATS transport '{}' missing 'subject' field", def.id)};
+        }
+
+        auto url = def.config["url"].get<std::string>();
+        auto subject = def.config["subject"].get<std::string>();
+
+        try {
+            auto transport = std::make_unique<nats::transport>(url, subject);
+            return {std::move(transport), ""};
+        } catch (const std::exception& e) {
+            return {nullptr, std::format("failed to create NATS transport '{}': {}", def.id, e.what())};
+        }
+#endif
+    }
+
+    return {nullptr, std::format("unknown transport type '{}' for transport '{}'", to_string(def.type), def.id)};
+}
+
+auto attach_component_transports(
+    std::shared_ptr<component> comp,
+    const nlohmann::json& transports_json,
+    const transport_registry& registry
+) -> std::string {
+
+    if (!transports_json.is_object()) {
+        return std::format("component '{}' transports must be an object", comp->id());
+    }
+
+    // Iterate over port_name -> [transport_ids] mappings
+    for (const auto& [port_name, transport_ids] : transports_json.items()) {
+        if (!transport_ids.is_array()) {
+            return std::format("component '{}' port '{}' transports must be an array",
+                comp->id(), port_name);
+        }
+
+        // Look up the port (will check both inputs and outputs)
+        auto* output_port_ptr = comp->get_port<output_port_base>(port_name);
+
+        if (output_port_ptr != nullptr) {
+            // It's an output port - attach transports
+            for (const auto& transport_id_json : transport_ids) {
+                if (!transport_id_json.is_string()) {
+                    return std::format("component '{}' port '{}' transport ID must be a string",
+                        comp->id(), port_name);
+                }
+
+                auto transport_id = transport_id_json.get<std::string>();
+
+                // Look up transport definition in registry
+                auto it = registry.find(transport_id);
+                if (it == registry.end()) {
+                    return std::format("component '{}' port '{}' references unknown transport '{}'",
+                        comp->id(), port_name, transport_id);
+                }
+
+                // Create a new transport instance from the definition
+                auto [transport, error] = create_transport(it->second);
+                if (!error.empty()) {
+                    return std::format("component '{}' port '{}': {}", comp->id(), port_name, error);
+                }
+
+                // Attach transport to the output port
+                output_port_ptr->add_transport(std::move(transport));
+
+                spdlog::debug("Attached transport '{}' to component '{}' port '{}'",
+                    transport_id, comp->id(), port_name);
+            }
+        } else {
+            // Check if it's an input port
+            auto* input_port = comp->get_port<input_port_base>(port_name);
+            if (input_port != nullptr) {
+                // Input transports not yet implemented
+                return std::format("component '{}' port '{}' is an input port - input transports not yet supported",
+                    comp->id(), port_name);
+            } else {
+                return std::format("component '{}' has no port named '{}'",
+                    comp->id(), port_name);
+            }
+        }
+    }
+
+    return "";
 }
 
 } // namespace composite

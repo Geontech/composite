@@ -19,8 +19,9 @@
 
 #pragma once
 
-#include "composite/component.hpp"
-#include "composite/property_set.hpp"
+#include "composite/core/component.hpp"
+#include "composite/properties/property_set.hpp"
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <string>

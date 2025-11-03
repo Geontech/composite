@@ -17,7 +17,7 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "composite/application.hpp"
+#include "composite/core/application.hpp"
 #include "composite/version.hpp"
 #include "helpers.hpp"
 #include "property_changeset.hpp"
@@ -56,9 +56,8 @@ auto make_server(application&, composite::component_handles_type&) -> std::uniqu
 auto main(int argc, char** argv) -> int {
     // Create argument parser with options
     auto program = argparse::ArgumentParser{"composite-cli", VERSION};
-    program.add_argument("-f", "--config-file")
-      .help("application configuration file")
-      .required();
+    program.add_argument("config-file")
+      .help("application configuration file");
     program.add_argument("-s", "--server")
       .help("REST server address")
       .default_value(std::string{"localhost"});
@@ -124,7 +123,7 @@ auto main(int argc, char** argv) -> int {
 #endif
 
     // Get configuration file, then read and parse
-    auto config_file = program.get<std::string>("--config-file");
+    auto config_file = program.get<std::string>("config-file");
     spdlog::info("Using config file at: {}", config_file);
     auto config_ifstream = std::ifstream{config_file};
     auto app_json = nlohmann::json::parse(config_ifstream);
@@ -190,6 +189,40 @@ auto main(int argc, char** argv) -> int {
         app.add_component(comp_ptr);
     }
 
+    // Parse transport definitions from configuration
+    auto transport_registry = composite::transport_registry{};
+    if (app_json.contains("transports")) {
+        spdlog::trace("parsing transport definitions");
+        auto [registry, error] = composite::parse_transports(app_json["transports"]);
+        if (!error.empty()) {
+            spdlog::error("failed to parse transports: {}", error);
+            return EXIT_FAILURE;
+        }
+        transport_registry = std::move(registry);
+        spdlog::debug("parsed {} transport definition(s)", transport_registry.size());
+    }
+
+    // Attach transports to component ports
+    for (const auto& comp : app_json["components"]) {
+        if (!comp.contains("transports")) {
+            continue;
+        }
+
+        auto comp_id = comp.contains("id") ? comp["id"].get<std::string>() : comp["name"].get<std::string>();
+        auto comp_ptr = app.get_component(comp_id);
+        if (comp_ptr == nullptr) {
+            spdlog::error("component '{}' not found when attaching transports", comp_id);
+            return EXIT_FAILURE;
+        }
+
+        spdlog::trace("attaching transports to component '{}'", comp_id);
+        auto error = composite::attach_component_transports(comp_ptr, comp["transports"], transport_registry);
+        if (!error.empty()) {
+            spdlog::error("failed to attach transports to '{}': {}", comp_id, error);
+            return EXIT_FAILURE;
+        }
+    }
+
     // Make connections
     auto conn_exit = [&app](std::string_view msg) {
         spdlog::error(msg);
@@ -217,37 +250,22 @@ auto main(int argc, char** argv) -> int {
         }
 
         spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
-        if (input_comp.starts_with("nats://")) {
-#ifndef COMPOSITE_USE_NATS
-            return conn_exit(std::format("NATS support is not enabled: required for connection: {}", conn.dump()));
-#endif
-            // Get the output component port
-            auto output_comp_ptr = app.get_component(output_comp);
-            if (output_comp_ptr == nullptr) {
-                return conn_exit(std::format("output component {} null during connection: {}", output_comp, conn.dump()));
-            }
-#ifdef COMPOSITE_USE_NATS
-            if (!output_comp_ptr->connect(output_port, input_comp, input_port)) {
-                return conn_exit(std::format("Failed to connect {}:{} to {}", output_comp, output_port, input_comp));
-            }
-#endif
-        } else if (output_comp.starts_with("nats://")) {
-            // Future release will enable this support
-            return conn_exit(std::format("NATS support is not enabled: required for connection: {}", conn.dump()));
-        } else {
-            // Get the output component port
-            auto output_comp_ptr = app.get_component(output_comp);
-            if (output_comp_ptr == nullptr) {
-                return conn_exit(std::format("output component {} null during connection: {}", output_comp, conn.dump()));
-            }
-            // Get the input component port
-            auto input_comp_ptr = app.get_component(input_comp);
-            if (input_comp_ptr == nullptr) {
-                return conn_exit(std::format("input component {} null during connection: {}", input_comp, conn.dump()));
-            }
-            if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-                return conn_exit(std::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
-            }
+
+        // Get the output component
+        auto output_comp_ptr = app.get_component(output_comp);
+        if (output_comp_ptr == nullptr) {
+            return conn_exit(std::format("output component {} not found: {}", output_comp, conn.dump()));
+        }
+
+        // Get the input component
+        auto input_comp_ptr = app.get_component(input_comp);
+        if (input_comp_ptr == nullptr) {
+            return conn_exit(std::format("input component {} not found: {}", input_comp, conn.dump()));
+        }
+
+        // Connect the ports
+        if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
+            return conn_exit(std::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
         }
     }
 

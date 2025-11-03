@@ -23,8 +23,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
-#include "composite/component.hpp"
-#include "composite/property_set.hpp"
+#include "composite/core/component.hpp"
+#include "composite/properties/property_set.hpp"
 #include "helpers.hpp"
 #include "property_rest_api.hpp"
 

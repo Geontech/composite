@@ -105,6 +105,47 @@ public:
 
 }; // class data_format
 
+/**
+ * @brief Metadata describing properties of a data stream
+ *
+ * Metadata is sent alongside data packets through ports to describe the
+ * characteristics and properties of the data stream. It is commonly used
+ * for signal processing applications to convey information about sample
+ * rates, center frequencies, and other stream properties.
+ *
+ * **Key Fields:**
+ * - `format`: Data format information (type, bit width, endianness, complexity)
+ * - `center_frequency`: Center frequency in Hz (for RF/signal processing)
+ * - `bandwidth`: Signal bandwidth in Hz
+ * - `sample_rate`: Sampling rate in samples/sec
+ * - `eos`: End-of-stream flag indicating last packet
+ * - `annotations`: Extensible key-value pairs for custom metadata
+ *
+ * **Usage Pattern:**
+ * @code
+ * // Create and send metadata before data
+ * metadata md;
+ * md.sample_rate = 1e6;          // 1 MHz
+ * md.center_frequency = 2.4e9;    // 2.4 GHz
+ * md.bandwidth = 20e6;            // 20 MHz
+ * md.format.type = data_type::floating_point;
+ * md.format.bit_width = 32;
+ * md.annotations["source"] = "antenna_1";
+ *
+ * output_port.send_metadata(md);
+ * output_port.send_data(buffer, timestamp);
+ * @endcode
+ *
+ * **Propagation Rules:**
+ * - Metadata is sent via `output_port::send_metadata()`
+ * - Metadata is "latched" by input ports until data arrives
+ * - Metadata is bundled with the next data packet received
+ * - Components can forward, modify, or generate new metadata
+ * - Metadata without subsequent data is discarded
+ *
+ * @see output_port_base::send_metadata()
+ * @see input_port::get_data()
+ */
 class metadata {
 public:
     data_format format;
