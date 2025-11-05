@@ -68,7 +68,6 @@ auto to_json(nlohmann::json& json_obj, const composite::property_set& set) -> vo
 
 auto to_json(nlohmann::json& json_obj, const component& comp) {
     json_obj["id"] = comp.id();
-    json_obj["name"] = comp.name();
     json_obj["ports"] = comp.ports();
     json_obj["connections"] = comp.connections();
     auto props_obj = nlohmann::json{};
@@ -207,10 +206,17 @@ auto make_server(application& app, composite::component_handles_type& handles) -
         try {
             // Parse JSON body
             auto comp_json = nlohmann::json::parse(req.body);
-            // Check for name
-            if (!comp_json.contains("name")) {
+            // Check for required fields
+            if (!comp_json.contains("library")) {
                 auto content = nlohmann::json::object();
-                content["error"] = std::string{"no component name provided"};
+                content["error"] = std::string{"no component library provided"};
+                res.set_content(content.dump(), "application/json");
+                res.status = httplib::BadRequest_400;
+                return;
+            }
+            if (!comp_json.contains("id")) {
+                auto content = nlohmann::json::object();
+                content["error"] = std::string{"no component id provided"};
                 res.set_content(content.dump(), "application/json");
                 res.status = httplib::BadRequest_400;
                 return;
@@ -218,7 +224,9 @@ auto make_server(application& app, composite::component_handles_type& handles) -
             // Add component to application
             auto comp_ptr = composite::make_component(comp_json, handles);
             if (comp_ptr == nullptr) {
-                auto msg = std::format("failed to create component {}", comp_json["name"].get<std::string>());
+                auto msg = std::format("failed to create component {} from library {}",
+                    comp_json["id"].get<std::string>(),
+                    comp_json["library"].get<std::string>());
                 auto content = nlohmann::json::object();
                 content["error"] = msg;
                 spdlog::error(msg);

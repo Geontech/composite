@@ -30,6 +30,7 @@
 #include <optional>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -60,18 +61,8 @@ public:
         }
     }
 
-    auto name() const noexcept -> std::string {
-        return m_name;
-    }
-
-    auto id() const noexcept -> std::string {
+    auto id() const noexcept -> const std::string& {
         return m_id;
-    }
-
-    auto id(std::string_view id) -> void {
-        m_id = id;
-        auto pattern = std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
-        m_logger->set_pattern(pattern);
     }
 
     auto initialize() -> void override {
@@ -342,17 +333,20 @@ public:
     }
 
 protected:
-    explicit component(std::string_view name) :
-      m_name(name),
-      m_id(m_name),
+    explicit component(std::string_view id) :
+      m_id(id),
       m_sink(std::make_shared<spdlog::sinks::stdout_color_sink_mt>()),
-      m_logger(std::make_shared<spdlog::logger>(m_name, m_sink)) {
+      m_logger(std::make_shared<spdlog::logger>(m_id, m_sink)) {
+        if (m_id.empty()) {
+            throw std::invalid_argument("component id cannot be empty");
+        }
+        auto pattern = std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
+        m_logger->set_pattern(pattern);
         add_property("noop_thread_delay", &m_delay).units("ns");
         add_property("enabled", &m_enabled)
             .configurability(composite::properties::config_type::RUNTIME)
             .change_listener([this]() -> bool {
-                // Just mark that lifecycle change is pending
-                // Calling start()/stop() here causes deadlock
+                // Mark that lifecycle change is pending
                 m_lifecycle_change_pending = true;
                 return true;
             });
@@ -363,7 +357,6 @@ protected:
     }
 
 private:
-    std::string m_name;
     std::string m_id;
     std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink;
     std::shared_ptr<spdlog::logger> m_logger;

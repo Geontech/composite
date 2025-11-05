@@ -50,56 +50,55 @@ auto generate_app_name() -> std::string {
 }
 
 auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component> {
-    // Get component name
-    auto name = comp_json["name"].get<std::string>();
-    // Open component module
-    auto comp_str = std::format("lib{}.so", name);
-    spdlog::trace("component module: {}", comp_str);
+    // Get component library path/name
+    auto library = comp_json["library"].get<std::string>();
+    spdlog::trace("loading component library: {}", library);
+
     // Get component module handle
-    auto comp_handle = std::unique_ptr<void, decltype(&close_func)>(dlopen(comp_str.c_str(), RTLD_NOW), close_func);
+    auto comp_handle = std::unique_ptr<void, decltype(&close_func)>(dlopen(library.c_str(), RTLD_NOW), close_func);
     if (!comp_handle) {
-        std::cerr << std::format("failed to open {}: {}\n", comp_str, dlerror());
+        std::cerr << std::format("failed to open {}: {}\n", library, dlerror());
         return {};
     }
     dlerror(); // clear existing
+
+    // Get component id (required)
+    auto comp_id = comp_json["id"].get<std::string>();
+
     // Component shared_ptr
     auto comp_ptr = std::shared_ptr<composite::component>{nullptr};
-    // Get the create function
+
+    // Get the create function and call with id
     if (comp_json.contains("create_arg")) {
         // Get create arg if present
         auto create_arg = comp_json["create_arg"].get<std::string>();
-        // Create function to include string_view argument
+        // Create function with id and arg parameters
+        using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view, std::string_view);
+        auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
+        if (auto err = dlerror(); err != nullptr) {
+            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", library, err);
+            return {};
+        }
+        dlerror(); // clear existing
+        // Create a new component with id and arg
+        comp_ptr = (*create_func)(comp_id, create_arg);
+    } else {
+        // Create function with only id parameter
         using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view);
         auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
         if (auto err = dlerror(); err != nullptr) {
-            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
+            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", library, err);
             return {};
         }
         dlerror(); // clear existing
-        // Create a new component
-        comp_ptr = (*create_func)(create_arg);
-    } else {
-        // Empty create function
-        using function_ptr = std::shared_ptr<composite::component> (*)();
-        auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
-        if (auto err = dlerror(); err != nullptr) {
-            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", comp_str, err);
-            return {};
-        }
-        dlerror(); // clear existing
-        // Create a new component
-        comp_ptr = (*create_func)();
+        // Create a new component with id
+        comp_ptr = (*create_func)(comp_id);
     }
     if (comp_ptr == nullptr) {
-        spdlog::error("failed to create component {}", name);
+        spdlog::error("failed to create component '{}' from library {}", comp_id, library);
         return comp_ptr;
     }
-    // Set id if needed
-    if (comp_json.contains("id")) {
-        comp_ptr->id(comp_json["id"].get<std::string>());
-    } else {
-        comp_ptr->id(name);
-    }
+
     // Store handle for closing later
     handles.emplace_back(std::move(comp_handle));
     spdlog::trace("component {} created", comp_ptr->id());
