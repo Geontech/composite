@@ -90,9 +90,11 @@ values must be defined as strings.
 
 3. **components (required, array of objects):** An array where each object defines a component to be loaded into the application.
 Each component object must contain:
-    - **name (required, string):** The name of the shared object to be loaded (e.g., `"name": "my_component"` will attempt to load `libmy_component.so`).
-    - **id (optional, string):** When defining two components of the same name, a unique identifier must be provided with this field
-      to differentiate them. By default, the `id` is assigned the `name`. This identifier must also be used when making connections (see below).
+    - **id (required, string):** A unique identifier for this component instance. This identifier is used when making connections (see below)
+      and is passed to the component's constructor.
+    - **library (required, string):** The shared library to load. Can be either:
+      - A filename (e.g., `"libmy_component.so"`) - searched in `LD_LIBRARY_PATH` and standard library paths
+      - An absolute path (e.g., `"/path/to/libmy_component.so"`) - loaded from the specified location
     - **properties (optional, object):** Defines component-specific properties that can override application-level properties or
       provide unique configurations for this component. Just as with application-level properties, all property values must be defined
       as strings.
@@ -105,7 +107,8 @@ Each component object must contain:
     },
     "components": [
         {
-            "name": "my_component",
+            "id": "my_component_instance",
+            "library": "libmy_component.so",
             "properties": {
                 "specific_param": "123",
                 "processing_gain": "2.5"
@@ -132,16 +135,16 @@ port of one component and an input port of another component. Each connection ob
     },
     "components": [
         {
-            "name": "sensor_reader",
-            "id": "sensor"
+            "id": "sensor",
+            "library": "libsensor_reader.so"
         },
         {
-            "name": "data_processor",
-            "id": "processor"
+            "id": "processor",
+            "library": "libdata_processor.so"
         },
         {
-            "name": "file_writer",
-            "id": "writer"
+            "id": "writer",
+            "library": "libfile_writer.so"
         }
     ],
     "connections": [
@@ -168,9 +171,18 @@ Each component follows a well-defined interface that allows it to be integrated 
 
 Components are dynamically loaded at runtime as shared libraries:
 
-- **Library Naming**: Components must be named `lib<component_name>.so` (e.g., `libmy_component.so`)
-- **Factory Function**: Each component library must export a factory function that returns `std::shared_ptr<composite::component>`
-- **Component ID vs. Name**: When multiple instances of the same component are needed, use unique IDs (specified in JSON) to differentiate them
+- **Library Path**: The `library` field in configuration can specify either:
+  - A library filename (e.g., `"libmy_component.so"`) searched via `LD_LIBRARY_PATH` and standard locations
+  - An absolute path (e.g., `"/opt/components/libmy_component.so"`) for direct loading
+- **Factory Function**: Each component library must export a `create()` factory function with one of these signatures:
+  ```cpp
+  // For simple components:
+  auto create(std::string_view id) -> std::shared_ptr<composite::component>
+
+  // For components that need additional arguments:
+  auto create(std::string_view id, std::string_view arg) -> std::shared_ptr<composite::component>
+  ```
+- **Component ID**: Each component instance must have a unique ID (required in configuration), which is passed to the constructor and used for connections and logging
 
 ### Component Lifecycle
 
@@ -505,13 +517,13 @@ Properties are typically defined with a component's constructor by linking them 
 provided by the `component` base class:
 
 ```cpp
-#include <composite/component.hpp>
+#include <composite/composite.hpp>
 #include <optional>
 #include <string>
 
 class MyConfigurableComponent : public composite::component {
 public:
-    MyConfigurableComponent() : composite::component("MyConfigurableComponent") {
+    explicit MyConfigurableComponent(std::string_view id) : composite::component(id) {
         // Define a mandatory integer property with units and runtime configurability
         add_property("threshold", &m_threshold)
             .units("dB")
@@ -554,14 +566,14 @@ private:
 For properties that represent collections of values, use `add_list_property()`. List properties support indexing, appending, and clearing operations.
 
 ```cpp
-#include <composite/component.hpp>
+#include <composite/composite.hpp>
 #include <vector>
 
 class MyComponentWithList : public composite::component {
 public:
-    MyComponentWithList() : composite::component("MyComponentWithList") {
+    explicit MyComponentWithList(std::string_view id) : composite::component(id) {
         // Define a list property
-        add_property("thresholds", &m_thresholds)
+        add_list_property("thresholds", &m_thresholds)
             .configurability(composite::properties::config_type::RUNTIME);
 
         // Add an indexed change listener for validation
@@ -592,7 +604,7 @@ For more complex configurations, properties can be grouped into structures using
 (e.g., `"network.host"`, `"network.port"`) and better organization.
 
 ```cpp
-#include <composite/component.hpp>
+#include <composite/composite.hpp>
 #include <string>
 
 struct NetworkConfig {
@@ -603,7 +615,7 @@ struct NetworkConfig {
 
 class MyComponentWithStructProp : public composite::component {
 public:
-    MyComponentWithStructProp() : composite::component("MyComponentWithStructProp") {
+    explicit MyComponentWithStructProp(std::string_view id) : composite::component(id) {
         add_struct_property("network", &m_net_config,
             // This lambda registers the fields of the NetworkConfig struct
             [](auto& ps, auto* conf) {
@@ -628,7 +640,7 @@ private:
 For advanced use cases, you can combine lists and structures using `add_struct_list_property()`. This creates a vector of structured objects.
 
 ```cpp
-#include <composite/component.hpp>
+#include <composite/composite.hpp>
 #include <vector>
 
 struct Connection {
@@ -638,7 +650,7 @@ struct Connection {
 
 class MyComponentWithStructList : public composite::component {
 public:
-    MyComponentWithStructList() : composite::component("MyComponentWithStructList") {
+    explicit MyComponentWithStructList(std::string_view id) : composite::component(id) {
         add_struct_list_property("connections", &m_connections,
             [](auto& ps, auto* conn) {
                 ps.add_property("host", &conn->host);
@@ -854,12 +866,11 @@ To create a new component, developers must implement the required interface func
 compatibility with the **composite** framework. Example:
 
 ```cpp
-#include <composite/component.hpp>
-#include <composite/buffer.hpp>
+#include <composite/composite.hpp>
 
 class MyComponent : public composite::component {
 public:
-    MyComponent() : composite::component("MyComponent") {
+    explicit MyComponent(std::string_view id) : composite::component(id) {
         // Add ports to port set
         add_port(&m_in_port);
         add_port(&m_out_port);
@@ -933,4 +944,18 @@ private:
     float m_processing_gain{1.0f}; // example property with a default value
 
 }; // class MyComponent
+
+// Export the factory function for dynamic loading
+extern "C" {
+    auto create(std::string_view id) -> std::shared_ptr<composite::component> {
+        return std::make_shared<MyComponent>(id);
+    }
+}
 ```
+
+**Factory Function Requirements:**
+- Must be declared `extern "C"` to prevent C++ name mangling
+- Must be named `create`
+- Must accept `std::string_view id` as the first parameter
+- For components that need additional configuration, add a second `std::string_view arg` parameter
+- Must return `std::shared_ptr<composite::component>`

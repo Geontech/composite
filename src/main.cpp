@@ -35,6 +35,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <unordered_set>
 #include <vector>
 
 namespace composite {
@@ -54,7 +55,9 @@ auto make_server(application&, composite::component_handles_type&) -> std::uniqu
 } // namespace composite
 
 auto main(int argc, char** argv) -> int {
-    // Create argument parser with options
+    // ========================================
+    // Argument Parsing
+    // ========================================
     auto program = argparse::ArgumentParser{"composite-cli", VERSION};
     program.add_argument("config-file")
       .help("application configuration file");
@@ -80,7 +83,6 @@ auto main(int argc, char** argv) -> int {
       .help("log level [trace, debug, info, warning, error, critical, off]")
       .default_value(std::string{"info"});
 
-    // Parse arguments
     try {
         program.parse_args(argc, argv);
     } catch (const std::runtime_error& err) {
@@ -89,7 +91,9 @@ auto main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
     }
 
-    // Setup signal handlers
+    // ========================================
+    // Signal Handler Setup
+    // ========================================
     sigset_t sigset;
     sigemptyset(&sigset);
     sigaddset(&sigset, SIGINT);
@@ -99,12 +103,16 @@ auto main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
     }
 
-    // Setup logging
+    // ========================================
+    // Logging Configuration
+    // ========================================
     auto level = spdlog::level::from_str(program.get<std::string>("--log-level"));
     spdlog::set_level(level);
 
 #ifdef COMPOSITE_USE_OPENSSL
-    // Check certificate and key files exist
+    // ========================================
+    // TLS Certificate Validation
+    // ========================================
     auto ca_path = program.get<std::string>("--certificate-authority");
     auto cert_path = program.get<std::string>("--client-certificate");
     auto key_path = program.get<std::string>("--client-key");
@@ -112,8 +120,8 @@ auto main(int argc, char** argv) -> int {
         spdlog::error("client certificate file not found at {}", cert_path);
         return EXIT_FAILURE;
     }
-    if (!std::filesystem::exists(cert_path)) {
-        spdlog::error("client key file not found at {}", cert_path);
+    if (!std::filesystem::exists(key_path)) {
+        spdlog::error("client key file not found at {}", key_path);
         return EXIT_FAILURE;
     }
     if (!ca_path.empty() && !std::filesystem::exists(ca_path)) {
@@ -122,16 +130,33 @@ auto main(int argc, char** argv) -> int {
     }
 #endif
 
-    // Get configuration file, then read and parse
+    // ========================================
+    // Configuration File Parsing
+    // ========================================
     auto config_file = program.get<std::string>("config-file");
+
+    // Validate config file exists
+    if (!std::filesystem::exists(config_file)) {
+        spdlog::error("config file not found: {}", config_file);
+        return EXIT_FAILURE;
+    }
+
     spdlog::info("Using config file at: {}", config_file);
     auto config_ifstream = std::ifstream{config_file};
-    auto app_json = nlohmann::json::parse(config_ifstream);
 
-    // Component handle holders
+    // Parse JSON with error handling
+    nlohmann::json app_json;
+    try {
+        app_json = nlohmann::json::parse(config_ifstream);
+    } catch (const nlohmann::json::parse_error& e) {
+        spdlog::error("failed to parse config file: {}", e.what());
+        return EXIT_FAILURE;
+    }
+
+    // ========================================
+    // Application Initialization
+    // ========================================
     auto comp_handles = composite::component_handles_type{};
-
-    // Create a new application object
     auto app_name = composite::generate_app_name();
     if (app_json.contains("name")) {
         app_name = app_json["name"].get<std::string>();
@@ -139,12 +164,56 @@ auto main(int argc, char** argv) -> int {
     pthread_setname_np(pthread_self(), app_name.c_str());
     auto app = composite::application{app_name};
 
-    // Get components and load them
+    // ========================================
+    // Component Configuration Validation
+    // ========================================
+    // Validate components field exists
+    if (!app_json.contains("components")) {
+        spdlog::error("config file missing 'components' field");
+        return EXIT_FAILURE;
+    }
+    if (!app_json["components"].is_array()) {
+        spdlog::error("'components' field must be an array");
+        return EXIT_FAILURE;
+    }
+
+    // Validate component definitions and check for duplicates
+    auto component_ids = std::unordered_set<std::string>{};
     for (const auto& comp : app_json["components"]) {
-        // Add component to application
+        // Validate required fields
+        if (!comp.contains("id")) {
+            spdlog::error("component missing required 'id' field: {}", comp.dump());
+            return EXIT_FAILURE;
+        }
+        if (!comp.contains("library")) {
+            spdlog::error("component missing required 'library' field: {}", comp.dump());
+            return EXIT_FAILURE;
+        }
+
+        // Check for duplicate IDs
+        auto comp_id = comp["id"].get<std::string>();
+        if (component_ids.contains(comp_id)) {
+            spdlog::error("duplicate component id: '{}'", comp_id);
+            return EXIT_FAILURE;
+        }
+        component_ids.insert(comp_id);
+    }
+
+    // ========================================
+    // Component Loading and Configuration
+    // ========================================
+    // Error handler that cleans up application resources
+    auto cleanup_and_exit = [&app](std::string_view msg) {
+        spdlog::error("{}", msg);
+        app.clear();
+        return EXIT_FAILURE;
+    };
+
+    for (const auto& comp : app_json["components"]) {
+        // Load component from library
         auto comp_ptr = composite::make_component(comp, comp_handles);
         if (comp_ptr == nullptr) {
-            return EXIT_FAILURE;
+            return cleanup_and_exit("failed to load component");
         }
         // Set log level
         comp_ptr->log_level(level);
@@ -181,72 +250,71 @@ auto main(int argc, char** argv) -> int {
                 comp_ptr->property_change_handler();
             }
         } catch (const std::runtime_error& err) {
-            spdlog::error(err.what());
-            return EXIT_FAILURE;
+            return cleanup_and_exit(std::format("property error for component '{}': {}", comp_ptr->id(), err.what()));
         }
         // Add to application
         spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
         app.add_component(comp_ptr);
     }
 
-    // Parse transport definitions from configuration
+    // ========================================
+    // Transport Registry Setup
+    // ========================================
     auto transport_registry = composite::transport_registry{};
     if (app_json.contains("transports")) {
         spdlog::trace("parsing transport definitions");
         auto [registry, error] = composite::parse_transports(app_json["transports"]);
         if (!error.empty()) {
-            spdlog::error("failed to parse transports: {}", error);
-            return EXIT_FAILURE;
+            return cleanup_and_exit(std::format("failed to parse transports: {}", error));
         }
         transport_registry = std::move(registry);
         spdlog::debug("parsed {} transport definition(s)", transport_registry.size());
     }
 
-    // Attach transports to component ports
+    // ========================================
+    // Transport Attachment
+    // ========================================
     for (const auto& comp : app_json["components"]) {
         if (!comp.contains("transports")) {
             continue;
         }
 
-        auto comp_id = comp.contains("id") ? comp["id"].get<std::string>() : comp["name"].get<std::string>();
+        auto comp_id = comp["id"].get<std::string>();
         auto comp_ptr = app.get_component(comp_id);
         if (comp_ptr == nullptr) {
-            spdlog::error("component '{}' not found when attaching transports", comp_id);
-            return EXIT_FAILURE;
+            return cleanup_and_exit(std::format("component '{}' not found when attaching transports", comp_id));
         }
 
         spdlog::trace("attaching transports to component '{}'", comp_id);
         auto error = composite::attach_component_transports(comp_ptr, comp["transports"], transport_registry);
         if (!error.empty()) {
-            spdlog::error("failed to attach transports to '{}': {}", comp_id, error);
-            return EXIT_FAILURE;
+            return cleanup_and_exit(std::format("failed to attach transports to '{}': {}", comp_id, error));
         }
     }
 
-    // Make connections
-    auto conn_exit = [&app](std::string_view msg) {
-        spdlog::error(msg);
-        app.clear();
-        return EXIT_FAILURE;
-    };
+    // ========================================
+    // Component Connections
+    // ========================================
     for (const auto& conn : app_json["connections"]) {
         if (!conn.contains("output")) {
-            return conn_exit(std::format("missing output for connection: {}", conn.dump()));
+            return cleanup_and_exit(std::format("missing output for connection: {}", conn.dump()));
         }
         if (!conn.contains("input")) {
-            return conn_exit(std::format("missing output for connection: {}", conn.dump()));
+            return cleanup_and_exit(std::format("missing input for connection: {}", conn.dump()));
         }
+
         // Validate output section
         auto output = conn["output"];
         auto [output_comp, output_port, oerror] = composite::validate_connection(output);
         if (!oerror.empty()) {
-            return conn_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
+            return cleanup_and_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
         }
+
         // Validate input section
         auto input = conn["input"];
         auto [input_comp, input_port, ierror] = composite::validate_connection(input);
         if (!ierror.empty()) {
-            return conn_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
+            return cleanup_and_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
         }
 
         spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
@@ -254,22 +322,24 @@ auto main(int argc, char** argv) -> int {
         // Get the output component
         auto output_comp_ptr = app.get_component(output_comp);
         if (output_comp_ptr == nullptr) {
-            return conn_exit(std::format("output component {} not found: {}", output_comp, conn.dump()));
+            return cleanup_and_exit(std::format("output component '{}' not found", output_comp));
         }
 
         // Get the input component
         auto input_comp_ptr = app.get_component(input_comp);
         if (input_comp_ptr == nullptr) {
-            return conn_exit(std::format("input component {} not found: {}", input_comp, conn.dump()));
+            return cleanup_and_exit(std::format("input component '{}' not found", input_comp));
         }
 
         // Connect the ports
         if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-            return conn_exit(std::format("Failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+            return cleanup_and_exit(std::format("failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
         }
     }
 
-    // Create REST server for c&c
+    // ========================================
+    // REST Server Setup
+    // ========================================
     auto server_addr = program.get<std::string>("--server");
     auto server_port = program.get<int>("--port");
 #ifdef COMPOSITE_USE_OPENSSL
@@ -278,7 +348,9 @@ auto main(int argc, char** argv) -> int {
     auto server = composite::make_server(app, comp_handles);
 #endif
 
-    // Create the signal handling thread
+    // ========================================
+    // Signal Handler Thread
+    // ========================================
     auto signal_future = std::async(std::launch::async, [sigset]() mutable -> int {
         auto signum = int{};
         if (auto rc = sigwait(&sigset, &signum); rc != 0) {
@@ -289,6 +361,9 @@ auto main(int argc, char** argv) -> int {
         return signum;
     });
 
+    // ========================================
+    // Application Lifecycle
+    // ========================================
     try {
         // Initialize the application
         spdlog::trace("initializing application '{}'", app.name());
