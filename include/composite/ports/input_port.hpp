@@ -106,6 +106,14 @@ public:
     ~input_port() override = default;
 
     /**
+     * @brief Get type index for element type T
+     * @return std::type_index for type T
+     */
+    auto element_type() const -> std::type_index override {
+        return std::type_index(typeid(T));
+    }
+
+    /**
      * @brief Get type identifier for element type T
      * @return Hash code from typeid(T)
      */
@@ -313,6 +321,14 @@ public:
      * @brief Inherit constructor from input_port_base
      */
     using input_port_base::input_port_base;
+
+    /**
+     * @brief Get type index for element type T
+     * @return std::type_index for type T
+     */
+    auto element_type() const -> std::type_index override {
+        return std::type_index(typeid(T));
+    }
 
     /**
      * @brief Get type identifier for element type T

@@ -1012,4 +1012,4 @@ auto make_aligned_immutable_buffer(std::size_t alignment, std::size_t count) -> 
     return make_aligned_buffer<T>(alignment, count).to_immutable();
 }
 
- } // namespace composite
+} // namespace composite
