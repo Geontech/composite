@@ -130,19 +130,18 @@ public:
         // Check element type compatibility
         if (out_port->element_type_id() != in_port->element_type_id()) {
             m_logger->error(
-              "type mismatch connecting {}:{} to {}:{}",
-              id(), output_port_name,
-              other->id(), input_port_name,
-              out_port->element_type_id(), in_port->element_type_id()
+                "type mismatch connecting {}:{} ({}) to {}:{} ({})",
+                id(), output_port_name, out_port->element_type().name(),
+                other->id(), input_port_name, in_port->element_type().name()
             );
             return false;
         }
 
         // Log mutability information for transfer optimization transparency
         m_logger->trace(
-          "connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})",
-          id(), output_port_name, out_port->is_mutable() ? "mutable" : "immutable",
-          other->id(), input_port_name, in_port->is_mutable() ? "mutable" : "immutable"
+            "connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})",
+            id(), output_port_name, out_port->is_mutable() ? "mutable" : "immutable",
+            other->id(), input_port_name, in_port->is_mutable() ? "mutable" : "immutable"
         );
 
         // Make the connection

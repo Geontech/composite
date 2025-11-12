@@ -83,6 +83,14 @@ public:
     ~output_port() override = default;
 
     /**
+     * @brief Get type index for element type T
+     * @return std::type_index for type T
+     */
+    auto element_type() const -> std::type_index override {
+        return std::type_index(typeid(T));
+    }
+
+    /**
      * @brief Get type identifier for element type T
      * @return Hash code from typeid(T)
      */
@@ -118,19 +126,19 @@ public:
         // Lock connection list for thread-safe access
         const auto lock = std::scoped_lock{m_connection_mtx};
 
-        for (auto* port_base : m_connected_ports) {
-            if (port_base == nullptr) { continue; };
+        for (const auto& port : m_connected_ports) {
+            if (port == nullptr) { continue; };
 
-            if (port_base->is_mutable()) {
+            if (port->is_mutable()) {
                 // immutable → mutable: Must perform deep copy
-                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port_base);
+                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
 
                 // Create mutable copy from immutable data
                 auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
                 mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts);
             } else {
                 // immutable → immutable: Zero-copy share (optimal)
-                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port_base);
+                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
                 immutable_port->add_data(buffer.share(), ts);
             }
         }
@@ -214,6 +222,14 @@ public:
     ~output_port() override = default;
 
     /**
+     * @brief Get type index for element type T
+     * @return std::type_index for type T
+     */
+    auto element_type() const -> std::type_index override {
+        return std::type_index(typeid(T));
+    }
+
+    /**
      * @brief Get type identifier for element type T
      * @return Hash code from typeid(T)
      */
@@ -264,36 +280,35 @@ public:
         if (m_connected_ports.empty()) { return; };
 
         if (m_connected_ports.size() == 1) {
-            auto* port_base = m_connected_ports.at(0);
-            if (port_base == nullptr) { return; };
+            const auto& port = m_connected_ports.at(0);
+            if (port == nullptr) { return; };
 
-            if (port_base->is_mutable()) {
+            if (port->is_mutable()) {
                 // Mutable to mutable: direct move
-                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port_base);
+                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
                 mutable_port->add_data(std::move(buffer), ts);
             } else {
                 // Mutable to immutable: promote
-                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port_base);
+                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
                 immutable_port->add_data(std::move(buffer).to_immutable(), ts);
             }
         } else {
             // Fan-out: handle multiple outputs
             for (std::size_t i = 0; i < m_connected_ports.size() - 1; ++i) {
-                auto* port_base = m_connected_ports.at(i);
-                if (port_base == nullptr) { continue; };
+                const auto& port = m_connected_ports.at(i);
+                if (port == nullptr) { continue; };
 
-                if (port_base->is_mutable()) {
-                    auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port_base);
+                if (port->is_mutable()) {
+                    auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
                     mutable_port->add_data(buffer.copy(), ts);
                 } else {
-                    auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port_base);
-                    // Convert copy to immutable
+                    auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
                     immutable_port->add_data(buffer.copy().to_immutable(), ts);
                 }
             }
 
             // Last output: move
-            auto* last_port = m_connected_ports.back();
+            const auto& last_port = m_connected_ports.back();
             if (last_port != nullptr) {
                 if (last_port->is_mutable()) {
                     auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(last_port);

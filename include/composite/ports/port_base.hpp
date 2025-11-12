@@ -30,6 +30,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <typeindex>
+#include <utility>
 #include <vector>
 
 namespace composite {
@@ -62,6 +64,14 @@ public:
      * @return Port name as string_view
      */
     auto name() const -> std::string_view { return m_name; }
+
+    /**
+     * @brief Get type index for the element type (T in buffer<T>)
+     * @return std::type_index for compile-time type information
+     *
+     * Used for transformation lookup and diagnostic output.
+     */
+    virtual auto element_type() const -> std::type_index = 0;
 
     /**
      * @brief Get type identifier for the element type (T in buffer<T>)
@@ -319,7 +329,7 @@ public:
         const auto lock = std::scoped_lock{m_connection_mtx};
         std::vector<std::string> names;
         names.reserve(m_connected_ports.size());
-        for (const auto* port : m_connected_ports) {
+        for (const auto& port : m_connected_ports) {
             if (port != nullptr) {
                 names.emplace_back(port->name());  // Convert string_view to string
             }
@@ -358,7 +368,7 @@ public:
      */
     auto send_metadata(const composite::metadata& value) const -> void {
         const auto lock = std::scoped_lock{m_connection_mtx};
-        for (auto* port : m_connected_ports) {
+        for (const auto& port : m_connected_ports) {
             if (port != nullptr) {
                 port->metadata(value);
             }
@@ -386,7 +396,7 @@ public:
      */
     auto can_send() const -> bool {
         const auto lock = std::scoped_lock{m_connection_mtx};
-        for (const auto* port : m_connected_ports) {
+        for (const auto& port : m_connected_ports) {
             if (port != nullptr && !port->is_full()) {
                 return true;
             }

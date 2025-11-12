@@ -52,6 +52,13 @@ auto generate_app_name() -> std::string {
 auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component> {
     // Get component library path/name
     auto library = comp_json["library"].get<std::string>();
+
+    // Transform library name if it doesn't end with .so
+    // If just a component name like "udp_source", convert to "libudp_source.so"
+    if (!library.ends_with(".so")) {
+        library = std::format("lib{}.so", library);
+    }
+
     spdlog::trace("loading component library: {}", library);
 
     // Get component module handle
