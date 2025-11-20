@@ -362,4 +362,35 @@ auto attach_component_transports(
     return "";
 }
 
+auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config {
+    dpdk::config config;
+
+    // Parse EAL arguments
+    if (dpdk_json.contains("eal_args") && dpdk_json["eal_args"].is_array()) {
+        config.eal_args = dpdk_json["eal_args"].get<std::vector<std::string>>();
+    }
+
+    // Parse port configurations
+    if (dpdk_json.contains("ports") && dpdk_json["ports"].is_array()) {
+        for (const auto& port_json : dpdk_json["ports"]) {
+            dpdk::port_config port;
+
+            port.port_id = port_json.value("port_id", 0);
+            port.interface = port_json.value("interface", "");
+            port.rx_queues = port_json.value("rx_queues", 1);
+            port.tx_queues = port_json.value("tx_queues", 1);
+            port.rx_descriptors = port_json.value("rx_descriptors", 1024);
+            port.tx_descriptors = port_json.value("tx_descriptors", 1024);
+            port.mempool_name = port_json.value("mempool_name", "mbuf_pool");
+            port.mempool_size = port_json.value("mempool_size", 8192);
+            port.mempool_cache_size = port_json.value("mempool_cache_size", 256);
+            port.mbuf_data_room_size = port_json.value("mbuf_data_room_size", 2048);
+
+            config.ports.push_back(port);
+        }
+    }
+
+    return config;
+}
+
 } // namespace composite

@@ -74,6 +74,13 @@ public:
         m_enabled = true;
         m_thread.emplace(&component::thread_func, this);
         pthread_setname_np(m_thread->native_handle(), m_id.c_str());
+
+        // Apply CPU affinity if configured
+        if (m_cpu_affinity.has_value()) {
+            if (pthread_setaffinity_np(m_thread->native_handle(), sizeof(*m_cpu_affinity), &(*m_cpu_affinity)) != 0) {
+                m_logger->warn("Failed to set thread CPU affinity: {}", strerror(errno));
+            }
+        }
     }
 
     auto stop() -> void override {
@@ -304,6 +311,17 @@ public:
     }
 
     /**
+     * @brief Set the CPU affinity for this component's thread
+     * @param cpuset CPU set to apply when thread starts
+     *
+     * This must be called before start(). The affinity will be applied
+     * when the component thread is created.
+     */
+    auto set_cpu_affinity(const cpu_set_t& cpuset) -> void {
+        m_cpu_affinity = cpuset;
+    }
+
+    /**
      * @brief Apply pending lifecycle changes based on enabled property
      *
      * Must be called after set_properties() completes to avoid deadlock.
@@ -362,6 +380,7 @@ private:
     std::optional<std::jthread> m_thread;
     uint32_t m_delay{DEFAULT_DELAY};
     bool m_enabled{true};
+    std::optional<cpu_set_t> m_cpu_affinity;
     port_set m_port_set;
     property_set m_prop_set;
     std::mutex m_prop_mtx;
@@ -413,7 +432,18 @@ private:
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
             auto lk = std::scoped_lock{m_prop_mtx};
-            auto res = process();
+            retval res;
+            try {
+                res = process();
+            } catch (const std::exception& e) {
+                logger()->error("component '{}' process() threw an exception: {}; pausing input ports and stopping thread.", m_id, e.what());
+                pause_input_ports();
+                res = FINISH;
+            } catch (...) {
+                logger()->error("component '{}' process() threw an unknown exception; pausing input ports and stopping thread.", m_id);
+                pause_input_ports();
+                res = FINISH;
+            }
             if (res == NOOP) {
                 std::this_thread::sleep_for(std::chrono::nanoseconds{m_delay});
             } else if (res == FINISH) {

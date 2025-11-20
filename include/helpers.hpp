@@ -20,6 +20,7 @@
 #pragma once
 
 #include "composite/core/component.hpp"
+#include "composite/dpdk/config.hpp"
 #include "composite/transports/transport.hpp"
 
 #include <dlfcn.h>
@@ -112,5 +113,26 @@ auto attach_component_transports(
   const nlohmann::json& transports_json,
   const transport_registry& registry
 ) -> std::string;
+
+/**
+ * @brief Parse DPDK configuration from JSON
+ * @param dpdk_json JSON object containing DPDK configuration
+ * @return DPDK configuration structure
+ *
+ * Expected JSON format:
+ * {
+ *   "enabled": true,
+ *   "eal_args": ["-l", "0-3", "-n", "4"],
+ *   "ports": [
+ *     {
+ *       "port_id": 0,
+ *       "interface": "eth0",
+ *       "rx_queues": 4,
+ *       ...
+ *     }
+ *   ]
+ * }
+ */
+auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config;
 
 } // namespace composite
