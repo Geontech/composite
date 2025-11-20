@@ -16,13 +16,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
- 
+
 # Executable
 add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/property_rest_api.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu_affinity.cpp
 )
 # Set RPATH property
 if(COMPOSITE_EMBED_MODULE_RPATH)
@@ -37,6 +38,9 @@ else()
 endif()
 # Compile definitions
 target_compile_definitions(composite-cli PRIVATE CPPHTTPLIB_THREAD_POOL_COUNT=2)
+if(COMPOSITE_USE_DPDK)
+    target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_DPDK=1)
+endif()
 if(COMPOSITE_USE_OPENSSL)
     target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_OPENSSL=1)
 endif()
@@ -51,6 +55,7 @@ target_include_directories(composite-cli
 # Linkage
 target_link_libraries(composite-cli
     PRIVATE
+    composite::composite
     argparse
     nlohmann_json::nlohmann_json
     spdlog::spdlog_header_only
@@ -61,5 +66,11 @@ if(COMPOSITE_USE_NATS)
     target_link_libraries(composite-cli
         PRIVATE
         nats
+    )
+endif()
+if(COMPOSITE_USE_DPDK)
+    target_link_libraries(composite-cli
+        PRIVATE
+        ${DPDK_LIBRARIES}
     )
 endif()

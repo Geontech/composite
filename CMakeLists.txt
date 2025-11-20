@@ -89,6 +89,14 @@ if(COMPOSITE_USE_NATS)
     file(COPY ${cnats_SOURCE_DIR}/src/ DESTINATION ${PROJECT_BINARY_DIR}/include/nats/ FILES_MATCHING PATTERN "*.h")
 endif()
 
+# DPDK support
+option(COMPOSITE_USE_DPDK "Compile with DPDK support" OFF)
+if(COMPOSITE_USE_DPDK)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(DPDK REQUIRED libdpdk)
+    message(STATUS "Found DPDK: ${DPDK_VERSION}")
+endif()
+
 # OpenSSL support
 option(COMPOSITE_USE_OPENSSL "Compile with OpenSSL support" OFF)
 if(COMPOSITE_USE_OPENSSL)

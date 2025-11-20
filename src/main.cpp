@@ -18,9 +18,14 @@
  */
 
 #include "composite/core/application.hpp"
+#include "composite/util/cpu_affinity.hpp"
 #include "composite/version.hpp"
 #include "helpers.hpp"
 #include "property_changeset.hpp"
+
+#ifdef COMPOSITE_USE_DPDK
+#include "composite/dpdk/manager.hpp"
+#endif
 
 #include <argparse/argparse.hpp>
 #include <atomic>
@@ -82,6 +87,11 @@ auto main(int argc, char** argv) -> int {
     program.add_argument("-l", "--log-level")
       .help("log level [trace, debug, info, warning, error, critical, off]")
       .default_value(std::string{"info"});
+#ifdef COMPOSITE_USE_DPDK
+    program.add_argument("--list-dpdk-ports")
+      .help("list available DPDK ports and exit")
+      .flag();
+#endif
 
     try {
         program.parse_args(argc, argv);
@@ -109,26 +119,31 @@ auto main(int argc, char** argv) -> int {
     auto level = spdlog::level::from_str(program.get<std::string>("--log-level"));
     spdlog::set_level(level);
 
-#ifdef COMPOSITE_USE_OPENSSL
     // ========================================
-    // TLS Certificate Validation
+    // CPU Affinity Capture
     // ========================================
-    auto ca_path = program.get<std::string>("--certificate-authority");
-    auto cert_path = program.get<std::string>("--client-certificate");
-    auto key_path = program.get<std::string>("--client-key");
-    if (!std::filesystem::exists(cert_path)) {
-        spdlog::error("client certificate file not found at {}", cert_path);
-        return EXIT_FAILURE;
+    // Get available CPUs from cgroups/container for affinity mapping
+    std::vector<int> available_cores;
+    if (auto cpuset_opt = composite::get_available_cpus()) {
+        const auto& cpuset = *cpuset_opt;
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            if (CPU_ISSET(cpu, &cpuset)) {
+                available_cores.push_back(cpu);
+            }
+        }
+        spdlog::info("Captured {} available CPU cores for component affinity", available_cores.size());
+        spdlog::debug("Available physical CPU cores: [{}]",
+            [&available_cores]() {
+                std::string result;
+                for (size_t i = 0; i < available_cores.size(); i++) {
+                    if (i > 0) result += ", ";
+                    result += std::to_string(available_cores[i]);
+                }
+                return result;
+            }());
+    } else {
+        spdlog::warn("Failed to capture available CPUs, component cpu_affinity will not be available");
     }
-    if (!std::filesystem::exists(key_path)) {
-        spdlog::error("client key file not found at {}", key_path);
-        return EXIT_FAILURE;
-    }
-    if (!ca_path.empty() && !std::filesystem::exists(ca_path)) {
-        spdlog::error("certificate authority file not found at {}", ca_path);
-        return EXIT_FAILURE;
-    }
-#endif
 
     // ========================================
     // Configuration File Parsing
@@ -153,6 +168,195 @@ auto main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
     }
 
+#ifdef COMPOSITE_USE_DPDK
+    bool dpdk_initialized = false;
+    auto shutdown_dpdk = [&]() {
+        if (!dpdk_initialized) {
+            return;
+        }
+        spdlog::trace("shutting down DPDK");
+        composite::dpdk::manager::instance().shutdown();
+        dpdk_initialized = false;
+    };
+
+    // ========================================
+    // DPDK Port Discovery (early exit if requested)
+    // ========================================
+    if (program.get<bool>("--list-dpdk-ports")) {
+        // Check if DPDK is configured
+        if (!app_json.contains("dpdk")) {
+            spdlog::error("DPDK config not found");
+            return EXIT_FAILURE;
+        }
+        if (!app_json["dpdk"].contains("enabled")) {
+            spdlog::error("DPDK enable flag not found in config");
+            return EXIT_FAILURE;
+        }
+        if (!app_json["dpdk"]["enabled"].get<bool>()) {
+            spdlog::warn("DPDK not enabled in configuration file");
+            return EXIT_SUCCESS;
+        }
+
+        // Initialize DPDK
+        auto dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
+        if (!composite::dpdk::manager::instance().initialize(dpdk_cfg)) {
+            spdlog::error("failed to initialize DPDK");
+            return EXIT_FAILURE;
+        }
+        dpdk_initialized = true;
+
+        // List ports
+        spdlog::info("Available DPDK Ports");
+        spdlog::info("====================");
+
+        auto& mgr = composite::dpdk::manager::instance();
+        if (mgr.get_port_count() == 0) {
+            spdlog::info("No ports configured");
+        } else {
+            for (const auto& port_cfg : dpdk_cfg.ports) {
+                spdlog::info(
+                    std::format("Port {}: interface={}, rx_queues={}, mempool={}",
+                        port_cfg.port_id,
+                        port_cfg.interface,
+                        port_cfg.rx_queues,
+                    port_cfg.mempool_name
+                    )
+                );
+            }
+        }
+
+        // Cleanup and exit
+        shutdown_dpdk();
+        return EXIT_SUCCESS;
+    }
+#else
+    auto shutdown_dpdk = [](){};
+#endif
+
+#ifdef COMPOSITE_USE_OPENSSL
+    // ========================================
+    // TLS Certificate Validation
+    // ========================================
+    auto ca_path = program.get<std::string>("--certificate-authority");
+    auto cert_path = program.get<std::string>("--client-certificate");
+    auto key_path = program.get<std::string>("--client-key");
+    if (!std::filesystem::exists(cert_path)) {
+        spdlog::error("client certificate file not found at {}", cert_path);
+        return EXIT_FAILURE;
+    }
+    if (!std::filesystem::exists(key_path)) {
+        spdlog::error("client key file not found at {}", key_path);
+        return EXIT_FAILURE;
+    }
+    if (!ca_path.empty() && !std::filesystem::exists(ca_path)) {
+        spdlog::error("certificate authority file not found at {}", ca_path);
+        return EXIT_FAILURE;
+    }
+#endif
+
+#ifdef COMPOSITE_USE_DPDK
+    // ========================================
+    // DPDK Initialization
+    // ========================================
+    std::vector<int> dpdk_logical_cores;
+    if (app_json.contains("dpdk") && app_json["dpdk"].contains("enabled") && app_json["dpdk"]["enabled"].get<bool>()) {
+        spdlog::debug("initializing DPDK");
+        auto dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
+
+        // Translate DPDK EAL args from logical to physical cores
+        if (!available_cores.empty()) {
+            auto [translated_args, logical_cores] =
+                composite::translate_dpdk_eal_args(dpdk_cfg.eal_args, available_cores);
+            dpdk_cfg.eal_args = translated_args;
+            dpdk_logical_cores = logical_cores;
+
+            // Log the DPDK core allocation
+            if (!dpdk_logical_cores.empty()) {
+                std::string dpdk_cores_str;
+                std::string physical_cores_str;
+                for (size_t i = 0; i < dpdk_logical_cores.size(); i++) {
+                    if (i > 0) {
+                        dpdk_cores_str += ", ";
+                        physical_cores_str += ", ";
+                    }
+                    int logical = dpdk_logical_cores[i];
+                    dpdk_cores_str += std::to_string(logical);
+                    physical_cores_str += std::to_string(available_cores[logical]);
+                }
+                spdlog::info("DPDK cores: logical [{}] -> physical [{}]",
+                    dpdk_cores_str, physical_cores_str);
+            }
+        }
+
+        if (!composite::dpdk::manager::instance().initialize(dpdk_cfg)) {
+            spdlog::error("failed to initialize DPDK");
+            return EXIT_FAILURE;
+        }
+        dpdk_initialized = true;
+
+        // If no lcores were specified in config, query DPDK to see what it chose
+        if (dpdk_logical_cores.empty() && !available_cores.empty()) {
+            auto dpdk_physical_cores = composite::dpdk::manager::instance().get_dpdk_lcores();
+            if (!dpdk_physical_cores.empty()) {
+                // Map physical cores back to logical indices
+                for (int physical_core : dpdk_physical_cores) {
+                    auto it = std::find(available_cores.begin(), available_cores.end(), physical_core);
+                    if (it != available_cores.end()) {
+                        int logical_idx = std::distance(available_cores.begin(), it);
+                        dpdk_logical_cores.push_back(logical_idx);
+                    }
+                }
+
+                // Log what DPDK chose
+                if (!dpdk_logical_cores.empty()) {
+                    std::string dpdk_cores_str;
+                    std::string physical_cores_str;
+                    for (size_t i = 0; i < dpdk_logical_cores.size(); i++) {
+                        if (i > 0) {
+                            dpdk_cores_str += ", ";
+                            physical_cores_str += ", ";
+                        }
+                        int logical = dpdk_logical_cores[i];
+                        dpdk_cores_str += std::to_string(logical);
+                        physical_cores_str += std::to_string(available_cores[logical]);
+                    }
+                    spdlog::info("DPDK auto-detected cores: logical [{}] -> physical [{}]",
+                        dpdk_cores_str, physical_cores_str);
+                }
+            }
+        }
+
+        // Move main thread off DPDK cores to avoid interfering with polling
+        if (!dpdk_logical_cores.empty() && !available_cores.empty()) {
+            cpu_set_t non_dpdk_cpuset;
+            CPU_ZERO(&non_dpdk_cpuset);
+
+            // Build set of non-DPDK physical cores
+            for (size_t i = 0; i < available_cores.size(); i++) {
+                bool is_dpdk = std::find(dpdk_logical_cores.begin(),
+                    dpdk_logical_cores.end(), static_cast<int>(i)) != dpdk_logical_cores.end();
+                if (!is_dpdk) {
+                    CPU_SET(available_cores[i], &non_dpdk_cpuset);
+                }
+            }
+
+            if (CPU_COUNT(&non_dpdk_cpuset) > 0) {
+                if (pthread_setaffinity_np(pthread_self(), sizeof(non_dpdk_cpuset), &non_dpdk_cpuset) == 0) {
+                    spdlog::info("Moved main thread to {} non-DPDK cores", CPU_COUNT(&non_dpdk_cpuset));
+                } else {
+                    spdlog::warn("Failed to move main thread off DPDK cores: {}", strerror(errno));
+                }
+            } else {
+                spdlog::warn("All cores assigned to DPDK, main thread cannot be moved off");
+            }
+        }
+
+        spdlog::info("DPDK initialized with {} port(s)", dpdk_cfg.ports.size());
+    }
+#else
+    std::vector<int> dpdk_logical_cores;  // Empty when DPDK not enabled
+#endif
+
     // ========================================
     // Application Initialization
     // ========================================
@@ -170,10 +374,12 @@ auto main(int argc, char** argv) -> int {
     // Validate components field exists
     if (!app_json.contains("components")) {
         spdlog::error("config file missing 'components' field");
+        shutdown_dpdk();
         return EXIT_FAILURE;
     }
     if (!app_json["components"].is_array()) {
         spdlog::error("'components' field must be an array");
+        shutdown_dpdk();
         return EXIT_FAILURE;
     }
 
@@ -183,10 +389,12 @@ auto main(int argc, char** argv) -> int {
         // Validate required fields
         if (!comp.contains("id")) {
             spdlog::error("component missing required 'id' field: {}", comp.dump());
+            shutdown_dpdk();
             return EXIT_FAILURE;
         }
         if (!comp.contains("library")) {
             spdlog::error("component missing required 'library' field: {}", comp.dump());
+            shutdown_dpdk();
             return EXIT_FAILURE;
         }
 
@@ -194,6 +402,7 @@ auto main(int argc, char** argv) -> int {
         auto comp_id = comp["id"].get<std::string>();
         if (component_ids.contains(comp_id)) {
             spdlog::error("duplicate component id: '{}'", comp_id);
+            shutdown_dpdk();
             return EXIT_FAILURE;
         }
         component_ids.insert(comp_id);
@@ -203,9 +412,10 @@ auto main(int argc, char** argv) -> int {
     // Component Loading and Configuration
     // ========================================
     // Error handler that cleans up application resources
-    auto cleanup_and_exit = [&app](std::string_view msg) {
+    auto cleanup_and_exit = [&app, &shutdown_dpdk](std::string_view msg) {
         spdlog::error("{}", msg);
         app.clear();
+        shutdown_dpdk();
         return EXIT_FAILURE;
     };
 
@@ -217,6 +427,23 @@ auto main(int argc, char** argv) -> int {
         }
         // Set log level
         comp_ptr->log_level(level);
+
+        // Configure CPU affinity if specified
+        if (!available_cores.empty() && comp.contains("cpu_affinity")) {
+            auto affinity_str = comp["cpu_affinity"].get<std::string>();
+            auto cpuset_opt = composite::parse_affinity_config(affinity_str, available_cores);
+            if (cpuset_opt.has_value()) {
+                comp_ptr->set_cpu_affinity(*cpuset_opt);
+                spdlog::debug("Component '{}' cpu_affinity configured: '{}'", comp_ptr->id(), affinity_str);
+            } else if (affinity_str != "none" && !affinity_str.empty()) {
+                return cleanup_and_exit(
+                    std::format(
+                        "Failed to parse cpu_affinity '{}' for component '{}'", affinity_str, comp_ptr->id()
+                    )
+                );
+            }
+        }
+
         // Set properties
         try {
             // Merge application-level properties with component-level properties
@@ -295,45 +522,51 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // Component Connections
     // ========================================
-    for (const auto& conn : app_json["connections"]) {
-        if (!conn.contains("output")) {
-            return cleanup_and_exit(std::format("missing output for connection: {}", conn.dump()));
-        }
-        if (!conn.contains("input")) {
-            return cleanup_and_exit(std::format("missing input for connection: {}", conn.dump()));
+    if (app_json.contains("connections")) {
+        if (!app_json["connections"].is_array()) {
+            return cleanup_and_exit("'connections' field must be an array");
         }
 
-        // Validate output section
-        auto output = conn["output"];
-        auto [output_comp, output_port, oerror] = composite::validate_connection(output);
-        if (!oerror.empty()) {
-            return cleanup_and_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
-        }
+        for (const auto& conn : app_json["connections"]) {
+            if (!conn.contains("output")) {
+                return cleanup_and_exit(std::format("missing output for connection: {}", conn.dump()));
+            }
+            if (!conn.contains("input")) {
+                return cleanup_and_exit(std::format("missing input for connection: {}", conn.dump()));
+            }
 
-        // Validate input section
-        auto input = conn["input"];
-        auto [input_comp, input_port, ierror] = composite::validate_connection(input);
-        if (!ierror.empty()) {
-            return cleanup_and_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
-        }
+            // Validate output section
+            auto output = conn["output"];
+            auto [output_comp, output_port, oerror] = composite::validate_connection(output);
+            if (!oerror.empty()) {
+                return cleanup_and_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
+            }
 
-        spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
+            // Validate input section
+            auto input = conn["input"];
+            auto [input_comp, input_port, ierror] = composite::validate_connection(input);
+            if (!ierror.empty()) {
+                return cleanup_and_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
+            }
 
-        // Get the output component
-        auto output_comp_ptr = app.get_component(output_comp);
-        if (output_comp_ptr == nullptr) {
-            return cleanup_and_exit(std::format("output component '{}' not found", output_comp));
-        }
+            spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
 
-        // Get the input component
-        auto input_comp_ptr = app.get_component(input_comp);
-        if (input_comp_ptr == nullptr) {
-            return cleanup_and_exit(std::format("input component '{}' not found", input_comp));
-        }
+            // Get the output component
+            auto output_comp_ptr = app.get_component(output_comp);
+            if (output_comp_ptr == nullptr) {
+                return cleanup_and_exit(std::format("output component '{}' not found", output_comp));
+            }
 
-        // Connect the ports
-        if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-            return cleanup_and_exit(std::format("failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+            // Get the input component
+            auto input_comp_ptr = app.get_component(input_comp);
+            if (input_comp_ptr == nullptr) {
+                return cleanup_and_exit(std::format("input component '{}' not found", input_comp));
+            }
+
+            // Connect the ports
+            if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
+                return cleanup_and_exit(std::format("failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+            }
         }
     }
 
@@ -396,8 +629,11 @@ auto main(int argc, char** argv) -> int {
         app.clear();
     } catch (const std::exception& e) {
         spdlog::critical("unhandled exception in main: {}", e.what());
+        shutdown_dpdk();
         return EXIT_FAILURE;
     }
+
+    shutdown_dpdk();
 
     spdlog::trace("complete");
     spdlog::shutdown();

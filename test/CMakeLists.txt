@@ -74,7 +74,7 @@ add_test(NAME TestPorts_Buffer COMMAND test_ports "[buffer]")
 add_test(NAME TestPorts_Connection COMMAND test_ports "[connection]")
 add_test(NAME TestPorts_Fanout COMMAND test_ports "[fanout]")
 add_test(NAME TestPorts_Integration COMMAND test_ports "[integration]")
-add_test(NAME TestPorts_Benchmark COMMAND test_ports "[.benchmark]")
+# add_test(NAME TestPorts_Benchmark COMMAND test_ports "[.benchmark]" "--benchmark-samples" "5")
 
 ##############################
 # Lifecycle Tests

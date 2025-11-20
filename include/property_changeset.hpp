@@ -114,18 +114,36 @@ private:
 
     static auto parse_object_property(property_changeset& changeset, const std::string& key, const nlohmann::json& value) -> void {
         auto obj_props = std::vector<std::pair<std::string, std::string>>{};
-        for (const auto& [k, v] : value.items()) {
-            obj_props.emplace_back(k, v);
-        }
+        parse_object_fields(obj_props, "", value);
         changeset.m_struct_props.emplace_back(key, std::move(obj_props));
     }
 
-    static auto parse_scalar_property(property_changeset& changeset, const std::string& key, const nlohmann::json& value) -> void {
-        if (value.is_null() || value.empty()) {
-            changeset.m_scalar_props.emplace_back(key, properties::null_prop);
-        } else {
-            changeset.m_scalar_props.emplace_back(key, value.get<std::string>());
+    // Recursively flatten nested objects with dot notation
+    static auto parse_object_fields(std::vector<std::pair<std::string, std::string>>& props,
+                                    const std::string& prefix,
+                                    const nlohmann::json& obj) -> void {
+        for (const auto& [k, v] : obj.items()) {
+            std::string field_key = prefix.empty() ? k : std::format("{}.{}", prefix, k);
+
+            if (v.is_object()) {
+                // Recursively flatten nested objects
+                parse_object_fields(props, field_key, v);
+            } else {
+                // Use common scalar conversion logic
+                props.emplace_back(field_key, json_to_string(v));
+            }
         }
+    }
+
+    static auto parse_scalar_property(property_changeset& changeset, const std::string& key, const nlohmann::json& value) -> void {
+        changeset.m_scalar_props.emplace_back(key, json_to_string(value));
+    }
+
+    static auto json_to_string(const nlohmann::json& value) -> std::string {
+        if (value.is_null() || value.empty()) {
+            return std::string{properties::null_prop};
+        }
+        return value.get<std::string>();
     }
 
 }; // class property_changeset
