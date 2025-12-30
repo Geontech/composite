@@ -1,20 +1,6 @@
 /*
  * Copyright (C) 2024-2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program. If not, see http://www.gnu.org/licenses/.
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #include "composite/core/application.hpp"
@@ -462,18 +448,8 @@ auto main(int argc, char** argv) -> int {
 
             // Apply changes if there are any
             if (changeset.has_updates()) {
-                if (!changeset.scalar_properties().empty()) {
-                    spdlog::trace("setting scalar properties on component {}", comp_ptr->id());
-                    comp_ptr->set_properties(changeset.scalar_properties(), composite::properties::config_type::INITIALIZE, true);
-                }
-                if (!changeset.list_properties().empty()) {
-                    spdlog::trace("setting list properties on component {}", comp_ptr->id());
-                    comp_ptr->set_properties(changeset.list_properties(), composite::properties::config_type::INITIALIZE, true);
-                }
-                if (!changeset.struct_properties().empty()) {
-                    spdlog::trace("setting struct properties on component {}", comp_ptr->id());
-                    comp_ptr->set_properties(changeset.struct_properties(), composite::properties::config_type::INITIALIZE, true);
-                }
+                spdlog::trace("setting properties on component {}", comp_ptr->id());
+                comp_ptr->set_properties(changeset.properties(), composite::properties::config_type::INITIALIZE, true);
                 comp_ptr->property_change_handler();
             }
         } catch (const std::runtime_error& err) {

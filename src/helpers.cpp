@@ -1,20 +1,6 @@
 /*
- * Copyright (C) 2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program. If not, see http://www.gnu.org/licenses/.
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #include "composite/core/application.hpp"
@@ -140,87 +126,6 @@ auto validate_connection(const nlohmann::json& conn) -> std::tuple<std::string, 
         return validate_nats_connection(conn);
     }
     return {{}, {}, "missing connection type"};
-}
-
-auto build_props_lists(const nlohmann::json& properties)
-  -> std::tuple<
-       std::vector<std::pair<std::string, std::string>>,
-       std::vector<std::pair<std::string, std::vector<std::string>>>,
-       std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>
-     > {
-    auto props = std::vector<std::pair<std::string, std::string>>{};
-    auto list_props = std::vector<std::pair<std::string, std::vector<std::string>>>{};
-    auto struct_props = std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>{};
-    auto to_string_pair = [](const nlohmann::json& value) -> std::pair<bool, std::string> {
-        if (value.is_null()) {
-            return {true, {}};
-        }
-        if (value.is_string()) {
-            auto str = value.get<std::string>();
-            if (str.empty()) {
-                return {true, {}};
-            }
-            return {false, str};
-        }
-        return {false, value.dump()};
-    };
-
-    std::function<void(const nlohmann::json&, const std::string&, std::vector<std::pair<std::string, std::string>>&)>
-    flatten_struct = [&](const nlohmann::json& object,
-                         const std::string& prefix,
-                         std::vector<std::pair<std::string, std::string>>& out) {
-        for (const auto& [child_key, child_value] : object.items()) {
-            if (child_key == "enabled") {
-                continue;
-            }
-            auto dotted = prefix.empty() ? std::string{child_key} : std::format("{}.{}", prefix, child_key);
-            if (child_value.is_object()) {
-                flatten_struct(child_value, dotted, out);
-            } else {
-                const auto& [is_null, str_val] = to_string_pair(child_value);
-                if (is_null) {
-                    out.emplace_back(dotted, composite::properties::null_prop);
-                } else {
-                    out.emplace_back(dotted, str_val);
-                }
-            }
-        }
-    };
-
-    for (const auto& [key, value] : properties.items()) {
-        if (key == "enabled") {
-            continue;
-        } else if (value.is_array()) {
-            std::vector<std::string> obj_scalar_props;
-            for (const auto& [k, v] : value.items()) {
-                if (v.is_object()) {
-                    std::vector<std::pair<std::string, std::string>> obj_props;
-                    flatten_struct(v, "", obj_props);
-                    props.emplace_back(key, composite::properties::null_prop);
-                    struct_props.emplace_back(std::format("{}[]", key), obj_props);
-                } else {
-                    const auto& [is_null, str_val] = to_string_pair(v);
-                    obj_scalar_props.emplace_back(
-                        is_null ? std::string{composite::properties::null_prop} : str_val
-                    );
-                }
-            }
-            if (!obj_scalar_props.empty()) {
-                list_props.emplace_back(key, obj_scalar_props);
-            }
-        } else if (value.is_object()) {
-            std::vector<std::pair<std::string, std::string>> obj_props;
-            flatten_struct(value, "", obj_props);
-            struct_props.emplace_back(key, obj_props);
-        } else {
-            if (value.is_null() || value.empty()) {
-                props.emplace_back(key, composite::properties::null_prop);
-            } else {
-                props.emplace_back(key, value.get<std::string>());
-            }
-        }
-    }
-    return {props, list_props, struct_props};
 }
 
 auto parse_transports(const nlohmann::json& transports_json)

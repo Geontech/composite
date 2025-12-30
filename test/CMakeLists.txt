@@ -1,3 +1,8 @@
+#
+# Copyright (C) 2024-2025 Geon Technologies, LLC
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
@@ -12,7 +17,6 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(test_properties
   test_properties.cpp
   ${PROJECT_SOURCE_DIR}/src/helpers.cpp
-  ${PROJECT_SOURCE_DIR}/src/property_rest_api.cpp
 )
 
 target_include_directories(test_properties
@@ -36,7 +40,6 @@ add_test(NAME TestProperties COMMAND test_properties)
 add_executable(test_http_integration
   test_http_integration.cpp
   ${PROJECT_SOURCE_DIR}/src/helpers.cpp
-  ${PROJECT_SOURCE_DIR}/src/property_rest_api.cpp
 )
 
 target_include_directories(test_http_integration

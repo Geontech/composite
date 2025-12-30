@@ -1,20 +1,6 @@
 /*
- * Copyright (C) 2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #define CATCH_CONFIG_MAIN
@@ -44,7 +30,7 @@ using namespace composite;
 class TestMutableSource : public component {
 public:
     TestMutableSource() : component("TestMutableSource") {
-        add_port(&m_output);
+        add_port(m_output);
     }
 
     auto process() -> retval override {
@@ -76,7 +62,7 @@ private:
 class TestImmutableSource : public component {
 public:
     TestImmutableSource() : component("TestImmutableSource") {
-        add_port(&m_output);
+        add_port(m_output);
     }
 
     auto process() -> retval override {
@@ -110,7 +96,7 @@ private:
 class TestMutableSink : public component {
 public:
     TestMutableSink() : component("TestMutableSink") {
-        add_port(&m_input);
+        add_port(m_input);
     }
 
     auto process() -> retval override {
@@ -144,7 +130,7 @@ private:
 class TestImmutableSink : public component {
 public:
     TestImmutableSink() : component("TestImmutableSink") {
-        add_port(&m_input);
+        add_port(m_input);
     }
 
     auto process() -> retval override {
@@ -178,9 +164,9 @@ private:
 class TestAmplifier : public component {
 public:
     TestAmplifier() : component("TestAmplifier") {
-        add_port(&m_input);
-        add_port(&m_output);
-        add_property("gain", &m_gain);
+        add_port(m_input);
+        add_port(m_output);
+        add_property("gain", m_gain);
     }
 
     auto process() -> retval override {
@@ -215,10 +201,10 @@ private:
 class TestBroadcaster : public component {
 public:
     TestBroadcaster() : component("TestBroadcaster") {
-        add_port(&m_input);
-        add_port(&m_output1);
-        add_port(&m_output2);
-        add_port(&m_output3);
+        add_port(m_input);
+        add_port(m_output1);
+        add_port(m_output2);
+        add_port(m_output3);
     }
 
     auto process() -> retval override {
@@ -256,7 +242,7 @@ private:
 class TestMetadataSource : public component {
 public:
     TestMetadataSource() : component("TestMetadataSource") {
-        add_port(&m_output);
+        add_port(m_output);
     }
 
     auto process() -> retval override {
@@ -310,7 +296,7 @@ private:
 class TestMetadataSink : public component {
 public:
     TestMetadataSink() : component("TestMetadataSink") {
-        add_port(&m_input);
+        add_port(m_input);
     }
 
     auto process() -> retval override {
@@ -346,8 +332,8 @@ private:
 class TestMetadataPassthrough : public component {
 public:
     TestMetadataPassthrough() : component("TestMetadataPassthrough") {
-        add_port(&m_input);
-        add_port(&m_output);
+        add_port(m_input);
+        add_port(m_output);
     }
 
     auto process() -> retval override {
@@ -384,9 +370,9 @@ private:
 class TestMetadataModifier : public component {
 public:
     TestMetadataModifier() : component("TestMetadataModifier") {
-        add_port(&m_input);
-        add_port(&m_output);
-        add_property("center_frequency_offset", &m_cf_offset);
+        add_port(m_input);
+        add_port(m_output);
+        add_property("center_frequency_offset", m_cf_offset);
     }
 
     auto process() -> retval override {
@@ -1393,7 +1379,7 @@ TEST_CASE("complete pipeline integration", "[integration]") {
 class TestIntSource : public component {
 public:
     TestIntSource() : component("TestIntSource") {
-        add_port(&m_output);
+        add_port(m_output);
     }
 
     auto process() -> retval override {
@@ -1987,14 +1973,14 @@ TEST_CASE("port disconnect API basic functionality", "[port][disconnect]") {
     // Create simple test components with public port access
     class SimpleSource : public component {
     public:
-        SimpleSource() : component("SimpleSource") { add_port(&output); }
+        SimpleSource() : component("SimpleSource") { add_port(output); }
         auto process() -> retval override { return retval::NOOP; }
         output_port<mutable_buffer<float>> output{"out"};
     };
 
     class SimpleSink : public component {
     public:
-        SimpleSink() : component("SimpleSink") { add_port(&input); }
+        SimpleSink() : component("SimpleSink") { add_port(input); }
         auto process() -> retval override { return retval::NOOP; }
         input_port<mutable_buffer<float>> input{"in"};
     };
@@ -2056,14 +2042,14 @@ TEST_CASE("port disconnect API basic functionality", "[port][disconnect]") {
 TEST_CASE("port disconnect with data transmission", "[port][disconnect]") {
     class SimpleSource : public component {
     public:
-        SimpleSource() : component("SimpleSource") { add_port(&output); }
+        SimpleSource() : component("SimpleSource") { add_port(output); }
         auto process() -> retval override { return retval::NOOP; }
         output_port<mutable_buffer<float>> output{"out"};
     };
 
     class SimpleSink : public component {
     public:
-        SimpleSink() : component("SimpleSink") { add_port(&input); }
+        SimpleSink() : component("SimpleSink") { add_port(input); }
         auto process() -> retval override { return retval::NOOP; }
         input_port<mutable_buffer<float>> input{"in"};
     };
@@ -2174,14 +2160,14 @@ TEST_CASE("port disconnect with data transmission", "[port][disconnect]") {
 TEST_CASE("port disconnect fanout scenarios", "[port][disconnect][fanout]") {
     class SimpleSource : public component {
     public:
-        SimpleSource() : component("SimpleSource") { add_port(&output); }
+        SimpleSource() : component("SimpleSource") { add_port(output); }
         auto process() -> retval override { return retval::NOOP; }
         output_port<mutable_buffer<float>> output{"out"};
     };
 
     class SimpleSink : public component {
     public:
-        SimpleSink() : component("SimpleSink") { add_port(&input); }
+        SimpleSink() : component("SimpleSink") { add_port(input); }
         auto process() -> retval override { return retval::NOOP; }
         input_port<mutable_buffer<float>> input{"in"};
     };
@@ -2276,14 +2262,14 @@ TEST_CASE("port disconnect fanout scenarios", "[port][disconnect][fanout]") {
 TEST_CASE("port disconnect thread safety", "[port][disconnect][thread]") {
     class SimpleSource : public component {
     public:
-        SimpleSource() : component("SimpleSource") { add_port(&output); }
+        SimpleSource() : component("SimpleSource") { add_port(output); }
         auto process() -> retval override { return retval::NOOP; }
         output_port<mutable_buffer<float>> output{"out"};
     };
 
     class SimpleSink : public component {
     public:
-        SimpleSink() : component("SimpleSink") { add_port(&input); }
+        SimpleSink() : component("SimpleSink") { add_port(input); }
         auto process() -> retval override { return retval::NOOP; }
         input_port<mutable_buffer<float>> input{"in"};
     };
@@ -2366,14 +2352,14 @@ TEST_CASE("port disconnect thread safety", "[port][disconnect][thread]") {
 TEST_CASE("port disconnect with metadata", "[port][disconnect][metadata]") {
     class SimpleSource : public component {
     public:
-        SimpleSource() : component("SimpleSource") { add_port(&output); }
+        SimpleSource() : component("SimpleSource") { add_port(output); }
         auto process() -> retval override { return retval::NOOP; }
         output_port<mutable_buffer<float>> output{"out"};
     };
 
     class SimpleSink : public component {
     public:
-        SimpleSink() : component("SimpleSink") { add_port(&input); }
+        SimpleSink() : component("SimpleSink") { add_port(input); }
         auto process() -> retval override { return retval::NOOP; }
         input_port<mutable_buffer<float>> input{"in"};
     };
@@ -2538,14 +2524,14 @@ TEST_CASE("buffer capacity with data transfer", "[buffer][capacity][integration]
     SECTION("resize before sending through port") {
         class SimpleSource : public component {
         public:
-            SimpleSource() : component("SimpleSource") { add_port(&output); }
+            SimpleSource() : component("SimpleSource") { add_port(output); }
             auto process() -> retval override { return retval::NOOP; }
             output_port<mutable_buffer<float>> output{"out"};
         };
 
         class SimpleSink : public component {
         public:
-            SimpleSink() : component("SimpleSink") { add_port(&input); }
+            SimpleSink() : component("SimpleSink") { add_port(input); }
             auto process() -> retval override { return retval::NOOP; }
             input_port<mutable_buffer<float>> input{"in"};
         };
@@ -3574,7 +3560,7 @@ TEST_CASE("timestamp edge cases", "[timestamp][edge_case]") {
 class TestLifecycleSink : public component {
 public:
     TestLifecycleSink() : component("TestLifecycleSink") {
-        add_port(&m_input);
+        add_port(m_input);
         m_input.depth(100);  // Default depth
     }
 
@@ -3604,7 +3590,7 @@ private:
 class TestContinuousSource : public component {
 public:
     TestContinuousSource() : component("TestContinuousSource") {
-        add_port(&m_output);
+        add_port(m_output);
     }
 
     auto process() -> retval override {

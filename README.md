@@ -513,7 +513,7 @@ adaptation of component behavior at initialization or, for certain properties, d
 
 ### Defining Properties
 
-Properties are typically defined with a component's constructor by linking them to member variable. This is done using the `add_property()` method
+Properties are typically defined in a component's constructor by linking them to member variables. This is done using the `add_property()` method
 provided by the `component` base class:
 
 ```cpp
@@ -525,16 +525,16 @@ class MyConfigurableComponent : public composite::component {
 public:
     explicit MyConfigurableComponent(std::string_view id) : composite::component(id) {
         // Define a mandatory integer property with units and runtime configurability
-        add_property("threshold", &m_threshold)
+        add_property("threshold", m_threshold)
             .units("dB")
             .configurability(composite::properties::config_type::RUNTIME);
 
         // Define an optional string property (m_api_key is std::optional<std::string>)
         // Default configurability is INITIALIZE, no units specified
-        add_property("api_key", &m_api_key);
+        add_property("api_key", m_api_key);
 
         // Define a property that can only be set at initialization (default behavior)
-        add_property("buffer_size", &m_buffer_size).units("elements");
+        add_property("buffer_size", m_buffer_size).units("elements");
     }
 
     // ... process() and other methods ...
@@ -551,19 +551,19 @@ private:
 
 - **Type System**: The system automatically deduces the property type from the member variable's C++ type
   (e.g., `int` becomes `"int32"`, `float` becomes `"float"`, `std::string` becomes `"string"`).
-  - `std::optional<T>` is supported for properties that may not always have a value. Its type will be represented as `"<type>?"` 
+  - `std::optional<T>` is supported for properties that may not always have a value. Its type will be represented as `"<type>?"`
     (e.g., `std::optional<int>` corresponds to type string `"int32?"`).
 - **Fluent Configuration**: `add_property()` returns a reference that allows for chained calls to set metadata:
   - `.units(std::string_view)`: Specifies units for the property (e.g., "ms", "items", "percent"). This is for informational purposes.
   - `.configurability(composite::properties::config_type)`: Defines when the property can be changed:
     - `composite::properties::config_type::INITIALIZE` (default): The property can only be set during initialization configuration of values from JSON file.
     - `composite::properties::config_type::RUNTIME`: The property can be modified while the component is running.
-- **Pointers**: Properties are registered by passing a pointer to the component's member variable that will store the actual value.
-  The `property_set` directly manipulates this memory location.
+- **Reference Binding**: Properties are registered by passing a reference to the component's member variable.
+  The `property_set` directly reads and modifies this memory location when getting or setting property values.
 
 ### List Properties
 
-For properties that represent collections of values, use `add_list_property()`. List properties support indexing, appending, and clearing operations.
+For properties that represent collections of values, simply use `add_property()` with a `std::vector<T>`. List properties support indexing, appending, and clearing operations.
 
 ```cpp
 #include <composite/composite.hpp>
@@ -572,8 +572,8 @@ For properties that represent collections of values, use `add_list_property()`. 
 class MyComponentWithList : public composite::component {
 public:
     explicit MyComponentWithList(std::string_view id) : composite::component(id) {
-        // Define a list property
-        add_list_property("thresholds", &m_thresholds)
+        // Define a list property - just pass the vector member
+        add_property("thresholds", m_thresholds)
             .configurability(composite::properties::config_type::RUNTIME);
 
         // Add an indexed change listener for validation
@@ -600,8 +600,10 @@ private:
 
 ### Structured Properties
 
-For more complex configurations, properties can be grouped into structures using `add_struct_property()`. This allows for namespaced properties
+For more complex configurations, properties can be grouped into structures. This allows for namespaced properties
 (e.g., `"network.host"`, `"network.port"`) and better organization.
+
+To use a struct as a property, you must specialize `composite::properties::property_traits<T>` for your struct type:
 
 ```cpp
 #include <composite/composite.hpp>
@@ -613,17 +615,23 @@ struct NetworkConfig {
     std::optional<std::string> protocol{};
 };
 
+// Specialize property_traits to register struct fields
+template<>
+struct composite::properties::property_traits<NetworkConfig> {
+    static constexpr std::string_view type_name = "network_config";
+    static void register_fields(composite::properties::property_set& ps, NetworkConfig& cfg) {
+        using composite::properties::config_type;
+        ps.add("host", cfg.host, config_type::RUNTIME);
+        ps.add("port", cfg.port);  // Default: INITIALIZE
+        ps.add("protocol", cfg.protocol);  // Optional property
+    }
+};
+
 class MyComponentWithStructProp : public composite::component {
 public:
     explicit MyComponentWithStructProp(std::string_view id) : composite::component(id) {
-        add_struct_property("network", &m_net_config,
-            // This lambda registers the fields of the NetworkConfig struct
-            [](auto& ps, auto* conf) {
-                ps.add_property("host", &conf->host).configurability(composite::properties::config_type::RUNTIME);
-                ps.add_property("port", &conf->port); // Default: INITIALIZE
-                ps.add_property("protocol", &conf->protocol); // Optional property
-            }
-        );
+        // Simply add the struct as a property - fields are registered via property_traits
+        add_property("network", m_net_config, composite::properties::config_type::RUNTIME);
     }
     // ... other methods and members ...
 private:
@@ -637,7 +645,8 @@ private:
 
 ### List-of-Structs Properties
 
-For advanced use cases, you can combine lists and structures using `add_struct_list_property()`. This creates a vector of structured objects.
+For advanced use cases, you can combine lists and structures. This creates a vector of structured objects.
+Like struct properties, you must specialize `property_traits` for the element type:
 
 ```cpp
 #include <composite/composite.hpp>
@@ -648,15 +657,22 @@ struct Connection {
     uint16_t port{8080};
 };
 
+// Specialize property_traits for the struct type
+template<>
+struct composite::properties::property_traits<Connection> {
+    static constexpr std::string_view type_name = "connection";
+    static void register_fields(composite::properties::property_set& ps, Connection& conn) {
+        using composite::properties::config_type;
+        ps.add("host", conn.host, config_type::RUNTIME);
+        ps.add("port", conn.port, config_type::RUNTIME);
+    }
+};
+
 class MyComponentWithStructList : public composite::component {
 public:
     explicit MyComponentWithStructList(std::string_view id) : composite::component(id) {
-        add_struct_list_property("connections", &m_connections,
-            [](auto& ps, auto* conn) {
-                ps.add_property("host", &conn->host);
-                ps.add_property("port", &conn->port);
-            }
-        ).configurability(composite::properties::config_type::RUNTIME);
+        // Add the vector as a property - element fields are registered via property_traits
+        add_property("connections", m_connections, composite::properties::config_type::RUNTIME);
 
         // Indexed change listener receives the index of modified/added item
         add_property_change_listener("connections",
@@ -696,13 +712,14 @@ The `component` base class provides a `set_properties()` method that accepts a l
 Components can react to changes in their properties in two main ways:
 
 1. **Change Listeners**: A specific callback function can be attached to an individual property using the `property`'s `change_listener()` method.
-   This callback is invoked by `set_property` *before* the property is finalized but *after* the pointed-to-member variable has been tenatively
+   This callback is invoked by `set_property` *before* the property is finalized but *after* the member variable has been tentatively
    updated. If the callback returns `false`, the change is rejected, and the property value is reverted to its previous state.
+   For struct and list properties, parent/list listeners also fire when nested fields change (e.g., `"network.host"` or `"connections[0].host"`).
 
    ```cpp
    // Use the change_listener() method to add a callback
    // Assume m_threshold is an int32_t member variable
-   add_property("threshold", &m_threshold)
+   add_property("threshold", m_threshold)
        .units("percentage")
        .configurability(composite::properties::config_type::RUNTIME)
        .change_listener([this]() {
@@ -719,7 +736,7 @@ Components can react to changes in their properties in two main ways:
        });
    ```
 
-   For **list properties**, change listeners receive the index of the modified/added item:
+   For **list properties**, change listeners receive the index of the modified/added/removed item. Struct list field updates also notify the list listener:
    ```cpp
    add_property_change_listener("thresholds",
        [this](std::size_t index) -> bool {
@@ -731,6 +748,44 @@ Components can react to changes in their properties in two main ways:
            return true; // Accept
        });
    ```
+
+   **Contextual Change Listeners**: For more advanced use cases, listeners can receive a `change_type` parameter indicating what kind of change occurred:
+
+   - `change_type::SET` - A new value was set (e.g., optional property set from `nullopt`, or list item appended)
+   - `change_type::MODIFY` - An existing value was modified
+   - `change_type::RESET` - Value was reset (e.g., optional set to `nullopt`, list item deleted, or scalar reset to default)
+
+   ```cpp
+   // Contextual listener for optional properties - know if value is being set, modified, or cleared
+   add_property_change_listener("timeout",
+       [this](composite::properties::change_type ctx) -> bool {
+           using composite::properties::change_type;
+           if (ctx == change_type::SET) {
+               logger()->info("Timeout configured for the first time: {}", *m_timeout);
+           } else if (ctx == change_type::MODIFY) {
+               logger()->info("Timeout changed to: {}", *m_timeout);
+           } else if (ctx == change_type::RESET) {
+               logger()->info("Timeout cleared, will use default behavior");
+           }
+           return true;
+       });
+
+   // Contextual indexed listener for lists - know if item was added, modified, or removed
+   add_property_change_listener("connections",
+       [this](std::size_t index, composite::properties::change_type ctx) -> bool {
+           using composite::properties::change_type;
+           if (ctx == change_type::SET) {
+               logger()->info("New connection added at index {}", index);
+           } else if (ctx == change_type::MODIFY) {
+               logger()->info("Connection {} updated: host={}", index, m_connections[index].host);
+           } else if (ctx == change_type::RESET) {
+               logger()->info("Connection at index {} removed", index);
+           }
+           return true;
+       });
+   ```
+
+   Contextual listeners are backward compatible - if you register a simple listener (without `change_type`), it will still work. The system falls back to the simple listener if no contextual listener is registered.
 
 2. **`property_change_handler()`**: The `component` class provides a `virtual void property_change_handler()` method. This method is called
    once at the end of a successful `set_properties()` call, after all specified properties have been updated and their individual change listeners
@@ -854,10 +909,15 @@ curl -X DELETE http://localhost:5000/app/connections \
 **Notes on REST API Behavior:**
 
 - Only properties marked with `config_type::RUNTIME` can be modified via REST API
-- PATCH requests are atomic - all properties updated under a single mutex lock
-- `property_change_handler()` is called once after all property changes validated
+- PATCH requests are **atomic with rollback** - all properties updated under a single mutex lock:
+  - If any property update fails (validation error, type conversion error, or change listener rejection), all previously applied changes in that batch are automatically rolled back
+  - Either all properties are updated successfully, or none are modified
+  - This ensures consistent state even when updating multiple related properties
+- `property_change_handler()` is called once after all property changes validated and applied
 - For list properties, each individual POST creates a separate update (multiple handler calls)
 - PATCH with array replaces entire list (clears first, then adds items) - single handler call
+- **List deletions in batch updates**: Removing list items (setting indexed items to null) is not supported within multi-property batch updates due to rollback complexity. Use single-property DELETE requests instead.
+- Struct-list item updates via `PUT /items/:index` are applied atomically as a single change (one list listener notification).
 - Error responses include detailed information about validation failures
 
 ## Implementing a Component
@@ -876,7 +936,7 @@ public:
         add_port(&m_out_port);
 
         // Add properties to configure
-        add_property("processing_gain", &m_processing_gain)
+        add_property("processing_gain", m_processing_gain)
             .units("factor")
             .configurability(composite::properties::config_type::RUNTIME)
             .change_listener([this]() {

@@ -1,26 +1,13 @@
 /*
- * Copyright (C) 2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program. If not, see http://www.gnu.org/licenses/.
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #pragma once
 
-#include "property_metadata.hpp"
+#include "errors.hpp"
 
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,17 +15,46 @@
 
 namespace composite::properties {
 
+/**
+ * @brief A single segment of a property path
+ *
+ * Examples:
+ * - "foo" -> name="foo", index=nullopt, is_append=false
+ * - "foo[5]" -> name="foo", index=5, is_append=false
+ * - "foo[]" -> name="foo", index=nullopt, is_append=true
+ */
 struct path_segment {
     std::string name;
-    std::optional<std::size_t> index;  // For list access: foo[5] or foo[] (nullopt = append)
-    bool is_append{false};             // True for foo[]
+    std::optional<std::size_t> index;  // For list access: foo[5]
+    bool is_append{false};             // For append: foo[]
 
-    auto has_index() const -> bool { return index.has_value(); }
-    auto is_simple() const -> bool { return !index.has_value() && !is_append; }
-}; // struct path_segment
+    [[nodiscard]]
+    auto has_index() const noexcept -> bool {
+        return index.has_value();
+    }
 
+    [[nodiscard]]
+    auto is_simple() const noexcept -> bool {
+        return !index.has_value() && !is_append;
+    }
+};
+
+/**
+ * @brief Parsed property path supporting dot notation and indexing
+ *
+ * Supported formats:
+ * - "property" -> simple property access
+ * - "struct.field" -> nested property access
+ * - "list[0]" -> list element access
+ * - "list[]" -> list append operation
+ * - "struct_list[0].field" -> nested access into list element
+ */
 class property_path {
 public:
+    /**
+     * @brief Parse a property path string
+     * @throws property_error on invalid path syntax
+     */
     static auto parse(std::string_view path) -> property_path {
         auto result = property_path{};
         auto current = std::string{};
@@ -66,7 +82,7 @@ public:
                 }
 
                 if (i >= path.size()) {
-                    throw properties_error(std::format("unclosed bracket in path: {}", path));
+                    throw property_error(std::format("unclosed bracket in path: {}", path));
                 }
 
                 auto index_str = path.substr(bracket_start, i - bracket_start);
@@ -81,7 +97,8 @@ public:
                         auto index = std::stoul(std::string{index_str});
                         result.add_indexed_segment(name, index);
                     } catch (...) {
-                        throw properties_error(std::format("invalid index '{}' in path: {}", index_str, path));
+                        throw property_error(
+                            std::format("invalid index '{}' in path: {}", index_str, path));
                     }
                 }
             } else {
@@ -95,41 +112,35 @@ public:
         }
 
         if (result.m_segments.empty()) {
-            throw properties_error(std::format("empty property path: {}", path));
+            throw property_error(std::format("empty property path: {}", path));
         }
 
         return result;
     }
 
-    auto segments() const -> const std::vector<path_segment>& {
+    [[nodiscard]]
+    auto segments() const noexcept -> const std::vector<path_segment>& {
         return m_segments;
     }
 
-    auto is_simple() const -> bool {
+    [[nodiscard]]
+    auto is_simple() const noexcept -> bool {
         return m_segments.size() == 1 && m_segments[0].is_simple();
     }
 
-    auto simple_name() const -> const std::string& {
-        if (!is_simple()) {
-            throw properties_error("path is not simple");
-        }
-        return m_segments[0].name;
+    [[nodiscard]]
+    auto head() const -> const path_segment& {
+        return m_segments.front();
     }
 
-    auto first() const -> const path_segment& {
-        return m_segments[0];
-    }
-
-    auto has_nested() const -> bool {
+    [[nodiscard]]
+    auto has_tail() const noexcept -> bool {
         return m_segments.size() > 1;
     }
 
-    // Create a path from all segments after the first
+    /// Create a path from all segments after the first
+    [[nodiscard]]
     auto tail() const -> property_path {
-        if (m_segments.size() <= 1) {
-            throw properties_error("no tail segments");
-        }
-
         auto result = property_path{};
         for (auto i = std::size_t{1}; i < m_segments.size(); ++i) {
             result.m_segments.push_back(m_segments[i]);
@@ -137,6 +148,7 @@ public:
         return result;
     }
 
+    [[nodiscard]]
     auto to_string() const -> std::string {
         auto result = std::string{};
         for (auto i = std::size_t{0}; i < m_segments.size(); ++i) {
@@ -167,7 +179,6 @@ private:
     auto add_append_segment(std::string_view name) -> void {
         m_segments.push_back(path_segment{std::string{name}, std::nullopt, true});
     }
-
-}; // class property_path
+};
 
 } // namespace composite::properties

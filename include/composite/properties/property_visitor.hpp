@@ -1,90 +1,256 @@
 /*
- * Copyright (C) 2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program. If not, see http://www.gnu.org/licenses/.
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #pragma once
 
-#include "property_metadata.hpp"
+#include "types.hpp"
+#include "property_traits.hpp"
+#include "errors.hpp"
 
-#include <any>
-#include <optional>
-#include <vector>
+#include <string>
+#include <string_view>
 
 namespace composite::properties {
 
-template <typename Visitor>
-auto visit_by_type_name(std::string_view type, Visitor&& visitor) -> decltype(auto) {
-    if (type == "bool") { return visitor.template operator()<bool>(); }
-    if (type == "bool?") { return visitor.template operator()<std::optional<bool>>(); }
-    if (type == "string") { return visitor.template operator()<std::string>(); }
-    if (type == "string?") { return visitor.template operator()<std::optional<std::string>>(); }
-    if (type == "int16") { return visitor.template operator()<int16_t>(); }
-    if (type == "int16?") { return visitor.template operator()<std::optional<int16_t>>(); }
-    if (type == "uint16") { return visitor.template operator()<uint16_t>(); }
-    if (type == "uint16?") { return visitor.template operator()<std::optional<uint16_t>>(); }
-    if (type == "int32") { return visitor.template operator()<int32_t>(); }
-    if (type == "int32?") { return visitor.template operator()<std::optional<int32_t>>(); }
-    if (type == "uint32") { return visitor.template operator()<uint32_t>(); }
-    if (type == "uint32?") { return visitor.template operator()<std::optional<uint32_t>>(); }
-    if (type == "int64") { return visitor.template operator()<int64_t>(); }
-    if (type == "int64?") { return visitor.template operator()<std::optional<int64_t>>(); }
-    if (type == "uint64") { return visitor.template operator()<uint64_t>(); }
-    if (type == "uint64?") { return visitor.template operator()<std::optional<uint64_t>>(); }
-    if (type == "float") { return visitor.template operator()<float>(); }
-    if (type == "float?") { return visitor.template operator()<std::optional<float>>(); }
-    if (type == "double") { return visitor.template operator()<double>(); }
-    if (type == "double?") { return visitor.template operator()<std::optional<double>>(); }
+// ============================================================================
+// Visitor for Setting Scalar Values from String
+// ============================================================================
 
-    throw type_error("", "", type);
+/**
+ * @brief Visitor that sets a scalar value from a string
+ */
+struct set_scalar_visitor {
+    std::string_view value;
+    std::string_view prop_name;
+
+    template<typename T>
+    auto operator()(T* ptr) const -> void {
+        *ptr = from_string<T>(value, prop_name);
+    }
+};
+
+/**
+ * @brief Visitor that resets a scalar value to its default
+ */
+struct reset_scalar_visitor {
+    template<typename T>
+    auto operator()(T* ptr) const -> void {
+        *ptr = T{};
+    }
+};
+
+// ============================================================================
+// Visitor for Setting Optional Values from String
+// ============================================================================
+
+/**
+ * @brief Visitor that sets an optional value from a string (or resets if null)
+ */
+struct set_optional_visitor {
+    std::string_view value;
+    std::string_view prop_name;
+    bool is_null;
+
+    template<typename T>
+    auto operator()(std::optional<T>* ptr) const -> void {
+        if (is_null) {
+            ptr->reset();
+        } else {
+            *ptr = from_string<T>(value, prop_name);
+        }
+    }
+};
+
+// ============================================================================
+// Visitor for Getting Scalar Values as String
+// ============================================================================
+
+/**
+ * @brief Visitor that converts a scalar value to string
+ */
+struct get_string_visitor {
+    template<typename T>
+    auto operator()(const T* ptr) const -> std::string {
+        return to_string(*ptr);
+    }
+};
+
+// ============================================================================
+// Visitor for Getting Optional Values as String
+// ============================================================================
+
+/**
+ * @brief Visitor that converts an optional value to string (or empty if nullopt)
+ */
+struct get_optional_string_visitor {
+    template<typename T>
+    auto operator()(const std::optional<T>* ptr) const -> std::optional<std::string> {
+        if (ptr->has_value()) {
+            return to_string(ptr->value());
+        }
+        return std::nullopt;
+    }
+};
+
+// ============================================================================
+// Visitor for List Operations
+// ============================================================================
+
+/**
+ * @brief Visitor that gets the size of a list
+ */
+struct list_size_visitor {
+    template<typename T>
+    auto operator()(const std::vector<T>* ptr) const -> std::size_t {
+        return ptr->size();
+    }
+};
+
+/**
+ * @brief Visitor that sets a list item from a string
+ */
+struct set_list_item_visitor {
+    std::size_t index;
+    std::string_view value;
+    std::string_view prop_name;
+
+    template<typename T>
+    auto operator()(std::vector<T>* ptr) const -> void {
+        if (index >= ptr->size()) {
+            throw index_error(prop_name, index, ptr->size());
+        }
+        (*ptr)[index] = from_string<T>(value, prop_name);
+    }
+};
+
+/**
+ * @brief Visitor that gets a list item as a string
+ */
+struct get_list_item_visitor {
+    std::size_t index;
+    std::string_view prop_name;
+
+    template<typename T>
+    auto operator()(const std::vector<T>* ptr) const -> std::string {
+        if (index >= ptr->size()) {
+            throw index_error(prop_name, index, ptr->size());
+        }
+        return to_string((*ptr)[index]);
+    }
+};
+
+/**
+ * @brief Visitor that appends an item to a list from a string
+ */
+struct append_list_item_visitor {
+    std::string_view value;
+    std::string_view prop_name;
+
+    template<typename T>
+    auto operator()(std::vector<T>* ptr) const -> std::size_t {
+        ptr->push_back(from_string<T>(value, prop_name));
+        return ptr->size() - 1;
+    }
+};
+
+/**
+ * @brief Visitor that erases an item from a list
+ */
+struct erase_list_item_visitor {
+    std::size_t index;
+    std::string_view prop_name;
+
+    template<typename T>
+    auto operator()(std::vector<T>* ptr) const -> void {
+        if (index >= ptr->size()) {
+            throw index_error(prop_name, index, ptr->size());
+        }
+        ptr->erase(ptr->begin() + static_cast<std::ptrdiff_t>(index));
+    }
+};
+
+/**
+ * @brief Visitor that inserts an item into a list from a string
+ */
+struct insert_list_item_visitor {
+    std::size_t index;
+    std::string_view value;
+    std::string_view prop_name;
+
+    template<typename T>
+    auto operator()(std::vector<T>* ptr) const -> void {
+        if (index > ptr->size()) {
+            throw index_error(prop_name, index, ptr->size());
+        }
+        ptr->insert(ptr->begin() + static_cast<std::ptrdiff_t>(index),
+                    from_string<T>(value, prop_name));
+    }
+};
+
+/**
+ * @brief Visitor that clears a list
+ */
+struct clear_list_visitor {
+    template<typename T>
+    auto operator()(std::vector<T>* ptr) const -> void {
+        ptr->clear();
+    }
+};
+
+// ============================================================================
+// Helper Functions for Visiting Property Values
+// ============================================================================
+
+/**
+ * @brief Visit a scalar property value
+ */
+template<typename Visitor>
+auto visit_scalar(property_value& val, Visitor&& vis) -> decltype(auto) {
+    return std::visit(std::forward<Visitor>(vis), std::get<scalar_types>(val));
 }
 
-// Visit base types (without [] or ? modifiers)
-template <typename Visitor>
-auto visit_base_type(std::string_view type, Visitor&& visitor) -> decltype(auto) {
-    if (type == "bool") { return visitor.template operator()<bool>(); }
-    if (type == "string") { return visitor.template operator()<std::string>(); }
-    if (type == "int16") { return visitor.template operator()<int16_t>(); }
-    if (type == "uint16") { return visitor.template operator()<uint16_t>(); }
-    if (type == "int32") { return visitor.template operator()<int32_t>(); }
-    if (type == "uint32") { return visitor.template operator()<uint32_t>(); }
-    if (type == "int64") { return visitor.template operator()<int64_t>(); }
-    if (type == "uint64") { return visitor.template operator()<uint64_t>(); }
-    if (type == "float") { return visitor.template operator()<float>(); }
-    if (type == "double") { return visitor.template operator()<double>(); }
-
-    throw type_error("", "", type);
+template<typename Visitor>
+auto visit_scalar(const property_value& val, Visitor&& vis) -> decltype(auto) {
+    return std::visit(std::forward<Visitor>(vis), std::get<scalar_types>(val));
 }
 
-// Visit list types
-template <typename Visitor>
-auto visit_list_type(std::string_view type, Visitor&& visitor) -> decltype(auto) {
-    if (type == "[]bool") { return visitor.template operator()<std::vector<bool>>(); }
-    if (type == "[]string") { return visitor.template operator()<std::vector<std::string>>(); }
-    if (type == "[]int16") { return visitor.template operator()<std::vector<int16_t>>(); }
-    if (type == "[]uint16") { return visitor.template operator()<std::vector<uint16_t>>(); }
-    if (type == "[]int32") { return visitor.template operator()<std::vector<int32_t>>(); }
-    if (type == "[]uint32") { return visitor.template operator()<std::vector<uint32_t>>(); }
-    if (type == "[]int64") { return visitor.template operator()<std::vector<int64_t>>(); }
-    if (type == "[]uint64") { return visitor.template operator()<std::vector<uint64_t>>(); }
-    if (type == "[]float") { return visitor.template operator()<std::vector<float>>(); }
-    if (type == "[]double") { return visitor.template operator()<std::vector<double>>(); }
+/**
+ * @brief Visit an optional property value
+ */
+template<typename Visitor>
+auto visit_optional(property_value& val, Visitor&& vis) -> decltype(auto) {
+    return std::visit(std::forward<Visitor>(vis), std::get<optional_types>(val));
+}
 
-    throw type_error("", "", type);
+template<typename Visitor>
+auto visit_optional(const property_value& val, Visitor&& vis) -> decltype(auto) {
+    return std::visit(std::forward<Visitor>(vis), std::get<optional_types>(val));
+}
+
+/**
+ * @brief Visit a list property value
+ */
+template<typename Visitor>
+auto visit_list(property_value& val, Visitor&& vis) -> decltype(auto) {
+    return std::visit(std::forward<Visitor>(vis), std::get<list_types>(val));
+}
+
+template<typename Visitor>
+auto visit_list(const property_value& val, Visitor&& vis) -> decltype(auto) {
+    return std::visit(std::forward<Visitor>(vis), std::get<list_types>(val));
+}
+
+/**
+ * @brief Get the struct_accessor from a property value
+ */
+inline auto get_struct_accessor(property_value& val) -> struct_accessor& {
+    return std::get<struct_accessor>(val);
+}
+
+inline auto get_struct_accessor(const property_value& val) -> const struct_accessor& {
+    return std::get<struct_accessor>(val);
 }
 
 } // namespace composite::properties

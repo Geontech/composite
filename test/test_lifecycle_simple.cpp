@@ -10,7 +10,7 @@ using namespace composite;
 class SimpleTestSink : public component {
 public:
     SimpleTestSink() : component("SimpleTestSink") {
-        add_port(&m_input);
+        add_port(m_input);
         m_input.depth(100);
     }
 
