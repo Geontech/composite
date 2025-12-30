@@ -1,20 +1,6 @@
 /*
  * Copyright (C) 2024-2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #pragma once
@@ -28,6 +14,7 @@
 #include <concepts>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
@@ -56,9 +43,7 @@ public:
 
     virtual ~component() override {
         stop();
-        if (m_logger) {
-            m_logger->flush();
-        }
+        if (m_logger) { m_logger->flush(); }
     }
 
     auto id() const noexcept -> const std::string& {
@@ -90,7 +75,11 @@ public:
 
     virtual auto process() -> retval = 0;
 
-    auto add_port(port_base* port) {
+    auto add_port(port_base& port) -> void {
+        m_port_set.add_port(port);
+    }
+
+    auto add_port(port_base* port) -> void {
         m_port_set.add_port(port);
     }
 
@@ -172,129 +161,160 @@ public:
         return m_connections;
     }
 
+    // ========================================================================
+    // Property Registration API
+    // ========================================================================
+
+    /**
+     * @brief Register a scalar, optional, or scalar-list property
+     * Excludes struct types and struct list types which use separate overloads.
+     */
     template <typename T>
-    auto add_property(std::string_view name, T* prop) -> property& {
-       return  m_prop_set.add_property(name, prop);
+    requires (!properties::has_property_traits_v<T>) &&
+             (!properties::is_vector_v<std::remove_cvref_t<T>> ||
+              properties::is_scalar_type_v<typename std::remove_cvref_t<T>::value_type>)
+    auto add_property(
+      std::string_view name,
+      T& ref,
+      properties::config_type config = properties::config_type::INITIALIZE,
+      std::string_view units = "") -> properties::property& {
+        return m_prop_set.add(name, ref, config, units);
     }
 
-    template <typename T, typename Func>
-    auto add_struct_property(std::string_view name, T* obj, Func&& register_fields) -> property& {
-        return m_prop_set.add_struct_property(name, obj, register_fields);
-    }
-
+    /**
+     * @brief Register a struct property (no units parameter)
+     * Requires property_traits<T> specialization.
+     */
     template <typename T>
-    auto add_list_property(std::string_view name, std::vector<T>* vec) -> property& {
-        return m_prop_set.add_list_property(name, vec);
+    requires properties::has_property_traits_v<T>
+    auto add_property(
+      std::string_view name,
+      T& ref,
+      properties::config_type config = properties::config_type::INITIALIZE) -> properties::property& {
+        return m_prop_set.add(name, ref, config);
     }
 
-    template <typename T, typename Func>
-    auto add_struct_list_property(std::string_view name, std::vector<T>* vec, Func&& register_fields) -> property& {
-        return m_prop_set.add_struct_list_property(name, vec, register_fields);
+    /**
+     * @brief Register a struct list property (no units parameter)
+     * Requires property_traits<T::value_type> specialization.
+     */
+    template <typename T>
+    requires properties::is_vector_v<std::remove_cvref_t<T>> &&
+             properties::has_property_traits_v<typename std::remove_cvref_t<T>::value_type>
+    auto add_property(
+      std::string_view name, T& ref,
+      properties::config_type config = properties::config_type::INITIALIZE) -> properties::property& {
+        return m_prop_set.add(name, ref, config);
     }
+
+    // ========================================================================
+    // Property Access
+    // ========================================================================
 
     template <typename T>
     auto get_property(std::string_view name) const -> T {
-        return m_prop_set.get_property<T>(name);
+        return m_prop_set.get<T>(name);
     }
+
+    // ========================================================================
+    // Property Setting
+    // ========================================================================
 
     auto set_properties(
       const std::vector<std::pair<std::string, std::string>>& values,
-      properties::config_type config=properties::config_type::INITIALIZE,
-      bool allow_unknown_key=false) -> void {
+      properties::config_type config = properties::config_type::INITIALIZE,
+      bool allow_unknown_key = false) -> void {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         m_prop_change_requested = false;
 
         try {
-            m_prop_set.set_properties(values, config, allow_unknown_key);
-        } catch(const properties::key_error& err) {
-            auto throw_err = properties::key_error(m_id, err.prop);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::type_error& err) {
-            auto throw_err = properties::type_error(m_id, err.prop, err.type);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::value_error& err) {
-            auto throw_err = properties::value_error(m_id, err.prop, err.value);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::configurability_error& err) {
-            auto throw_err = properties::configurability_error(m_id, err.prop);
-            logger()->error(throw_err.what());
-            throw throw_err;
+            m_prop_set.set_batch(values, config, allow_unknown_key);
+        } catch (const properties::key_error& err) {
+            logger()->error("{}: unknown property '{}'", m_id, err.name);
+            throw;
+        } catch (const properties::config_error& err) {
+            logger()->error("{}: property '{}' is not runtime configurable", m_id, err.name);
+            throw;
+        } catch (const properties::value_error& err) {
+            logger()->error("{}: invalid value for property '{}'", m_id, err.name);
+            throw;
+        } catch (const properties::listener_rejected& err) {
+            logger()->error("{}: change listener rejected update to '{}'", m_id, err.name);
+            throw;
         } catch (const std::exception& ex) {
             logger()->error("{}: unexpected property error: {}", m_id, ex.what());
             throw;
         }
     }
 
-    auto set_properties(
-      const std::vector<std::pair<std::string, std::vector<std::string>>>& values,
-      properties::config_type config=properties::config_type::INITIALIZE,
-      bool allow_unknown_key=false) -> void {
+    auto append_struct_list(
+      std::string_view name,
+      std::span<const std::pair<std::string, std::string>> fields,
+      properties::config_type config = properties::config_type::INITIALIZE) -> std::size_t {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         m_prop_change_requested = false;
 
         try {
-            m_prop_set.set_properties(values, config, allow_unknown_key);
-        } catch(const properties::key_error& err) {
-            auto throw_err = properties::key_error(m_id, err.prop);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::type_error& err) {
-            auto throw_err = properties::type_error(m_id, err.prop, err.type);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::value_error& err) {
-            auto throw_err = properties::value_error(m_id, err.prop, err.value);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::configurability_error& err) {
-            auto throw_err = properties::configurability_error(m_id, err.prop);
-            logger()->error(throw_err.what());
-            throw throw_err;
+            return m_prop_set.append_struct_list(name, fields, config);
+        } catch (const properties::key_error& err) {
+            logger()->error("{}: unknown property '{}'", m_id, err.name);
+            throw;
+        } catch (const properties::config_error& err) {
+            logger()->error("{}: property '{}' is not runtime configurable", m_id, err.name);
+            throw;
+        } catch (const properties::value_error& err) {
+            logger()->error("{}: invalid value for property '{}'", m_id, err.name);
+            throw;
+        } catch (const properties::listener_rejected& err) {
+            logger()->error("{}: change listener rejected update to '{}'", m_id, err.name);
+            throw;
         } catch (const std::exception& ex) {
             logger()->error("{}: unexpected property error: {}", m_id, ex.what());
             throw;
         }
     }
 
-    auto set_properties(
-      const std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>& values,
-      properties::config_type config=properties::config_type::INITIALIZE,
-      bool allow_unknown_key=false) -> void {
+    auto update_struct_list_element(
+      std::string_view name,
+      std::size_t index,
+      std::span<const std::pair<std::string, std::string>> fields,
+      properties::config_type config = properties::config_type::INITIALIZE) -> void {
         m_prop_change_requested = true;
         auto lk = std::scoped_lock{m_prop_mtx};
         m_prop_change_requested = false;
 
         try {
-            m_prop_set.set_properties(values, config, allow_unknown_key);
-        } catch(const properties::key_error& err) {
-            auto throw_err = properties::key_error(m_id, err.prop);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::type_error& err) {
-            auto throw_err = properties::type_error(m_id, err.prop, err.type);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::value_error& err) {
-            auto throw_err = properties::value_error(m_id, err.prop, err.value);
-            logger()->error(throw_err.what());
-            throw throw_err;
-        } catch(const properties::configurability_error& err) {
-            auto throw_err = properties::configurability_error(m_id, err.prop);
-            logger()->error(throw_err.what());
-            throw throw_err;
+            m_prop_set.update_struct_list_element(name, index, fields, config);
+        } catch (const properties::key_error& err) {
+            logger()->error("{}: unknown property '{}'", m_id, err.name);
+            throw;
+        } catch (const properties::config_error& err) {
+            logger()->error("{}: property '{}' is not runtime configurable", m_id, err.name);
+            throw;
+        } catch (const properties::value_error& err) {
+            logger()->error("{}: invalid value for property '{}'", m_id, err.name);
+            throw;
+        } catch (const properties::listener_rejected& err) {
+            logger()->error("{}: change listener rejected update to '{}'", m_id, err.name);
+            throw;
         } catch (const std::exception& ex) {
             logger()->error("{}: unexpected property error: {}", m_id, ex.what());
             throw;
         }
     }
 
-    auto add_property_change_listener(std::string_view name, property_set::change_func_type func) -> void {
-        m_prop_set.add_change_listener(name, func);
+    // ========================================================================
+    // Change Listener Registration
+    // ========================================================================
+
+    auto add_property_change_listener(std::string_view name, properties::property::change_listener_fn func) -> void {
+        m_prop_set.add_change_listener(name, std::move(func));
+    }
+
+    auto add_property_change_listener(std::string_view name, properties::property::indexed_change_listener_fn func) -> void {
+        m_prop_set.add_change_listener(name, std::move(func));
     }
 
     virtual auto property_change_handler() -> void {
@@ -302,8 +322,12 @@ public:
         // Gets executed at the end of set_properties function
     }
 
-    auto properties() const -> const typename property_set::property_map_type& {
+    auto properties() const -> const properties::property_set::property_map& {
         return m_prop_set.properties();
+    }
+
+    auto property_set() const -> const properties::property_set& {
+        return m_prop_set;
     }
 
     auto log_level(spdlog::level::level_enum level) const -> void {
@@ -359,9 +383,9 @@ protected:
         }
         auto pattern = std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
         m_logger->set_pattern(pattern);
-        add_property("noop_thread_delay", &m_delay).units("ns");
-        add_property("enabled", &m_enabled)
-            .configurability(composite::properties::config_type::RUNTIME)
+        add_property("noop_thread_delay", m_delay).units("ns");
+        add_property("enabled", m_enabled)
+            .configurability(properties::config_type::RUNTIME)
             .change_listener([this]() -> bool {
                 // Mark that lifecycle change is pending
                 m_lifecycle_change_pending = true;
@@ -382,7 +406,7 @@ private:
     bool m_enabled{true};
     std::optional<cpu_set_t> m_cpu_affinity;
     port_set m_port_set;
-    property_set m_prop_set;
+    properties::property_set m_prop_set;
     std::mutex m_prop_mtx;
     std::atomic_bool m_prop_change_requested{};
     std::atomic_bool m_lifecycle_change_pending{false};

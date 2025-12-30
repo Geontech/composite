@@ -1,148 +1,264 @@
 /*
- * Copyright (C) 2025 Geon Technologies, LLC
- *
- * This file is part of composite.
- *
- * composite is free software: you can redistribute it and/or modify it under the
- * terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option)
- * any later version.
- *
- * composite is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
- * more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program. If not, see http://www.gnu.org/licenses/.
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
 #pragma once
 
-#include "property_metadata.hpp"
-#include "property_operations.hpp"
+#include "types.hpp"
+#include "property_traits.hpp"
 
-#include <any>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
-#include <variant>
 
-namespace composite {
+namespace composite::properties {
 
 // Forward declaration
 class property_set;
 
+/**
+ * @brief A single property with metadata and change notification
+ *
+ * Properties store a pointer to the actual data via the property_value variant.
+ * They also hold metadata (units, configurability) and optional change listeners.
+ */
 class property {
 public:
-    using change_func_type = std::function<bool()>;
-    using indexed_change_func_type = std::function<bool(std::size_t)>;
-    using any_change_listener = std::variant<std::monostate, change_func_type, indexed_change_func_type>;
+    /// Change listener signature for scalar/struct properties
+    using change_listener_fn = std::function<bool()>;
 
-    property(std::string_view type, std::any value) :
-      m_type(type),
-      m_value(value) {}
+    /// Change listener signature for list properties (receives modified index)
+    using indexed_change_listener_fn = std::function<bool(std::size_t)>;
 
-    // Type information
-    auto type() const noexcept -> std::string { return m_type; }
-    auto type(std::string_view value) -> void { m_type = value; }
-    auto is_optional() const noexcept -> bool { return m_type.ends_with('?'); }
-    auto is_list() const noexcept -> bool { return m_type.starts_with("[]"); }
-    auto is_structured() const noexcept -> bool { return m_struct != nullptr; }
+    /// Contextual change listener signature (receives change type)
+    using contextual_change_listener_fn = std::function<bool(change_type)>;
 
-    // Value access
-    auto value() const -> const std::any& { return m_value; }
-    auto value() -> std::any& { return m_value; }
-    auto value(std::any value) -> void { m_value = value; }
+    /// Contextual indexed change listener signature (receives index and change type)
+    using contextual_indexed_change_listener_fn = std::function<bool(std::size_t, change_type)>;
 
-    // Metadata
-    auto units() const noexcept -> std::string { return m_units; }
+    // ========================================================================
+    // Constructors for different property types
+    // ========================================================================
+
+    /// Construct from a scalar pointer
+    template<typename T>
+    requires is_scalar_type_v<T>
+    explicit property(T* ptr)
+        : m_value{scalar_types{ptr}}
+        , m_type_name{type_name_v<T>} {}
+
+    /// Construct from an optional pointer
+    template<typename T>
+    requires is_scalar_type_v<T>
+    explicit property(std::optional<T>* ptr)
+        : m_value{optional_types{ptr}}
+        , m_type_name{std::string{type_name_v<T>} + "?"} {}
+
+    /// Construct from a vector pointer (list of scalars)
+    template<typename T>
+    requires is_scalar_type_v<T>
+    explicit property(std::vector<T>* ptr)
+        : m_value{list_types{ptr}}
+        , m_type_name{std::string{"[]"} + type_name_v<T>} {}
+
+    /// Construct from a struct accessor
+    explicit property(struct_accessor acc, bool is_list = false)
+        : m_value{std::move(acc)}
+        , m_type_name{is_list ? "[]struct" : "struct"} {}
+
+    // ========================================================================
+    // Fluent Metadata Setters
+    // ========================================================================
+
+    /// Set the units string (e.g., "Hz", "ms", "dB")
     auto units(std::string_view u) -> property& {
-        m_units = std::string{u};
+        m_units = u;
         return *this;
     }
 
-    auto configurability() const noexcept -> properties::config_type { return m_configurability; }
-    auto configurability(properties::config_type value) -> property& {
-        m_configurability = value;
+    /// Set the configurability (INITIALIZE or RUNTIME)
+    auto configurability(config_type c) -> property& {
+        m_config = c;
         return *this;
     }
 
-    // Change listeners
-    auto change_listener() const noexcept -> any_change_listener { return m_change_func; }
+    /// Set a change listener for scalar/struct properties
+    auto change_listener(change_listener_fn fn) -> property& {
+        m_on_change = std::move(fn);
+        return *this;
+    }
 
-    auto change_listener(change_func_type value) -> void {
-        if (this->is_list()) {
-            throw std::runtime_error("list properties must use indexed change listener");
+    /// Set an indexed change listener for list properties
+    auto change_listener(indexed_change_listener_fn fn) -> property& {
+        m_on_index_change = std::move(fn);
+        return *this;
+    }
+
+    /// Set a contextual change listener for scalar/struct properties (receives change type)
+    auto change_listener(contextual_change_listener_fn fn) -> property& {
+        m_on_change_ctx = std::move(fn);
+        return *this;
+    }
+
+    /// Set a contextual indexed change listener for list properties (receives index and change type)
+    auto change_listener(contextual_indexed_change_listener_fn fn) -> property& {
+        m_on_index_change_ctx = std::move(fn);
+        return *this;
+    }
+
+    // ========================================================================
+    // Metadata Getters
+    // ========================================================================
+
+    [[nodiscard]] auto units() const noexcept -> std::string_view {
+        return m_units;
+    }
+
+    [[nodiscard]] auto configurability() const noexcept -> config_type {
+        return m_config;
+    }
+
+    [[nodiscard]] auto type_name() const noexcept -> std::string_view {
+        return m_type_name;
+    }
+
+    auto set_type_name(std::string_view type_name) -> void {
+        m_type_name = type_name;
+    }
+
+    // ========================================================================
+    // Type Queries
+    // ========================================================================
+
+    [[nodiscard]] auto is_scalar() const noexcept -> bool {
+        return std::holds_alternative<scalar_types>(m_value);
+    }
+
+    [[nodiscard]] auto is_optional() const noexcept -> bool {
+        return std::holds_alternative<optional_types>(m_value);
+    }
+
+    [[nodiscard]] auto is_list() const noexcept -> bool {
+        if (std::holds_alternative<list_types>(m_value)) return true;
+        if (auto* acc = std::get_if<struct_accessor>(&m_value)) {
+            return acc->is_list();
         }
-        m_change_func = value;
+        return false;
     }
 
-    auto change_listener(indexed_change_func_type value) -> void {
-        if (!this->is_list()) {
-            throw std::runtime_error("non-list properties must use non-indexed change listener");
+    [[nodiscard]] auto is_struct() const noexcept -> bool {
+        if (auto* acc = std::get_if<struct_accessor>(&m_value)) {
+            return !acc->is_list();
         }
-        m_change_func = value;
+        return false;
     }
 
-    // Structured property access
-    auto structured() -> property_set& { return *m_struct; }
-    auto structured() const -> const property_set& { return *m_struct; }
-    auto structured(std::shared_ptr<property_set> s) -> void { m_struct = std::move(s); }
-
-    // Struct operations (delegated to helper)
-    auto struct_registration(detail::struct_operations::registration_func func) -> void {
-        m_struct_ops.set_registration_func(std::move(func));
-    }
-    auto struct_registration(property_set& set, void* ptr) const -> void {
-        m_struct_ops.register_fields(set, ptr);
+    [[nodiscard]] auto is_struct_list() const noexcept -> bool {
+        if (auto* acc = std::get_if<struct_accessor>(&m_value)) {
+            return acc->is_list();
+        }
+        return false;
     }
 
-    auto struct_reset(detail::struct_operations::reset_func func) -> void {
-        m_struct_ops.set_reset_func(std::move(func));
-    }
-    auto struct_reset() -> void {
-        m_struct_ops.reset(m_value);
+    // ========================================================================
+    // Value Access
+    // ========================================================================
+
+    [[nodiscard]] auto value() const noexcept -> const property_value& {
+        return m_value;
     }
 
-    auto struct_emplace_back(detail::struct_operations::emplace_back_func func) -> void {
-        m_struct_ops.set_emplace_back_func(std::move(func));
-    }
-    auto struct_emplace_back() -> std::optional<std::size_t> {
-        return m_struct_ops.emplace_back(m_value);
+    [[nodiscard]] auto value() noexcept -> property_value& {
+        return m_value;
     }
 
-    auto struct_erase(detail::struct_operations::erase_func func) -> void {
-        m_struct_ops.set_erase_func(std::move(func));
-    }
-    auto struct_erase(std::size_t index) -> void {
-        m_struct_ops.erase(m_value, index);
+    // ========================================================================
+    // Nested Property Set (for struct properties)
+    // ========================================================================
+
+    /// Get the nested property_set for struct properties
+    [[nodiscard]] auto nested() const -> const property_set* {
+        return m_nested.get();
     }
 
-    auto struct_getter(detail::struct_operations::getter_func func) -> void {
-        m_struct_ops.set_getter_func(std::move(func));
-    }
-    auto struct_getter(std::size_t index) const -> void* {
-        return m_struct_ops.get_element(m_value, index);
+    [[nodiscard]] auto nested() -> property_set* {
+        return m_nested.get();
     }
 
-    auto struct_list_size(detail::struct_operations::list_size_func func) -> void {
-        m_struct_ops.set_list_size_func(std::move(func));
+    /// Set the nested property_set
+    auto set_nested(std::unique_ptr<property_set> ps) -> void {
+        m_nested = std::move(ps);
     }
-    auto struct_list_size() const -> std::size_t {
-        return m_struct_ops.list_size(m_value);
+
+    // ========================================================================
+    // Change Notification
+    // ========================================================================
+
+    /// Invoke change listener (for scalar/struct properties) without context
+    /// @returns true if accepted (or no listener), false if rejected
+    [[nodiscard]] auto notify_change() const -> bool {
+        if (m_on_change) {
+            return m_on_change();
+        }
+        return true;
+    }
+
+    /// Invoke change listener with context (for scalar/struct properties)
+    /// Calls contextual listener if set, otherwise falls back to simple listener
+    /// @returns true if accepted (or no listener), false if rejected
+    [[nodiscard]] auto notify_change(change_type ctx) const -> bool {
+        if (m_on_change_ctx) {
+            return m_on_change_ctx(ctx);
+        }
+        if (m_on_change) {
+            return m_on_change();
+        }
+        return true;
+    }
+
+    /// Invoke indexed change listener (for list properties) without context
+    /// @returns true if accepted (or no listener), false if rejected
+    [[nodiscard]] auto notify_change(std::size_t index) const -> bool {
+        if (m_on_index_change) {
+            return m_on_index_change(index);
+        }
+        return true;
+    }
+
+    /// Invoke indexed change listener with context (for list properties)
+    /// Calls contextual listener if set, otherwise falls back to simple listener
+    /// @returns true if accepted (or no listener), false if rejected
+    [[nodiscard]] auto notify_change(std::size_t index, change_type ctx) const -> bool {
+        if (m_on_index_change_ctx) {
+            return m_on_index_change_ctx(index, ctx);
+        }
+        if (m_on_index_change) {
+            return m_on_index_change(index);
+        }
+        return true;
+    }
+
+    /// Check if a change listener is set
+    [[nodiscard]] auto has_change_listener() const noexcept -> bool {
+        return static_cast<bool>(m_on_change) || static_cast<bool>(m_on_index_change) ||
+               static_cast<bool>(m_on_change_ctx) || static_cast<bool>(m_on_index_change_ctx);
     }
 
 private:
-    std::string m_type;
-    std::any m_value;
+    property_value m_value;
+    std::string m_type_name;
     std::string m_units;
-    properties::config_type m_configurability{};
-    any_change_listener m_change_func;
-    std::shared_ptr<property_set> m_struct;
-    mutable detail::struct_operations m_struct_ops;
+    config_type m_config{config_type::INITIALIZE};
 
-}; // class property
+    change_listener_fn m_on_change;
+    indexed_change_listener_fn m_on_index_change;
+    contextual_change_listener_fn m_on_change_ctx;
+    contextual_indexed_change_listener_fn m_on_index_change_ctx;
 
-} // namespace composite
+    /// Nested property_set for struct properties
+    std::unique_ptr<property_set> m_nested;
+};
+
+} // namespace composite::properties
