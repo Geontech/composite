@@ -5,13 +5,16 @@
 
 #pragma once
 
+#include "composite/metrics/metrics.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
 #include "composite/ports/port_set.hpp"
 #include "composite/properties/property_set.hpp"
 #include "lifecycle.hpp"
 
+#include <chrono>
 #include <concepts>
+#include <format>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -66,21 +69,33 @@ public:
                 m_logger->warn("Failed to set thread CPU affinity: {}", strerror(errno));
             }
         }
+
+        // Update state metric
+        if (m_state) { m_state->set(1.0); }
     }
 
     auto stop() -> void override {
         m_enabled = false;
         m_thread.reset();
+
+        // Update state metric
+        if (m_state) { m_state->set(0.0); }
     }
 
     virtual auto process() -> retval = 0;
 
     auto add_port(port_base& port) -> void {
         m_port_set.add_port(port);
+
+        // Register port metrics with component context
+        port.register_port_metrics(m_id);
     }
 
     auto add_port(port_base* port) -> void {
         m_port_set.add_port(port);
+
+        // Register port metrics with component context
+        port->register_port_metrics(m_id);
     }
 
     template <typename T>
@@ -376,6 +391,7 @@ public:
 protected:
     explicit component(std::string_view id) :
       m_id(id),
+      m_metric_name_prefix(metrics::sanitize_for_metric_name(id)),
       m_sink(std::make_shared<spdlog::sinks::stdout_color_sink_mt>()),
       m_logger(std::make_shared<spdlog::logger>(m_id, m_sink)) {
         if (m_id.empty()) {
@@ -383,6 +399,10 @@ protected:
         }
         auto pattern = std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", m_id);
         m_logger->set_pattern(pattern);
+
+        // Register component lifecycle metrics
+        register_lifecycle_metrics();
+
         add_property("noop_thread_delay", m_delay).units("ns");
         add_property("enabled", m_enabled)
             .configurability(properties::config_type::RUNTIME)
@@ -397,8 +417,145 @@ protected:
         return m_logger;
     }
 
+    // ========================================================================
+    // Metrics Convenience Methods
+    // ========================================================================
+
+    /**
+     * @brief Create a counter metric for this component
+     *
+     * The metric name is automatically namespaced with the component ID
+     * (e.g., "packets_sent" becomes "my_component.packets_sent").
+     * A "component_id" label is automatically added.
+     *
+     * @param name Metric name (will be prefixed with component ID)
+     * @param description Human-readable description
+     * @param unit Unit of measurement (default "1")
+     * @param labels Additional labels (component_id is auto-added)
+     * @return Reference to the created counter
+     */
+    auto create_counter(
+        std::string_view name,
+        std::string_view description = "",
+        std::string_view unit = "1",
+        metrics::labels_t labels = {}
+    ) -> metrics::counter<uint64_t>& {
+        labels.emplace_back("component_id", m_id);
+        return metrics::registry::instance().create_counter(
+            std::format("{}.{}", m_metric_name_prefix, name),
+            std::string{description},
+            std::string{unit},
+            std::move(labels)
+        );
+    }
+
+    /**
+     * @brief Create an up/down counter metric for this component
+     *
+     * @param name Metric name (will be prefixed with component ID)
+     * @param description Human-readable description
+     * @param unit Unit of measurement (default "1")
+     * @param labels Additional labels (component_id is auto-added)
+     * @return Reference to the created updown_counter
+     */
+    auto create_updown_counter(
+        std::string_view name,
+        std::string_view description = "",
+        std::string_view unit = "1",
+        metrics::labels_t labels = {}
+    ) -> metrics::updown_counter<int64_t>& {
+        labels.emplace_back("component_id", m_id);
+        return metrics::registry::instance().create_updown_counter(
+            std::format("{}.{}", m_metric_name_prefix, name),
+            std::string{description},
+            std::string{unit},
+            std::move(labels)
+        );
+    }
+
+    /**
+     * @brief Create a gauge metric for this component
+     *
+     * @param name Metric name (will be prefixed with component ID)
+     * @param description Human-readable description
+     * @param unit Unit of measurement (default "1")
+     * @param labels Additional labels (component_id is auto-added)
+     * @return Reference to the created gauge
+     */
+    auto create_gauge(
+        std::string_view name,
+        std::string_view description = "",
+        std::string_view unit = "1",
+        metrics::labels_t labels = {}
+    ) -> metrics::gauge<double>& {
+        labels.emplace_back("component_id", m_id);
+        return metrics::registry::instance().create_gauge(
+            std::format("{}.{}", m_metric_name_prefix, name),
+            std::string{description},
+            std::string{unit},
+            std::move(labels)
+        );
+    }
+
+    /**
+     * @brief Create a histogram metric for this component
+     *
+     * @param name Metric name (will be prefixed with component ID)
+     * @param description Human-readable description
+     * @param unit Unit of measurement
+     * @param boundaries Bucket boundaries
+     * @param labels Additional labels (component_id is auto-added)
+     * @return Reference to the created histogram
+     */
+    auto create_histogram(
+        std::string_view name,
+        std::string_view description,
+        std::string_view unit,
+        std::vector<double> boundaries,
+        metrics::labels_t labels = {}
+    ) -> metrics::histogram& {
+        labels.emplace_back("component_id", m_id);
+        return metrics::registry::instance().create_histogram(
+            std::format("{}.{}", m_metric_name_prefix, name),
+            std::string{description},
+            std::string{unit},
+            std::move(boundaries),
+            std::move(labels)
+        );
+    }
+
+    /**
+     * @brief Create a histogram with power-of-2 boundaries for this component
+     *
+     * Power-of-2 boundaries enable O(1) bucket lookup via bit manipulation.
+     *
+     * @param name Metric name (will be prefixed with component ID)
+     * @param description Human-readable description
+     * @param unit Unit of measurement
+     * @param num_buckets Number of buckets (default 20, covering 0 to ~500K)
+     * @param labels Additional labels (component_id is auto-added)
+     * @return Reference to the created histogram
+     */
+    auto create_histogram_pow2(
+        std::string_view name,
+        std::string_view description = "",
+        std::string_view unit = "1",
+        std::size_t num_buckets = 20,
+        metrics::labels_t labels = {}
+    ) -> metrics::histogram& {
+        labels.emplace_back("component_id", m_id);
+        return metrics::registry::instance().create_histogram_pow2(
+            std::format("{}.{}", m_metric_name_prefix, name),
+            std::string{description},
+            std::string{unit},
+            num_buckets,
+            std::move(labels)
+        );
+    }
+
 private:
     std::string m_id;
+    std::string m_metric_name_prefix;  // Sanitized ID for metric names
     std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> m_sink;
     std::shared_ptr<spdlog::logger> m_logger;
     std::optional<std::jthread> m_thread;
@@ -412,6 +569,61 @@ private:
     std::atomic_bool m_lifecycle_change_pending{false};
     std::vector<connection> m_connections;
     std::map<std::string, std::size_t> m_saved_input_depths;
+
+    // Lifecycle metrics (registered in constructor)
+    metrics::counter<uint64_t>* m_process_calls{nullptr};
+    metrics::counter<uint64_t>* m_noop_count{nullptr};
+    metrics::histogram* m_process_time{nullptr};
+    metrics::gauge<double>* m_state{nullptr};
+
+    /**
+     * @brief Register component lifecycle metrics
+     *
+     * Creates the following metrics in the global registry:
+     * - composite.component.process_calls: Number of times process() was called
+     * - composite.component.noop_count: Number of times process() returned NOOP
+     * - composite.component.process_time: Histogram of process() execution time in microseconds
+     * - composite.component.state: Current state (0=stopped, 1=running)
+     */
+    auto register_lifecycle_metrics() -> void {
+        auto& registry = metrics::registry::instance();
+
+        metrics::labels_t labels = {{"component_id", m_id}};
+
+        m_process_calls = &registry.get_or_create_counter(
+            "composite.component.process_calls",
+            "Number of times process() was called",
+            "1",
+            labels
+        );
+
+        m_noop_count = &registry.get_or_create_counter(
+            "composite.component.noop_count",
+            "Number of times process() returned NOOP",
+            "1",
+            labels
+        );
+
+        // Power-of-2 histogram for process time in microseconds
+        // 20 buckets covers 1µs to ~1s which handles most signal processing scenarios
+        m_process_time = &registry.get_or_create_histogram_pow2(
+            "composite.component.process_time",
+            "Time spent in process() call",
+            "us",
+            20,
+            labels
+        );
+
+        m_state = &registry.get_or_create_gauge(
+            "composite.component.state",
+            "Component state (0=stopped, 1=running)",
+            "1",
+            labels
+        );
+
+        // Initialize state to stopped
+        m_state->set(0.0);
+    }
 
     /**
      * @brief Pause all input ports by setting their queue depth to 0
@@ -454,9 +666,17 @@ private:
         while (!token.stop_requested()) {
             if (m_prop_change_requested) {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;  // Let set_properties() acquire the lock
             }
-            auto lk = std::scoped_lock{m_prop_mtx};
+            auto lk = std::unique_lock<std::mutex>{m_prop_mtx, std::defer_lock};
+            if (!lk.try_lock()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+            }
             retval res;
+
+            // Time the process() call
+            auto start = std::chrono::steady_clock::now();
             try {
                 res = process();
             } catch (const std::exception& e) {
@@ -468,7 +688,15 @@ private:
                 pause_input_ports();
                 res = FINISH;
             }
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+
+            // Record metrics
+            if (m_process_calls) { m_process_calls->inc(); }
+            if (m_process_time) { m_process_time->record(static_cast<double>(elapsed_us)); }
+
             if (res == NOOP) {
+                if (m_noop_count) { m_noop_count->inc(); }
                 std::this_thread::sleep_for(std::chrono::nanoseconds{m_delay});
             } else if (res == FINISH) {
                 break;

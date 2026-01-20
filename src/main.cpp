@@ -13,6 +13,10 @@
 #include "composite/dpdk/manager.hpp"
 #endif
 
+#ifdef COMPOSITE_USE_OPENTELEMETRY
+#include "composite/telemetry/manager.hpp"
+#endif
+
 #include <argparse/argparse.hpp>
 #include <atomic>
 #include <csignal>
@@ -169,22 +173,13 @@ auto main(int argc, char** argv) -> int {
     // DPDK Port Discovery (early exit if requested)
     // ========================================
     if (program.get<bool>("--list-dpdk-ports")) {
-        // Check if DPDK is configured
-        if (!app_json.contains("dpdk")) {
-            spdlog::error("DPDK config not found");
-            return EXIT_FAILURE;
+        // Initialize DPDK (best effort; uses config if present)
+        auto dpdk_cfg = composite::dpdk::config{};
+        if (app_json.contains("dpdk")) {
+            dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
+        } else {
+            spdlog::warn("DPDK config not found; attempting discovery with default EAL args");
         }
-        if (!app_json["dpdk"].contains("enabled")) {
-            spdlog::error("DPDK enable flag not found in config");
-            return EXIT_FAILURE;
-        }
-        if (!app_json["dpdk"]["enabled"].get<bool>()) {
-            spdlog::warn("DPDK not enabled in configuration file");
-            return EXIT_SUCCESS;
-        }
-
-        // Initialize DPDK
-        auto dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
         if (!composite::dpdk::manager::instance().initialize(dpdk_cfg)) {
             spdlog::error("failed to initialize DPDK");
             return EXIT_FAILURE;
@@ -196,16 +191,18 @@ auto main(int argc, char** argv) -> int {
         spdlog::info("====================");
 
         auto& mgr = composite::dpdk::manager::instance();
-        if (mgr.get_port_count() == 0) {
-            spdlog::info("No ports configured");
+        auto ports = mgr.list_available_ports();
+        if (ports.empty()) {
+            spdlog::info("No ports detected");
         } else {
-            for (const auto& port_cfg : dpdk_cfg.ports) {
+            for (const auto& port : ports) {
                 spdlog::info(
-                    std::format("Port {}: interface={}, rx_queues={}, mempool={}",
-                        port_cfg.port_id,
-                        port_cfg.interface,
-                        port_cfg.rx_queues,
-                    port_cfg.mempool_name
+                    std::format("Port {}: driver={}, max_rx_queues={}, max_tx_queues={}, socket={}",
+                        port.port_id,
+                        port.driver_name,
+                        port.max_rx_queues,
+                        port.max_tx_queues,
+                        port.socket_id
                     )
                 );
             }
@@ -343,6 +340,34 @@ auto main(int argc, char** argv) -> int {
     std::vector<int> dpdk_logical_cores;  // Empty when DPDK not enabled
 #endif
 
+#ifdef COMPOSITE_USE_OPENTELEMETRY
+    // ========================================
+    // Telemetry Initialization (OpenTelemetry)
+    // ========================================
+    bool telemetry_initialized = false;
+    auto shutdown_telemetry = [&]() {
+        if (!telemetry_initialized) {
+            return;
+        }
+        spdlog::trace("shutting down OpenTelemetry");
+        composite::telemetry::manager::instance().shutdown();
+        telemetry_initialized = false;
+    };
+
+    if (app_json.contains("telemetry") && app_json["telemetry"].value("enabled", false)) {
+        spdlog::debug("initializing OpenTelemetry");
+        auto telemetry_cfg = composite::parse_telemetry_config(app_json["telemetry"]);
+        if (!composite::telemetry::manager::instance().initialize(telemetry_cfg)) {
+            spdlog::error("failed to initialize OpenTelemetry");
+            shutdown_dpdk();
+            return EXIT_FAILURE;
+        }
+        telemetry_initialized = true;
+    }
+#else
+    auto shutdown_telemetry = [](){};
+#endif
+
     // ========================================
     // Application Initialization
     // ========================================
@@ -398,9 +423,10 @@ auto main(int argc, char** argv) -> int {
     // Component Loading and Configuration
     // ========================================
     // Error handler that cleans up application resources
-    auto cleanup_and_exit = [&app, &shutdown_dpdk](std::string_view msg) {
+    auto cleanup_and_exit = [&app, &shutdown_telemetry, &shutdown_dpdk](std::string_view msg) {
         spdlog::error("{}", msg);
         app.clear();
+        shutdown_telemetry();
         shutdown_dpdk();
         return EXIT_FAILURE;
     };
@@ -420,6 +446,20 @@ auto main(int argc, char** argv) -> int {
             auto cpuset_opt = composite::parse_affinity_config(affinity_str, available_cores);
             if (cpuset_opt.has_value()) {
                 comp_ptr->set_cpu_affinity(*cpuset_opt);
+                spdlog::debug("Component '{}' cpu_affinity resolved cores: [{}]",
+                    comp_ptr->id(),
+                    [&cpuset_opt]() {
+                        std::string result;
+                        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+                            if (CPU_ISSET(cpu, &(*cpuset_opt))) {
+                                if (!result.empty()) {
+                                    result += ", ";
+                                }
+                                result += std::to_string(cpu);
+                            }
+                        }
+                        return result;
+                    }());
                 spdlog::debug("Component '{}' cpu_affinity configured: '{}'", comp_ptr->id(), affinity_str);
             } else if (affinity_str != "none" && !affinity_str.empty()) {
                 return cleanup_and_exit(
@@ -605,10 +645,12 @@ auto main(int argc, char** argv) -> int {
         app.clear();
     } catch (const std::exception& e) {
         spdlog::critical("unhandled exception in main: {}", e.what());
+        shutdown_telemetry();
         shutdown_dpdk();
         return EXIT_FAILURE;
     }
 
+    shutdown_telemetry();
     shutdown_dpdk();
 
     spdlog::trace("complete");

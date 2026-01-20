@@ -83,6 +83,13 @@ if(COMPOSITE_USE_DPDK)
     message(STATUS "Found DPDK: ${DPDK_VERSION}")
 endif()
 
+# OpenTelemetry support
+option(COMPOSITE_USE_OPENTELEMETRY "Compile with OpenTelemetry support" OFF)
+if(COMPOSITE_USE_OPENTELEMETRY)
+    find_package(opentelemetry-cpp REQUIRED)
+    message(STATUS "Found OpenTelemetry: ${opentelemetry-cpp_VERSION}")
+endif()
+
 # OpenSSL support
 option(COMPOSITE_USE_OPENSSL "Compile with OpenSSL support" OFF)
 if(COMPOSITE_USE_OPENSSL)

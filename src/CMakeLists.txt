@@ -32,6 +32,9 @@ endif()
 if(COMPOSITE_USE_NATS)
     target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_NATS=1)
 endif()
+if(COMPOSITE_USE_OPENTELEMETRY)
+    target_compile_definitions(composite-cli PRIVATE COMPOSITE_USE_OPENTELEMETRY=1)
+endif()
 # Includes
 target_include_directories(composite-cli
     PRIVATE ${PROJECT_SOURCE_DIR}/include
@@ -57,5 +60,13 @@ if(COMPOSITE_USE_DPDK)
     target_link_libraries(composite-cli
         PRIVATE
         ${DPDK_LIBRARIES}
+    )
+endif()
+if(COMPOSITE_USE_OPENTELEMETRY)
+    target_link_libraries(composite-cli
+        PRIVATE
+        opentelemetry-cpp::api
+        opentelemetry-cpp::sdk
+        opentelemetry-cpp::otlp_http_exporter
     )
 endif()

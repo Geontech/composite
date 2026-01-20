@@ -5,13 +5,17 @@
 
 #include "composite/core/application.hpp"
 #include "composite/core/component.hpp"
+#include "composite/metrics/metrics.hpp"
 #include "property_handlers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <thread>
+#include <ctime>
 #include <chrono>
+#include <variant>
 
 using namespace composite;
 using namespace std::chrono_literals;
@@ -1151,5 +1155,442 @@ TEST_CASE("HTTP Integration - Port Disconnections") {
 
         auto json = nlohmann::json::parse(result->body);
         REQUIRE(json.contains("error"));
+    }
+}
+
+// ============================================================================
+// Metrics HTTP Endpoint Tests
+// ============================================================================
+
+// Helper function to convert metric_snapshot to JSON (mirrors server.cpp)
+auto metric_snapshot_to_json(const metrics::metric_snapshot& snap) -> nlohmann::json {
+    auto json_obj = nlohmann::json::object();
+    json_obj["name"] = snap.name;
+    json_obj["description"] = snap.description;
+    json_obj["unit"] = snap.unit;
+    json_obj["type"] = std::string{metrics::to_string(snap.type)};
+
+    auto labels_obj = nlohmann::json::object();
+    for (const auto& [k, v] : snap.labels) {
+        labels_obj[k] = v;
+    }
+    json_obj["labels"] = labels_obj;
+
+    std::visit([&json_obj](auto&& val) {
+        using T = std::decay_t<decltype(val)>;
+        if constexpr (std::is_same_v<T, uint64_t>) {
+            json_obj["value"] = val;
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            json_obj["value"] = val;
+        } else if constexpr (std::is_same_v<T, double>) {
+            json_obj["value"] = val;
+        } else if constexpr (std::is_same_v<T, metrics::histogram_snapshot>) {
+            auto hist_obj = nlohmann::json::object();
+            hist_obj["count"] = val.count;
+            hist_obj["sum"] = val.sum;
+            hist_obj["boundaries"] = val.boundaries;
+            hist_obj["bucket_counts"] = val.bucket_counts;
+            json_obj["value"] = hist_obj;
+        }
+    }, snap.value);
+
+    // Add timestamp (matches server.cpp)
+    auto time_t = std::chrono::system_clock::to_time_t(snap.timestamp);
+    std::tm tm{};
+    gmtime_r(&time_t, &tm);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    json_obj["timestamp"] = buf;
+
+    return json_obj;
+}
+
+auto metrics_to_json(const std::vector<metrics::metric_snapshot>& snapshots) -> nlohmann::json {
+    auto result = nlohmann::json::object();
+
+    auto time_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm{};
+    gmtime_r(&time_t, &tm);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    result["timestamp"] = buf;
+
+    auto metrics_arr = nlohmann::json::array();
+    for (const auto& snap : snapshots) {
+        metrics_arr.push_back(metric_snapshot_to_json(snap));
+    }
+    result["metrics"] = metrics_arr;
+    result["count"] = snapshots.size();
+
+    return result;
+}
+
+// Test server with metrics endpoints
+class metrics_test_server {
+public:
+    metrics_test_server() : m_port(18082), m_server(std::make_unique<httplib::Server>()) {
+        // Clear existing metrics from previous tests
+        clear_test_metrics();
+
+        // Setup metrics REST API endpoints
+        setup_metrics_endpoints();
+
+        // Start server in background thread
+        m_server_thread = std::thread([this]() {
+            m_server->listen("localhost", m_port);
+        });
+
+        // Wait for server to be ready
+        std::this_thread::sleep_for(100ms);
+    }
+
+    ~metrics_test_server() {
+        m_server->stop();
+        if (m_server_thread.joinable()) {
+            m_server_thread.join();
+        }
+        // Clear test metrics
+        clear_test_metrics();
+    }
+
+    auto port() const -> int { return m_port; }
+    auto base_url() const -> std::string {
+        return std::format("http://localhost:{}", m_port);
+    }
+
+    // Create test metrics for the tests to use
+    auto create_test_counter(const std::string& name, const std::string& desc = "",
+                             metrics::labels_t labels = {}) -> metrics::counter<uint64_t>& {
+        return metrics::registry::instance().create_counter(name, desc, "1", labels);
+    }
+
+    auto create_test_gauge(const std::string& name, const std::string& desc = "",
+                           metrics::labels_t labels = {}) -> metrics::gauge<double>& {
+        return metrics::registry::instance().create_gauge(name, desc, "1", labels);
+    }
+
+    auto create_test_histogram(const std::string& name, const std::string& desc = "",
+                               metrics::labels_t labels = {}) -> metrics::histogram& {
+        return metrics::registry::instance().create_histogram_pow2(name, desc, "ms", 10, labels);
+    }
+
+private:
+    void clear_test_metrics() {
+        // Remove all test metrics by prefix
+        metrics::registry::instance().remove_by_prefix("test.");
+        metrics::registry::instance().remove_by_prefix("http_test.");
+    }
+
+    void setup_metrics_endpoints() {
+        // GET /app/metrics - Snapshot of all metrics
+        m_server->Get("/app/metrics", [](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+
+            auto& registry = metrics::registry::instance();
+            std::vector<metrics::metric_snapshot> snapshots;
+
+            // Check for prefix filter
+            if (req.has_param("prefix")) {
+                snapshots = registry.snapshot_by_prefix(req.get_param_value("prefix"));
+            }
+            // Check for label filter
+            else if (req.has_param("label_key") && req.has_param("label_value")) {
+                snapshots = registry.snapshot_by_label(
+                    req.get_param_value("label_key"),
+                    req.get_param_value("label_value"));
+            }
+            // All metrics
+            else {
+                snapshots = registry.snapshot_all();
+            }
+
+            auto result = metrics_to_json(snapshots);
+            res.set_content(result.dump(2), "application/json");
+            res.status = httplib::OK_200;
+        });
+
+        // GET /app/metrics/stream - SSE endpoint for metrics streaming
+        m_server->Get("/app/metrics/stream", [](const httplib::Request& req, httplib::Response& res) {
+            // Parse interval from query params (default 1000ms)
+            int interval_ms = 1000;
+            if (req.has_param("interval")) {
+                try {
+                    interval_ms = std::stoi(req.get_param_value("interval"));
+                    if (interval_ms < 100) interval_ms = 100;
+                    if (interval_ms > 60000) interval_ms = 60000;
+                } catch (...) {
+                    // Use default
+                }
+            }
+
+            // Optional prefix filter
+            std::string prefix_filter;
+            if (req.has_param("prefix")) {
+                prefix_filter = req.get_param_value("prefix");
+            }
+
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("Connection", "keep-alive");
+
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [interval_ms, prefix_filter](
+                    std::size_t /*offset*/,
+                    httplib::DataSink& sink
+                ) -> bool {
+                    if (sink.is_writable != nullptr && !sink.is_writable()) {
+                        return false;
+                    }
+
+                    auto& registry = metrics::registry::instance();
+                    std::vector<metrics::metric_snapshot> snapshots;
+                    if (!prefix_filter.empty()) {
+                        snapshots = registry.snapshot_by_prefix(prefix_filter);
+                    } else {
+                        snapshots = registry.snapshot_all();
+                    }
+
+                    auto data = metrics_to_json(snapshots).dump();
+                    auto event = std::format("event: metrics\ndata: {}\n\n", data);
+
+                    if (!sink.write(event.c_str(), event.size())) {
+                        return false;
+                    }
+
+                    // For testing, just send one event and stop
+                    // (to avoid infinite streaming in tests)
+                    return false;
+                }
+            );
+        });
+    }
+
+    int m_port;
+    std::unique_ptr<httplib::Server> m_server;
+    std::thread m_server_thread;
+};
+
+TEST_CASE("HTTP Integration - Metrics Snapshot", "[http][metrics]") {
+    metrics_test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Get empty metrics returns valid JSON") {
+        auto result = client.Get("/app/metrics");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+        REQUIRE(result->get_header_value("Content-Type") == "application/json");
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json.contains("timestamp"));
+        REQUIRE(json.contains("count"));
+        REQUIRE(json.contains("metrics"));
+        REQUIRE(json["metrics"].is_array());
+    }
+
+    SECTION("Get metrics with counter") {
+        auto& counter = server.create_test_counter("http_test.packets", "Packets processed",
+                                                    {{"component", "test"}});
+        counter.add(42);
+
+        auto result = client.Get("/app/metrics?prefix=http_test.");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["count"].get<size_t>() >= 1);
+
+        // Find our counter in the response
+        bool found = false;
+        for (const auto& metric : json["metrics"]) {
+            if (metric["name"].get<std::string>() == "http_test.packets") {
+                found = true;
+                REQUIRE(metric["type"].get<std::string>() == "counter");
+                REQUIRE(metric["value"].get<uint64_t>() == 42);
+                REQUIRE(metric["description"].get<std::string>() == "Packets processed");
+                REQUIRE(metric["labels"]["component"].get<std::string>() == "test");
+                break;
+            }
+        }
+        REQUIRE(found);
+    }
+
+    SECTION("Get metrics with gauge") {
+        auto& gauge = server.create_test_gauge("http_test.cpu_percent", "CPU usage",
+                                                {{"host", "localhost"}});
+        gauge.set(75.5);
+
+        auto result = client.Get("/app/metrics?prefix=http_test.");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+
+        // Find our gauge in the response
+        bool found = false;
+        for (const auto& metric : json["metrics"]) {
+            if (metric["name"].get<std::string>() == "http_test.cpu_percent") {
+                found = true;
+                REQUIRE(metric["type"].get<std::string>() == "gauge");
+                REQUIRE(metric["value"].get<double>() == Catch::Approx(75.5));
+                REQUIRE(metric["labels"]["host"].get<std::string>() == "localhost");
+                break;
+            }
+        }
+        REQUIRE(found);
+    }
+
+    SECTION("Get metrics with histogram") {
+        auto& histogram = server.create_test_histogram("http_test.latency", "Request latency",
+                                                        {{"endpoint", "/api"}});
+        histogram.record(10);
+        histogram.record(50);
+        histogram.record(100);
+
+        auto result = client.Get("/app/metrics?prefix=http_test.");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+
+        // Find our histogram in the response
+        bool found = false;
+        for (const auto& metric : json["metrics"]) {
+            if (metric["name"].get<std::string>() == "http_test.latency") {
+                found = true;
+                REQUIRE(metric["type"].get<std::string>() == "histogram");
+                REQUIRE(metric["value"].is_object());
+                REQUIRE(metric["value"]["count"].get<uint64_t>() == 3);
+                REQUIRE(metric["value"]["sum"].get<double>() == Catch::Approx(160.0));
+                REQUIRE(metric["value"]["boundaries"].is_array());
+                REQUIRE(metric["value"]["bucket_counts"].is_array());
+                REQUIRE(metric["labels"]["endpoint"].get<std::string>() == "/api");
+                break;
+            }
+        }
+        REQUIRE(found);
+    }
+
+    SECTION("CORS header is set") {
+        auto result = client.Get("/app/metrics");
+
+        REQUIRE(result);
+        REQUIRE(result->get_header_value("Access-Control-Allow-Origin") == "*");
+    }
+}
+
+TEST_CASE("HTTP Integration - Metrics Filtering", "[http][metrics]") {
+    metrics_test_server server;
+    httplib::Client client(server.base_url());
+
+    // Create metrics with different prefixes and labels
+    auto& counter1 = server.create_test_counter("http_test.app.requests", "", {{"env", "prod"}});
+    auto& counter2 = server.create_test_counter("http_test.app.errors", "", {{"env", "prod"}});
+    auto& counter3 = server.create_test_counter("http_test.db.queries", "", {{"env", "dev"}});
+
+    counter1.add(100);
+    counter2.add(5);
+    counter3.add(50);
+
+    SECTION("Filter by prefix") {
+        auto result = client.Get("/app/metrics?prefix=http_test.app");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["count"].get<size_t>() == 2);
+
+        // All returned metrics should start with http_test.app
+        for (const auto& metric : json["metrics"]) {
+            auto name = metric["name"].get<std::string>();
+            REQUIRE(name.starts_with("http_test.app"));
+        }
+    }
+
+    SECTION("Filter by label") {
+        auto result = client.Get("/app/metrics?label_key=env&label_value=prod");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+
+        // All returned metrics should have env=prod label
+        for (const auto& metric : json["metrics"]) {
+            if (metric["name"].get<std::string>().starts_with("http_test.")) {
+                REQUIRE(metric["labels"]["env"].get<std::string>() == "prod");
+            }
+        }
+    }
+
+    SECTION("Prefix filter returns empty for non-matching prefix") {
+        auto result = client.Get("/app/metrics?prefix=nonexistent.prefix");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["count"].get<size_t>() == 0);
+        REQUIRE(json["metrics"].empty());
+    }
+}
+
+// Note: SSE streaming tests are omitted because httplib's client has compatibility
+// issues with chunked streaming responses. The /app/metrics/stream endpoint should
+// be tested manually or with a different HTTP client library that supports SSE.
+
+TEST_CASE("HTTP Integration - Metrics Response Format", "[http][metrics]") {
+    metrics_test_server server;
+    httplib::Client client(server.base_url());
+
+    SECTION("Timestamp is ISO 8601 format") {
+        auto result = client.Get("/app/metrics");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        auto timestamp = json["timestamp"].get<std::string>();
+
+        // ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ
+        REQUIRE(timestamp.length() == 20);
+        REQUIRE(timestamp[4] == '-');
+        REQUIRE(timestamp[7] == '-');
+        REQUIRE(timestamp[10] == 'T');
+        REQUIRE(timestamp[13] == ':');
+        REQUIRE(timestamp[16] == ':');
+        REQUIRE(timestamp[19] == 'Z');
+    }
+
+    SECTION("Multiple metrics have correct structure") {
+        server.create_test_counter("http_test.multi.counter", "Counter metric");
+        server.create_test_gauge("http_test.multi.gauge", "Gauge metric");
+
+        auto result = client.Get("/app/metrics?prefix=http_test.multi");
+
+        REQUIRE(result);
+        REQUIRE(result->status == httplib::OK_200);
+
+        auto json = nlohmann::json::parse(result->body);
+        REQUIRE(json["count"].get<size_t>() == 2);
+
+        for (const auto& metric : json["metrics"]) {
+            // Every metric should have these fields
+            REQUIRE(metric.contains("name"));
+            REQUIRE(metric.contains("description"));
+            REQUIRE(metric.contains("unit"));
+            REQUIRE(metric.contains("type"));
+            REQUIRE(metric.contains("labels"));
+            REQUIRE(metric.contains("value"));
+            REQUIRE(metric.contains("timestamp"));
+
+            // Labels should be an object
+            REQUIRE(metric["labels"].is_object());
+        }
     }
 }

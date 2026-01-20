@@ -298,4 +298,40 @@ auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config {
     return config;
 }
 
+#ifdef COMPOSITE_USE_OPENTELEMETRY
+auto parse_telemetry_config(const nlohmann::json& telemetry_json) -> telemetry::config {
+    telemetry::config config;
+
+    // Parse basic fields
+    config.enabled = telemetry_json.value("enabled", false);
+    config.service_name = telemetry_json.value("service_name", "composite");
+    config.service_version = telemetry_json.value("service_version", "");
+
+    // Parse export interval
+    if (telemetry_json.contains("export_interval")) {
+        config.export_interval = std::chrono::milliseconds{
+            telemetry_json["export_interval"].get<uint64_t>()
+        };
+    }
+
+    // Parse exporter configuration
+    if (telemetry_json.contains("exporter") && telemetry_json["exporter"].is_object()) {
+        const auto& exporter_json = telemetry_json["exporter"];
+
+        config.exporter.endpoint = exporter_json.value("endpoint", "http://localhost:4318");
+        config.exporter.protocol = exporter_json.value("protocol", "http/protobuf");
+
+        if (exporter_json.contains("timeout")) {
+            config.exporter.timeout = std::chrono::milliseconds{
+                exporter_json["timeout"].get<uint64_t>()
+            };
+        }
+
+        config.exporter.headers = exporter_json.value("headers", "");
+    }
+
+    return config;
+}
+#endif
+
 } // namespace composite

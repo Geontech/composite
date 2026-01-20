@@ -75,6 +75,15 @@ public:
      */
     virtual auto is_mutable() const -> bool = 0;
 
+    /**
+     * @brief Register port metrics with the metrics registry
+     * @param component_id ID of the owning component
+     *
+     * Called by component::add_port() to expose port statistics as metrics.
+     * Subclasses implement this to register their specific stats.
+     */
+    virtual auto register_port_metrics(std::string_view component_id) -> void = 0;
+
 protected:
     std::string m_name;  ///< Port name for identification
 };
@@ -139,6 +148,9 @@ public:
     auto depth(std::size_t value) -> void {
         const auto lock = std::scoped_lock{m_mtx};
         m_depth = value;
+        if (m_queue_capacity_gauge) {
+            m_queue_capacity_gauge->set(static_cast<double>(value));
+        }
     }
 
     /**
@@ -190,13 +202,58 @@ public:
         m_overflow_callback = std::move(callback);
     }
 
+    /**
+     * @brief Register port metrics with the metrics registry
+     * @param component_id ID of the owning component
+     */
+    auto register_port_metrics(std::string_view component_id) -> void override {
+        m_stats.register_metrics(component_id, m_name, "input");
+
+        // Register input-port-specific gauges
+        auto& registry = metrics::registry::instance();
+        metrics::labels_t labels = {
+            {"component_id", std::string{component_id}},
+            {"port_name", std::string{m_name}},
+            {"port_type", "input"}
+        };
+
+        m_queue_depth_gauge = &registry.get_or_create_gauge(
+            "composite.port.queue_depth",
+            "Current number of packets in the queue",
+            "1",
+            labels
+        );
+
+        m_queue_capacity_gauge = &registry.get_or_create_gauge(
+            "composite.port.queue_capacity",
+            "Configured queue depth limit",
+            "1",
+            labels
+        );
+
+        // Set initial capacity value
+        m_queue_capacity_gauge->set(static_cast<double>(m_depth));
+    }
+
 protected:
+    /**
+     * @brief Update the queue depth gauge (called by derived classes)
+     * @param current_size Current number of items in the queue
+     */
+    auto update_queue_depth_metric(std::size_t current_size) -> void {
+        if (m_queue_depth_gauge) {
+            m_queue_depth_gauge->set(static_cast<double>(current_size));
+        }
+    }
+
     mutable std::mutex m_mtx;                                      ///< Protects queue and metadata
     std::condition_variable m_cv;                                  ///< Signals data availability for get_data()
     std::optional<composite::metadata> m_metadata;                 ///< Latched metadata for next packet
     std::size_t m_depth{std::numeric_limits<std::size_t>::max()};  ///< Queue depth limit (unbounded by default)
     mutable port_stats m_stats;                                    ///< Statistics tracking
     overflow_callback m_overflow_callback;                         ///< Callback for dropped packets
+    metrics::gauge<double>* m_queue_depth_gauge{nullptr};          ///< Current queue depth gauge
+    metrics::gauge<double>* m_queue_capacity_gauge{nullptr};       ///< Queue capacity gauge
 
 }; // class input_port_base
 
@@ -442,6 +499,14 @@ public:
             }
         }
         return endpoints;
+    }
+
+    /**
+     * @brief Register port metrics with the metrics registry
+     * @param component_id ID of the owning component
+     */
+    auto register_port_metrics(std::string_view component_id) -> void override {
+        m_stats.register_metrics(component_id, m_name, "output");
     }
 
 protected:

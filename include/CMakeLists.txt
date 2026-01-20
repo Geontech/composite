@@ -4,13 +4,22 @@
 #
 
 # Create composite library
-# SHARED library to support compiled code (dpdk_manager when enabled)
-# SHARED ensures singleton instances are shared across all DSOs
-set(COMPOSITE_SOURCES)
+# SHARED library to support compiled code and ensure singleton instances
+# are shared across all DSOs (dynamically loaded component libraries)
+set(COMPOSITE_SOURCES
+    # Always include registry.cpp - required for DSO-safe singleton
+    ${PROJECT_SOURCE_DIR}/src/registry.cpp
+)
 
 if(COMPOSITE_USE_DPDK)
     list(APPEND COMPOSITE_SOURCES
         ${PROJECT_SOURCE_DIR}/src/dpdk_manager.cpp
+    )
+endif()
+
+if(COMPOSITE_USE_OPENTELEMETRY)
+    list(APPEND COMPOSITE_SOURCES
+        ${PROJECT_SOURCE_DIR}/src/telemetry_manager.cpp
     )
 endif()
 
@@ -69,4 +78,14 @@ add_library(composite::composite ALIAS composite)
 if(COMPOSITE_USE_NATS)
     target_compile_definitions(composite PUBLIC COMPOSITE_USE_NATS=1)
     target_link_libraries(composite PUBLIC nats)
+endif()
+
+if(COMPOSITE_USE_OPENTELEMETRY)
+    target_compile_definitions(composite PUBLIC COMPOSITE_USE_OPENTELEMETRY=1)
+    target_link_libraries(composite
+        PUBLIC
+        opentelemetry-cpp::api
+        opentelemetry-cpp::sdk
+        opentelemetry-cpp::otlp_http_metric_exporter
+    )
 endif()

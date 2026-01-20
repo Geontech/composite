@@ -10,6 +10,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Catch2)
 
+# Test-only API access (e.g., metrics::registry::clear)
+add_compile_definitions(COMPOSITE_TESTING)
+
 ##############################
 # Properties Tests
 ##############################
@@ -184,3 +187,26 @@ add_test(NAME TestNATSIntegration_Transport COMMAND test_nats_integration "[nats
 add_test(NAME TestNATSIntegration_Performance COMMAND test_nats_integration "[nats][integration][performance][.]")
 
 add_test(NAME TestHttpIntegration COMMAND test_http_integration)
+
+##############################
+# Metrics Tests
+##############################
+
+add_executable(test_metrics
+  test_metrics.cpp
+)
+
+target_link_libraries(test_metrics
+  PRIVATE
+  composite::composite
+  spdlog::spdlog_header_only
+  Catch2::Catch2WithMain
+)
+
+add_test(NAME TestMetrics COMMAND test_metrics)
+add_test(NAME TestMetrics_Counter COMMAND test_metrics "[counter]")
+add_test(NAME TestMetrics_UpDownCounter COMMAND test_metrics "[updown_counter]")
+add_test(NAME TestMetrics_Gauge COMMAND test_metrics "[gauge]")
+add_test(NAME TestMetrics_Histogram COMMAND test_metrics "[histogram]")
+add_test(NAME TestMetrics_Registry COMMAND test_metrics "[registry]")
+add_test(NAME TestMetrics_Threading COMMAND test_metrics "[threading]")

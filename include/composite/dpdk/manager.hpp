@@ -175,6 +175,25 @@ public:
     COMPOSITE_API
     auto get_port_count() const -> std::size_t { return m_interface_to_port.size(); }
 
+    /**
+     * @brief Summary information about an available DPDK port
+     */
+    struct port_summary {
+        uint16_t port_id;
+        std::string driver_name;
+        uint16_t max_rx_queues;
+        uint16_t max_tx_queues;
+        int socket_id;
+    };
+
+    /**
+     * @brief List available DPDK ports detected by EAL
+     *
+     * @return Vector of port summaries
+     */
+    COMPOSITE_API
+    auto list_available_ports() const -> std::vector<port_summary>;
+
     // Disable copy/move (singleton)
     manager(const manager&) = delete;
     manager(manager&&) = delete;
@@ -222,9 +241,16 @@ private:
         rte_mempool* mempool{nullptr};          ///< Associated mempool
     };
 
+    struct mempool_config {
+        uint32_t mempool_size;
+        uint16_t mempool_cache_size;
+        uint16_t mbuf_data_room_size;
+    };
+
     bool m_initialized{false};
     std::map<std::string, port_info> m_interface_to_port;     ///< Interface name → port info
     std::map<std::string, rte_mempool*> m_mempools;           ///< Mempool name → mempool ptr
+    std::map<std::string, mempool_config> m_mempool_configs;  ///< Mempool name → config
     std::vector<uint16_t> m_configured_ports;                 ///< List of configured port IDs
 
 }; // class manager

@@ -59,7 +59,7 @@ auto parse_affinity_config(
  * @param available_cores Physical core IDs available to the application
  * @return Translated EAL args with physical core IDs, and list of logical DPDK cores
  *
- * Translates -l and --lcores arguments from logical (0-N) to physical core IDs.
+ * Translates -l arguments from logical (0-N) to physical core IDs.
  * This allows portable configs that work across different K8s core assignments.
  *
  * Example:
@@ -68,7 +68,7 @@ auto parse_affinity_config(
  *
  * Supported formats:
  * - "-l 0-3" or "-l 0,2,4"
- * - "--lcores (0-1)@(0-1)" (maps lcore group to physical group)
+ * - "--lcores (0-1)@(0-1)" is not translated (passed through as-is)
  */
 auto translate_dpdk_eal_args(
     const std::vector<std::string>& eal_args,

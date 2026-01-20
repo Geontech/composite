@@ -4,18 +4,21 @@
  */
 
 #include "composite/core/application.hpp"
+#include "composite/metrics/metrics.hpp"
 #include "composite/properties/serialization.hpp"
 
 #include "helpers.hpp"
 #include "property_changeset.hpp"
 #include "property_handlers.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <format>
 #include <httplib.h>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <thread>
 #include <variant>
 
 namespace composite {
@@ -141,6 +144,74 @@ struct connection_request {
     }
 };
 
+// ============================================================================
+// Metrics JSON Serialization
+// ============================================================================
+
+auto metric_snapshot_to_json(const metrics::metric_snapshot& snap) -> nlohmann::json {
+    auto json_obj = nlohmann::json::object();
+    json_obj["name"] = snap.name;
+    json_obj["description"] = snap.description;
+    json_obj["unit"] = snap.unit;
+    json_obj["type"] = std::string{metrics::to_string(snap.type)};
+
+    // Labels
+    auto labels_obj = nlohmann::json::object();
+    for (const auto& [k, v] : snap.labels) {
+        labels_obj[k] = v;
+    }
+    json_obj["labels"] = labels_obj;
+
+    // Value based on type
+    std::visit([&json_obj](auto&& val) {
+        using T = std::decay_t<decltype(val)>;
+        if constexpr (std::is_same_v<T, uint64_t>) {
+            json_obj["value"] = val;
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            json_obj["value"] = val;
+        } else if constexpr (std::is_same_v<T, double>) {
+            json_obj["value"] = val;
+        } else if constexpr (std::is_same_v<T, metrics::histogram_snapshot>) {
+            auto hist_obj = nlohmann::json::object();
+            hist_obj["count"] = val.count;
+            hist_obj["sum"] = val.sum;
+            hist_obj["boundaries"] = val.boundaries;
+            hist_obj["bucket_counts"] = val.bucket_counts;
+            json_obj["value"] = hist_obj;
+        }
+    }, snap.value);
+
+    // Timestamp as ISO 8601 (thread-safe)
+    auto time_t = std::chrono::system_clock::to_time_t(snap.timestamp);
+    std::tm tm{};
+    gmtime_r(&time_t, &tm);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    json_obj["timestamp"] = buf;
+
+    return json_obj;
+}
+
+auto metrics_to_json(const std::vector<metrics::metric_snapshot>& snapshots) -> nlohmann::json {
+    auto result = nlohmann::json::object();
+
+    auto time_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm{};
+    gmtime_r(&time_t, &tm);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    result["timestamp"] = buf;
+
+    auto metrics_arr = nlohmann::json::array();
+    for (const auto& snap : snapshots) {
+        metrics_arr.push_back(metric_snapshot_to_json(snap));
+    }
+    result["metrics"] = metrics_arr;
+    result["count"] = snapshots.size();
+
+    return result;
+}
+
 auto set_component_properties(
   composite::application::component_ptr comp,
   const nlohmann::json& properties
@@ -202,6 +273,123 @@ auto make_server(application& app, composite::component_handles_type& handles) -
         json_ok(res, {});
     });
 
+    // ========================================================================
+    // Metrics Endpoints
+    // ========================================================================
+
+    const auto METRICS = std::string{"metrics"};
+
+    // GET /app/metrics - Snapshot of all metrics
+    endpoint = std::format("/{}/{}", APP, METRICS);
+    server->Get(endpoint, [](const httplib::Request& req, httplib::Response& res) {
+        set_cors(res);
+
+        auto& registry = metrics::registry::instance();
+        std::vector<metrics::metric_snapshot> snapshots;
+
+        // Check for prefix filter
+        if (req.has_param("prefix")) {
+            snapshots = registry.snapshot_by_prefix(req.get_param_value("prefix"));
+        }
+        // Check for label filter
+        else if (req.has_param("label_key") && req.has_param("label_value")) {
+            snapshots = registry.snapshot_by_label(
+                req.get_param_value("label_key"),
+                req.get_param_value("label_value"));
+        }
+        // All metrics
+        else {
+            snapshots = registry.snapshot_all();
+        }
+
+        auto result = metrics_to_json(snapshots);
+        res.set_content(result.dump(2), "application/json");
+        res.status = httplib::OK_200;
+    });
+
+    // GET /app/metrics/stream - SSE endpoint for metrics streaming
+    endpoint = std::format("/{}/{}/stream", APP, METRICS);
+    server->Get(endpoint, [](const httplib::Request& req, httplib::Response& res) {
+        // Parse interval from query params (default 1000ms)
+        int interval_ms = 1000;
+        if (req.has_param("interval")) {
+            try {
+                interval_ms = std::stoi(req.get_param_value("interval"));
+                if (interval_ms < 100) interval_ms = 100;      // Min 100ms
+                if (interval_ms > 60000) interval_ms = 60000;  // Max 60s
+            } catch (...) {
+                // Use default
+            }
+        }
+
+        // Optional prefix filter
+        std::string prefix_filter;
+        if (req.has_param("prefix")) {
+            prefix_filter = req.get_param_value("prefix");
+        }
+
+        // Optional label filter
+        std::string label_key, label_value;
+        if (req.has_param("label_key") && req.has_param("label_value")) {
+            label_key = req.get_param_value("label_key");
+            label_value = req.get_param_value("label_value");
+        }
+
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [interval_ms, prefix_filter, label_key, label_value](
+                std::size_t /*offset*/,
+                httplib::DataSink& sink
+            ) -> bool {
+                // Check if client disconnected before doing any work
+                if (sink.is_writable != nullptr && !sink.is_writable()) {
+                    return false;  // Client disconnected
+                }
+
+                auto& registry = metrics::registry::instance();
+
+                // Get filtered snapshots
+                std::vector<metrics::metric_snapshot> snapshots;
+                if (!prefix_filter.empty()) {
+                    snapshots = registry.snapshot_by_prefix(prefix_filter);
+                } else if (!label_key.empty()) {
+                    snapshots = registry.snapshot_by_label(label_key, label_value);
+                } else {
+                    snapshots = registry.snapshot_all();
+                }
+
+                // Format as SSE event
+                auto data = metrics_to_json(snapshots).dump();
+                auto event = std::format("event: metrics\ndata: {}\n\n", data);
+
+                if (!sink.write(event.c_str(), event.size())) {
+                    return false;  // Connection closed
+                }
+
+                // Sleep in smaller chunks to detect disconnection faster
+                // Poll every 100ms to check connection status
+                constexpr int poll_interval_ms = 100;
+                int remaining_ms = interval_ms;
+                while (remaining_ms > 0) {
+                    int sleep_ms = std::min(remaining_ms, poll_interval_ms);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                    remaining_ms -= sleep_ms;
+
+                    // Check if client disconnected during sleep
+                    if (sink.is_writable != nullptr && !sink.is_writable()) {
+                        return false;  // Client disconnected
+                    }
+                }
+
+                return true;  // Continue streaming
+            }
+        );
+    });
+
     // GET application
     endpoint = std::format("/{}", APP);
     server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
@@ -227,10 +415,15 @@ auto make_server(application& app, composite::component_handles_type& handles) -
                 return error(res, "no component id provided", 400);
             }
 
+            auto comp_id = comp_json["id"].get<std::string>();
+            if (app.get_component(comp_id) != nullptr) {
+                return error(res, std::format("component id already exists: {}", comp_id), 409);
+            }
+
             auto comp_ptr = composite::make_component(comp_json, handles);
             if (comp_ptr == nullptr) {
                 auto msg = std::format("failed to create component {} from library {}",
-                    comp_json["id"].get<std::string>(),
+                    comp_id,
                     comp_json["library"].get<std::string>());
                 spdlog::error(msg);
                 return error(res, msg, 500);

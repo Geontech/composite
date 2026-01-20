@@ -104,10 +104,7 @@ public:
      */
     auto send_data(buffer_type buffer, timestamp ts) -> void {
         // Update outgoing statistics
-        auto bytes = buffer.size() * sizeof(T);
-        m_stats.packets_transferred.fetch_add(1, std::memory_order_relaxed);
-        m_stats.bytes_transferred.fetch_add(bytes, std::memory_order_relaxed);
-        m_stats.update_activity_timestamp();
+        m_stats.record_transfer(buffer.size() * sizeof(T));
 
         // Lock connection list for thread-safe access
         const auto lock = std::scoped_lock{m_connection_mtx};
@@ -250,10 +247,7 @@ public:
      */
     auto send_data(buffer_type buffer, timestamp ts) -> void {
         // Update statistics
-        auto bytes = buffer.size() * sizeof(T);
-        m_stats.packets_transferred.fetch_add(1, std::memory_order_relaxed);
-        m_stats.bytes_transferred.fetch_add(bytes, std::memory_order_relaxed);
-        m_stats.update_activity_timestamp();
+        m_stats.record_transfer(buffer.size() * sizeof(T));
 
         // Send to external transports FIRST (before buffer is moved)
         if (!m_transports.empty()) {

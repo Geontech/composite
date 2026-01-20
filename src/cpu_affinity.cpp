@@ -13,25 +13,111 @@
 
 namespace composite {
 
-auto get_available_cpus() -> std::optional<cpu_set_t> {
-    // Try cgroup v2 first, then v1
-    const std::vector<std::string> cpuset_paths = {
-        "/sys/fs/cgroup/cpuset.cpus",           // cgroup v2
-        "/sys/fs/cgroup/cpuset/cpuset.cpus"     // cgroup v1
-    };
+namespace {
 
-    for (const auto& path : cpuset_paths) {
-        std::ifstream file(path);
-        if (file.is_open()) {
-            std::string cpuset_str;
-            if (std::getline(file, cpuset_str)) {
-                cpu_set_t cpuset = parse_cpuset(cpuset_str);
-                if (CPU_COUNT(&cpuset) > 0) {
-                    spdlog::debug("Read CPU set from {}: {}", path, cpuset_str);
-                    return cpuset;
-                }
+auto read_first_line(const std::string& path) -> std::optional<std::string> {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return std::nullopt;
+    }
+    std::string line;
+    if (!std::getline(file, line)) {
+        return std::nullopt;
+    }
+    return line;
+}
+
+auto try_parse_cpuset(const std::string& cpuset_str) -> std::optional<cpu_set_t> {
+    auto cpuset = parse_cpuset(cpuset_str);
+    if (CPU_COUNT(&cpuset) > 0) {
+        return cpuset;
+    }
+    return std::nullopt;
+}
+
+auto try_read_cpuset_file(const std::string& path, const std::string& label)
+    -> std::optional<cpu_set_t> {
+    if (auto line = read_first_line(path)) {
+        if (auto cpuset = try_parse_cpuset(*line)) {
+            spdlog::debug("Read CPU set from {} ({}): {}", path, label, *line);
+            return cpuset;
+        }
+    }
+    return std::nullopt;
+}
+
+auto build_cgroup_path(const std::string& base, const std::string& suffix) -> std::string {
+    if (suffix.empty() || suffix == "/") {
+        return base;
+    }
+    if (suffix.front() == '/') {
+        return base + suffix;
+    }
+    return base + "/" + suffix;
+}
+
+auto try_cgroup_cpuset() -> std::optional<cpu_set_t> {
+    auto cgroup_line = read_first_line("/proc/self/cgroup");
+    if (!cgroup_line) {
+        return std::nullopt;
+    }
+
+    std::ifstream file("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        auto first_colon = line.find(':');
+        if (first_colon == std::string::npos) {
+            continue;
+        }
+        auto second_colon = line.find(':', first_colon + 1);
+        if (second_colon == std::string::npos) {
+            continue;
+        }
+
+        auto controllers = line.substr(first_colon + 1, second_colon - first_colon - 1);
+        auto path = line.substr(second_colon + 1);
+
+        if (controllers.empty()) {
+            // cgroup v2
+            auto base = std::string("/sys/fs/cgroup");
+            auto full = build_cgroup_path(base, path);
+            if (auto cpuset = try_read_cpuset_file(full + "/cpuset.cpus.effective", "cgroup v2 effective")) {
+                return cpuset;
+            }
+            if (auto cpuset = try_read_cpuset_file(full + "/cpuset.cpus", "cgroup v2")) {
+                return cpuset;
+            }
+        } else if (controllers.find("cpuset") != std::string::npos) {
+            // cgroup v1
+            auto base = std::string("/sys/fs/cgroup/cpuset");
+            auto full = build_cgroup_path(base, path);
+            if (auto cpuset = try_read_cpuset_file(full + "/cpuset.cpus", "cgroup v1")) {
+                return cpuset;
             }
         }
+    }
+
+    return std::nullopt;
+}
+
+} // namespace
+
+auto get_available_cpus() -> std::optional<cpu_set_t> {
+    // Try the current cgroup first (works for k8s and cgroup v1/v2)
+    if (auto cpuset = try_cgroup_cpuset()) {
+        return cpuset;
+    }
+
+    // Fallback: try root cgroup paths
+    if (auto cpuset = try_read_cpuset_file("/sys/fs/cgroup/cpuset.cpus", "root cgroup v2")) {
+        return cpuset;
+    }
+    if (auto cpuset = try_read_cpuset_file("/sys/fs/cgroup/cpuset/cpuset.cpus", "root cgroup v1")) {
+        return cpuset;
     }
 
     // Fallback: use sched_getaffinity to get current affinity
