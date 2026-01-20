@@ -35,6 +35,26 @@ auto manager::initialize(const dpdk::config& config) -> bool {
 
     spdlog::info("Initializing DPDK...");
 
+    auto cleanup_partial = [this]() {
+        for (uint16_t port_id : m_configured_ports) {
+            int ret = rte_eth_dev_stop(port_id);
+            if (ret != 0) {
+                spdlog::warn("Failed to stop DPDK port {}: {}", port_id, rte_strerror(-ret));
+            }
+            ret = rte_eth_dev_close(port_id);
+            if (ret != 0) {
+                spdlog::warn("Failed to close DPDK port {}: {}", port_id, rte_strerror(-ret));
+            }
+        }
+        m_mempools.clear();
+        m_interface_to_port.clear();
+        m_configured_ports.clear();
+        int ret = rte_eal_cleanup();
+        if (ret != 0) {
+            spdlog::warn("DPDK EAL cleanup returned: {}", ret);
+        }
+    };
+
     // Initialize EAL
     if (!init_eal(config.eal_args)) {
         spdlog::error("Failed to initialize DPDK EAL");
@@ -50,6 +70,7 @@ auto manager::initialize(const dpdk::config& config) -> bool {
         if (!configure_port(port_config)) {
             spdlog::error("Failed to configure DPDK port {} ({})",
                          port_config.port_id, port_config.interface);
+            cleanup_partial();
             return false;
         }
 
@@ -87,6 +108,7 @@ auto manager::shutdown() -> void {
 
     // Note: mempools are freed automatically by DPDK on cleanup
     m_mempools.clear();
+    m_mempool_configs.clear();
     m_interface_to_port.clear();
     m_configured_ports.clear();
 
@@ -152,6 +174,36 @@ auto manager::get_dpdk_lcores() const -> std::vector<int> {
     }
 
     return lcores;
+}
+
+auto manager::list_available_ports() const -> std::vector<port_summary> {
+    std::vector<port_summary> ports;
+    uint16_t nb_ports = rte_eth_dev_count_avail();
+    ports.reserve(nb_ports);
+
+    for (uint16_t port_id = 0; port_id < nb_ports; ++port_id) {
+        if (!rte_eth_dev_is_valid_port(port_id)) {
+            continue;
+        }
+
+        rte_eth_dev_info dev_info;
+        int ret = rte_eth_dev_info_get(port_id, &dev_info);
+        if (ret != 0) {
+            spdlog::warn("Failed to get device info for port {}: {}",
+                port_id, rte_strerror(-ret));
+            continue;
+        }
+
+        port_summary summary{};
+        summary.port_id = port_id;
+        summary.driver_name = dev_info.driver_name ? dev_info.driver_name : "unknown";
+        summary.max_rx_queues = dev_info.max_rx_queues;
+        summary.max_tx_queues = dev_info.max_tx_queues;
+        summary.socket_id = rte_eth_dev_socket_id(port_id);
+        ports.push_back(std::move(summary));
+    }
+
+    return ports;
 }
 
 auto manager::configure_port(const port_config& config) -> bool {
@@ -270,6 +322,32 @@ auto manager::create_mempool(const port_config& config) -> rte_mempool* {
     // Check if mempool already exists
     rte_mempool* existing = rte_mempool_lookup(config.mempool_name.c_str());
     if (existing) {
+        auto it = m_mempool_configs.find(config.mempool_name);
+        if (it != m_mempool_configs.end()) {
+            const auto& existing_cfg = it->second;
+            if (existing_cfg.mempool_size != config.mempool_size ||
+                existing_cfg.mempool_cache_size != config.mempool_cache_size ||
+                existing_cfg.mbuf_data_room_size != config.mbuf_data_room_size) {
+                spdlog::warn(
+                    "Mempool '{}' already exists with different settings "
+                    "(size={}, cache={}, room={}); requested size={}, cache={}, room={}",
+                    config.mempool_name,
+                    existing_cfg.mempool_size,
+                    existing_cfg.mempool_cache_size,
+                    existing_cfg.mbuf_data_room_size,
+                    config.mempool_size,
+                    config.mempool_cache_size,
+                    config.mbuf_data_room_size);
+            }
+        } else {
+            spdlog::warn("Reusing existing mempool '{}' without known config; "
+                         "settings are not verified", config.mempool_name);
+            m_mempool_configs[config.mempool_name] = {
+                config.mempool_size,
+                config.mempool_cache_size,
+                config.mbuf_data_room_size
+            };
+        }
         spdlog::debug("Reusing existing mempool '{}'", config.mempool_name);
         m_mempools[config.mempool_name] = existing;
         return existing;
@@ -292,6 +370,11 @@ auto manager::create_mempool(const port_config& config) -> rte_mempool* {
     }
 
     m_mempools[config.mempool_name] = pool;
+    m_mempool_configs[config.mempool_name] = {
+        config.mempool_size,
+        config.mempool_cache_size,
+        config.mbuf_data_room_size
+    };
     spdlog::debug("Created mempool '{}' with {} mbufs (data_room={})",
                   config.mempool_name, config.mempool_size, config.mbuf_data_room_size);
 

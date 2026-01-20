@@ -32,6 +32,7 @@ cmake --install build
 
 - `COMPOSITE_USE_NATS`: Enable components to publish data to a NATS server on a defined subject
 - `COMPOSITE_USE_OPENSSL`: Compile with OpenSSL support to enable a secure REST server
+- `COMPOSITE_USE_OPENTELEMETRY`: Enable OpenTelemetry OTLP metrics export (requires opentelemetry-cpp)
 
 ## Composite CLI Application and Configuration
 
@@ -919,6 +920,203 @@ curl -X DELETE http://localhost:5000/app/connections \
 - **List deletions in batch updates**: Removing list items (setting indexed items to null) is not supported within multi-property batch updates due to rollback complexity. Use single-property DELETE requests instead.
 - Struct-list item updates via `PUT /items/:index` are applied atomically as a single change (one list listener notification).
 - Error responses include detailed information about validation failures
+
+## Metrics
+
+The **composite** framework includes a lightweight, high-performance metrics system for observability. Metrics are **always available** regardless of build options, with optional OpenTelemetry export when built with `-DCOMPOSITE_USE_OPENTELEMETRY=ON`.
+
+### Design Principles
+
+- **Minimal overhead**: Metrics use relaxed atomic operations
+- **Cache-line aligned**: No false sharing between metrics updated by different threads
+- **No allocations in hot path**: All allocations happen during metric registration
+- **Always-on**: Metrics work without OpenTelemetry; OTel is just one export mechanism
+- **Multiple export options**: REST API, Server-Sent Events (SSE) streaming, and OTLP
+
+### Metric Types
+
+| Type | Use Case | Operations |
+|------|----------|------------|
+| `counter<T>` | Monotonic totals (packets, bytes) | `inc()`, `add()`, `++`, `+=` |
+| `updown_counter<T>` | Non-monotonic sums (queue depth) | `inc()`, `dec()`, `add()`, `++`, `--`, `+=`, `-=` |
+| `gauge<T>` | Point-in-time values (CPU %) | `set()`, `=` |
+| `histogram` | Distributions (latencies) | `record()` |
+
+### Using Metrics in Components
+
+The `component` base class provides convenience methods for creating metrics. These methods automatically:
+- Namespace metric names with the component ID (e.g., `"packets_sent"` becomes `"my_component.packets_sent"`)
+- Add a `component_id` label to all metrics
+
+```cpp
+#include <composite/composite.hpp>
+
+class MyComponent : public composite::component {
+public:
+    explicit MyComponent(std::string_view id) : composite::component(id) {
+        // Register metrics at construction (NOT hot path)
+        // Names are auto-prefixed with component ID, labels auto-include component_id
+        m_packets = &create_counter(
+            "packets_processed",           // becomes "{id}.packets_processed"
+            "Total packets processed",
+            "1"                            // unit
+        );
+
+        m_queue_depth = &create_updown_counter(
+            "queue_depth",
+            "Current queue depth"
+        );
+
+        m_processing_time = &create_histogram_pow2(
+            "processing_time_ns",
+            "Processing time distribution",
+            "ns",
+            20  // 20 power-of-2 buckets covering 0 to ~500K
+        );
+
+        // Additional labels can be passed as the last parameter
+        m_bytes = &create_counter(
+            "bytes_processed",
+            "Total bytes processed",
+            "bytes",
+            {{"port", "eth0"}}  // Additional labels (component_id auto-added)
+        );
+    }
+
+    auto process() -> composite::retval override {
+        auto start = std::chrono::steady_clock::now();
+
+        // Hot path - just atomic operations, minimal overhead
+        ++(*m_packets);                    // Increment counter
+        *m_queue_depth += 5;               // Adjust queue depth
+        --(*m_queue_depth);
+
+        // ... process data ...
+
+        // Record processing time
+        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        m_processing_time->record(static_cast<double>(elapsed_ns));
+
+        return composite::retval::NORMAL;
+    }
+
+private:
+    metrics::counter<uint64_t>* m_packets{};
+    metrics::counter<uint64_t>* m_bytes{};
+    metrics::updown_counter<int64_t>* m_queue_depth{};
+    metrics::histogram* m_processing_time{};
+};
+```
+
+**Available Methods:**
+- `create_counter(name, description, unit, labels)` → `metrics::counter<uint64_t>&`
+- `create_updown_counter(name, description, unit, labels)` → `metrics::updown_counter<int64_t>&`
+- `create_gauge(name, description, unit, labels)` → `metrics::gauge<double>&`
+- `create_histogram(name, description, unit, boundaries, labels)` → `metrics::histogram&`
+- `create_histogram_pow2(name, description, unit, num_buckets, labels)` → `metrics::histogram&`
+
+**Histogram Variants:**
+- `create_histogram` - Custom bucket boundaries (e.g., `{0.1, 0.5, 1.0, 5.0, 10.0}`)
+- `create_histogram_pow2` - Power-of-2 boundaries (1, 2, 4, 8, 16...) with O(1) bucket lookup via bit operations. Ideal for latency measurements spanning multiple orders of magnitude. Default: 20 buckets covering 1 to 524,288.
+
+### Metrics REST API
+
+The framework exposes metrics via REST endpoints:
+
+**GET /app/metrics** - Get snapshot of all metrics
+```bash
+curl http://localhost:5000/app/metrics
+```
+
+Response:
+```json
+{
+  "timestamp": "2025-01-15T12:34:56Z",
+  "count": 3,
+  "metrics": [
+    {
+      "name": "my_component.packets_processed",
+      "type": "counter",
+      "value": 12345,
+      "unit": "1",
+      "labels": {"component_id": "processor1"},
+      "description": "Total packets processed"
+    }
+  ]
+}
+```
+
+**Query Parameters:**
+- `?prefix=my_component` - Filter by metric name prefix
+- `?label_key=component_id&label_value=processor1` - Filter by label
+
+**GET /app/metrics/stream** - Server-Sent Events stream for real-time metrics
+```bash
+curl http://localhost:5000/app/metrics/stream
+```
+
+**SSE Query Parameters:**
+- `?interval=1000` - Push interval in ms (default 1000, min 100, max 60000)
+- `?prefix=my_component` - Filter by metric name prefix
+- `?label_key=component_id&label_value=processor1` - Filter by label
+
+### OpenTelemetry Export
+
+When built with `-DCOMPOSITE_USE_OPENTELEMETRY=ON`, metrics can be exported via OTLP to collectors like Grafana Agent, Jaeger, or the OpenTelemetry Collector.
+
+**JSON Configuration:**
+```json
+{
+  "telemetry": {
+    "enabled": true,
+    "service_name": "my_streaming_app",
+    "service_version": "1.0.0",
+    "export_interval": 10000,
+    "exporter": {
+      "endpoint": "http://otel-collector:4318",
+      "protocol": "http/protobuf",
+      "timeout": 10000,
+      "headers": "Authorization=Bearer token"
+    }
+  }
+}
+```
+
+**Exporter Protocol:**
+- `http/protobuf` (default) - Binary protobuf encoding, most efficient
+- `http/json` - JSON encoding, useful for debugging
+- `grpc` - Auto-converted to `http/protobuf` with endpoint port 4317→4318
+
+**Environment Variable Fallbacks:**
+- `OTEL_SERVICE_NAME` → `service_name`
+- `OTEL_EXPORTER_OTLP_ENDPOINT` → `exporter.endpoint`
+- `OTEL_EXPORTER_OTLP_PROTOCOL` → `exporter.protocol`
+- `OTEL_EXPORTER_OTLP_TIMEOUT` → `exporter.timeout`
+- `OTEL_EXPORTER_OTLP_HEADERS` → `exporter.headers`
+- `OTEL_METRIC_EXPORT_INTERVAL` → `export_interval`
+
+JSON configuration takes precedence over environment variables.
+
+### Registry Query API
+
+For custom monitoring integrations, the registry provides direct query methods:
+
+```cpp
+auto& registry = metrics::registry::instance();
+
+// Get all metrics
+auto all = registry.snapshot_all();
+
+// Filter by name prefix
+auto app_metrics = registry.snapshot_by_prefix("app.");
+
+// Filter by label
+auto port_metrics = registry.snapshot_by_label("port", "eth0");
+
+// Get metric count
+auto count = registry.metric_count();
+```
 
 ## Implementing a Component
 

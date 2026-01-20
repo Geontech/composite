@@ -94,6 +94,17 @@ public:
     auto empty() const noexcept -> bool { return size() == 0; }
 
     /**
+     * @brief Get a shared_ptr that shares ownership with this buffer.
+     *
+     * Enables zero-allocation construction of immutable_buffer by using
+     * the shared_ptr aliasing pattern. The returned pointer keeps this
+     * buffer's internal state alive.
+     */
+    auto ownership_handle() const noexcept -> std::shared_ptr<const void> {
+        return std::static_pointer_cast<const void>(m_state);
+    }
+
+    /**
      * @brief Create a view of the first n elements (similar to std::views::take).
      *
      * Returns a new external_buffer viewing only the first n elements while

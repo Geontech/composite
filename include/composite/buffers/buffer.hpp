@@ -8,6 +8,7 @@
 #include "aligned_mem.hpp"
 #include "composite/core/metadata.hpp"
 #include "composite/core/timestamp.hpp"
+#include "external_buffer.hpp"
 
 #include <concepts>
 #include <condition_variable>
@@ -127,6 +128,21 @@ public:
     template<ValidBufferContainer<T> Container>
     explicit immutable_buffer(std::unique_ptr<Container> data) :
       immutable_buffer(std::shared_ptr<Container>(std::move(data))) {}
+
+    /**
+     * @brief Construct from external_buffer without additional allocation.
+     * @param buf External buffer to take ownership from
+     *
+     * Uses external_buffer's internal shared_ptr via ownership_handle() to
+     * share ownership without allocating a new control block. This is the
+     * most efficient way to convert pool-acquired buffers to immutable_buffer.
+     *
+     * The external_buffer can be passed by value (moved) for optimal performance.
+     */
+    explicit immutable_buffer(external_buffer<T> buf) :
+      m_data(buf.ownership_handle()),
+      m_span(std::as_bytes(std::span{buf.data(), buf.size()})),
+      m_size(buf.size()) {}
 
     /**
      * @brief Copy constructor - shares ownership (cheap, only increments refcount)

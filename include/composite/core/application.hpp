@@ -113,13 +113,15 @@ public:
     }
 
     /**
-     * @brief Removes all components from the application.
+     * @brief Stop all components and remove them from the application.
      *
-     * This method clears the internal list of components. Note that this does
-     * not call `stop()` or `destroy()` on the components; it merely removes
-     * them from the application's management.
+     * This method calls stop() on each component before clearing the list.
+     * It is safe to call multiple times.
      */
     auto clear() -> void {
+        for (auto& component : m_components) {
+            component->stop();
+        }
         m_components.clear();
     }
 

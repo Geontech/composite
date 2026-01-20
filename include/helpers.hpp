@@ -8,6 +8,9 @@
 #include "composite/core/component.hpp"
 #include "composite/dpdk/config.hpp"
 #include "composite/transports/transport.hpp"
+#ifdef COMPOSITE_USE_OPENTELEMETRY
+#include "composite/telemetry/config.hpp"
+#endif
 
 #include <dlfcn.h>
 #include <map>
@@ -113,5 +116,27 @@ auto attach_component_transports(
  * }
  */
 auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config;
+
+#ifdef COMPOSITE_USE_OPENTELEMETRY
+/**
+ * @brief Parse telemetry configuration from JSON
+ * @param telemetry_json JSON object containing telemetry configuration
+ * @return Telemetry configuration structure
+ *
+ * Expected JSON format:
+ * {
+ *   "enabled": true,
+ *   "service_name": "my_app",
+ *   "service_version": "1.0.0",
+ *   "export_interval": 10000,
+ *   "exporter": {
+ *     "endpoint": "http://otel-collector:4318",
+ *     "timeout": 10000,
+ *     "headers": "Authorization=Bearer token"
+ *   }
+ * }
+ */
+auto parse_telemetry_config(const nlohmann::json& telemetry_json) -> telemetry::config;
+#endif
 
 } // namespace composite

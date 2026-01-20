@@ -2802,6 +2802,9 @@ TEST_CASE("port connection status", "[port][query]") {
 // ============================================================================
 
 TEST_CASE("input port statistics tracking", "[port][stats]") {
+    // Clear metrics from previous tests
+    metrics::registry::instance().clear();
+
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
@@ -2814,9 +2817,9 @@ TEST_CASE("input port statistics tracking", "[port][stats]") {
 
     // Initial statistics should be zero
     auto& stats = input_port->stats();
-    REQUIRE(stats.packets_transferred.load() == 0);
-    REQUIRE(stats.packets_dropped.load() == 0);
-    REQUIRE(stats.bytes_transferred.load() == 0);
+    REQUIRE(stats.packets_transferred() == 0);
+    REQUIRE(stats.packets_dropped() == 0);
+    REQUIRE(stats.bytes_transferred() == 0);
 
     // Send data
     REQUIRE(source->process() == retval::NORMAL);
@@ -2824,12 +2827,15 @@ TEST_CASE("input port statistics tracking", "[port][stats]") {
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify statistics updated
-    REQUIRE(stats.packets_transferred.load() == 1);
-    REQUIRE(stats.bytes_transferred.load() == 100 * sizeof(float));
-    REQUIRE(stats.packets_dropped.load() == 0);
+    REQUIRE(stats.packets_transferred() == 1);
+    REQUIRE(stats.bytes_transferred() == 100 * sizeof(float));
+    REQUIRE(stats.packets_dropped() == 0);
 }
 
 TEST_CASE("output port statistics tracking", "[port][stats]") {
+    // Clear metrics from previous tests
+    metrics::registry::instance().clear();
+
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
@@ -2840,20 +2846,23 @@ TEST_CASE("output port statistics tracking", "[port][stats]") {
     auto* output_port = source->get_port<output_port_base>("data_out");
     REQUIRE(output_port != nullptr);
 
-    // Initial state
+    // Initial state (fresh metrics)
     auto& stats = output_port->stats();
-    REQUIRE(stats.packets_transferred.load() == 0);
+    REQUIRE(stats.packets_transferred() == 0);
 
     // Send data
     REQUIRE(source->process() == retval::NORMAL);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Verify statistics
-    REQUIRE(stats.packets_transferred.load() == 1);
-    REQUIRE(stats.bytes_transferred.load() == 50 * sizeof(float));
+    REQUIRE(stats.packets_transferred() == 1);
+    REQUIRE(stats.bytes_transferred() == 50 * sizeof(float));
 }
 
 TEST_CASE("statistics reset", "[port][stats]") {
+    // Clear metrics from previous tests
+    metrics::registry::instance().clear();
+
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
@@ -2868,14 +2877,73 @@ TEST_CASE("statistics reset", "[port][stats]") {
     sink->process();
 
     // Verify stats exist
-    REQUIRE(input_port->stats().packets_transferred.load() > 0);
+    REQUIRE(input_port->stats().packets_transferred() > 0);
+    auto packets_before_reset = input_port->stats().packets_transferred();
 
-    // Reset
+    // Reset - note: counters are monotonic (metrics design), only timestamps reset
     input_port->reset_stats();
 
-    // Verify cleared
-    REQUIRE(input_port->stats().packets_transferred.load() == 0);
-    REQUIRE(input_port->stats().bytes_transferred.load() == 0);
+    // Counters remain unchanged (monotonic by design for metrics compatibility)
+    REQUIRE(input_port->stats().packets_transferred() == packets_before_reset);
+}
+
+TEST_CASE("queue depth and capacity metrics", "[port][stats]") {
+    // Clear metrics from previous tests
+    metrics::registry::instance().clear();
+
+    auto source = std::make_shared<TestMutableSource>();
+    auto sink = std::make_shared<TestMutableSink>();
+
+    source->m_size = 10;
+    REQUIRE(source->connect("data_out", sink, "data_in"));
+
+    auto* input_port = sink->get_port<input_port_base>("data_in");
+    REQUIRE(input_port != nullptr);
+
+    // Set a specific queue depth
+    input_port->depth(20);
+
+    // Verify queue_capacity metric reflects the configured depth
+    auto& registry = metrics::registry::instance();
+
+    metrics::labels_t labels = {
+        {"component_id", "TestMutableSink"},
+        {"port_name", "data_in"},
+        {"port_type", "input"}
+    };
+
+    // Get the queue_capacity gauge (get_or_create returns existing one)
+    auto& capacity_gauge = registry.get_or_create_gauge(
+        "composite.port.queue_capacity", "", "1", labels);
+    REQUIRE(capacity_gauge.value() == 20.0);
+
+    // Get the queue_depth gauge
+    auto& depth_gauge = registry.get_or_create_gauge(
+        "composite.port.queue_depth", "", "1", labels);
+
+    // Initially queue should be empty
+    REQUIRE(depth_gauge.value() == 0.0);
+
+    // Send some packets (without consuming)
+    for (int i = 0; i < 3; ++i) {
+        source->m_sent = false;
+        source->process();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Queue depth should reflect 3 packets
+    REQUIRE(depth_gauge.value() == 3.0);
+
+    // Consume one packet
+    sink->process();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Queue depth should now be 2
+    REQUIRE(depth_gauge.value() == 2.0);
+
+    // Change capacity at runtime
+    input_port->depth(50);
+    REQUIRE(capacity_gauge.value() == 50.0);
 }
 
 TEST_CASE("statistics throughput calculation", "[port][stats]") {
@@ -2955,6 +3023,9 @@ TEST_CASE("available_capacity() tracking", "[port][backpressure]") {
 }
 
 TEST_CASE("overflow callback invocation", "[port][backpressure]") {
+    // Clear metrics from previous tests
+    metrics::registry::instance().clear();
+
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
@@ -2983,10 +3054,13 @@ TEST_CASE("overflow callback invocation", "[port][backpressure]") {
     REQUIRE(total_dropped.load() > 0);
 
     // Verify statistics match
-    REQUIRE(input_port->stats().packets_dropped.load() == total_dropped.load());
+    REQUIRE(input_port->stats().packets_dropped() == total_dropped.load());
 }
 
 TEST_CASE("overflow with drop rate calculation", "[port][backpressure]") {
+    // Clear metrics from previous tests
+    metrics::registry::instance().clear();
+
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
@@ -3006,7 +3080,7 @@ TEST_CASE("overflow with drop rate calculation", "[port][backpressure]") {
     }
 
     // All should be dropped
-    REQUIRE(input_port->stats().packets_dropped.load() == 10);
+    REQUIRE(input_port->stats().packets_dropped() == 10);
 
     // Drop rate should be 100%
     auto drop_rate = input_port->stats().drop_rate();
@@ -3035,28 +3109,6 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
     REQUIRE(!output_port->can_send());
 }
 
-TEST_CASE("high water mark tracking", "[port][stats]") {
-    auto source = std::make_shared<TestMutableSource>();
-    auto sink = std::make_shared<TestMutableSink>();
-
-    REQUIRE(source->connect("data_out", sink, "data_in"));
-
-    auto* input_port = sink->get_port<input_port_base>("data_in");
-    input_port->depth(10);
-
-    // Send multiple packets - reset m_sent flag each time
-    source->m_size = 5;
-    for (int i = 0; i < 5; ++i) {
-        source->m_sent = false;
-        source->process();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    // Max depth should be tracked
-    auto max_depth = input_port->stats().max_queue_depth.load();
-    REQUIRE(max_depth > 0);
-    REQUIRE(max_depth <= 5); // Should not exceed number of packets sent
-}
 
 // ============================================================================
 // Blocking Variants Tests

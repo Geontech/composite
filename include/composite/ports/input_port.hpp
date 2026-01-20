@@ -127,14 +127,10 @@ public:
             auto result = std::move(m_queue.front());
             m_queue.pop_front();
 
-            // Update statistics
-            m_stats.packets_transferred.fetch_add(1, std::memory_order_relaxed);
+            // Update statistics and queue depth
             auto& [buffer, ts_val, metadata] = result;
-            m_stats.bytes_transferred.fetch_add(
-                buffer.size() * sizeof(T),
-                std::memory_order_relaxed
-            );
-            m_stats.update_activity_timestamp();
+            m_stats.record_transfer(buffer.size() * sizeof(T));
+            update_queue_depth_metric(m_queue.size());
 
             return result;
         }
@@ -155,14 +151,10 @@ public:
         auto result = std::move(m_queue.front());
         m_queue.pop_front();
 
-        // Update statistics
-        m_stats.packets_transferred.fetch_add(1, std::memory_order_relaxed);
+        // Update statistics and queue depth
         auto& [buffer, ts_val, metadata] = result;
-        m_stats.bytes_transferred.fetch_add(
-            buffer.size() * sizeof(T),
-            std::memory_order_relaxed
-        );
-        m_stats.update_activity_timestamp();
+        m_stats.record_transfer(buffer.size() * sizeof(T));
+        update_queue_depth_metric(m_queue.size());
 
         return result;
     }
@@ -234,24 +226,17 @@ private:
     auto add_data(buffer_type data, timestamp ts) -> void {
         const auto lock = std::scoped_lock{m_mtx};
 
-        // Update high-water mark for queue depth statistics
         auto current_size = m_queue.size();
-        auto max_depth = m_stats.max_queue_depth.load(std::memory_order_relaxed);
-        while (current_size > max_depth &&
-               !m_stats.max_queue_depth.compare_exchange_weak(
-                   max_depth, current_size, std::memory_order_relaxed)) {
-            // Retry if another thread updated max_depth concurrently
-        }
 
         if (current_size < m_depth) {
             // Space available - enqueue packet
-            auto bytes = data.size() * sizeof(T);
             m_queue.emplace_back(std::move(data), ts, m_metadata);
             m_metadata.reset();  // Clear latched metadata after use
+            update_queue_depth_metric(m_queue.size());
             m_cv.notify_one();   // Wake up one waiting get_data() call
         } else {
             // Queue full - drop packet and update statistics
-            m_stats.packets_dropped.fetch_add(1, std::memory_order_relaxed);
+            m_stats.record_drop();
 
             // Invoke overflow callback if set
             if (m_overflow_callback) {
@@ -344,14 +329,10 @@ public:
             auto result = std::move(m_queue.front());
             m_queue.pop_front();
 
-            // Update statistics
-            m_stats.packets_transferred.fetch_add(1, std::memory_order_relaxed);
+            // Update statistics and queue depth
             auto& [buffer, ts_val, metadata] = result;
-            m_stats.bytes_transferred.fetch_add(
-                buffer.size() * sizeof(T),
-                std::memory_order_relaxed
-            );
-            m_stats.update_activity_timestamp();
+            m_stats.record_transfer(buffer.size() * sizeof(T));
+            update_queue_depth_metric(m_queue.size());
 
             return result;
         }
@@ -372,14 +353,10 @@ public:
         auto result = std::move(m_queue.front());
         m_queue.pop_front();
 
-        // Update statistics
-        m_stats.packets_transferred.fetch_add(1, std::memory_order_relaxed);
+        // Update statistics and queue depth
         auto& [buffer, ts_val, metadata] = result;
-        m_stats.bytes_transferred.fetch_add(
-            buffer.size() * sizeof(T),
-            std::memory_order_relaxed
-        );
-        m_stats.update_activity_timestamp();
+        m_stats.record_transfer(buffer.size() * sizeof(T));
+        update_queue_depth_metric(m_queue.size());
 
         return result;
     }
@@ -451,24 +428,17 @@ private:
     auto add_data(buffer_type data, timestamp ts) -> void {
         const auto lock = std::scoped_lock{m_mtx};
 
-        // Update high-water mark for queue depth statistics
         auto current_size = m_queue.size();
-        auto max_depth = m_stats.max_queue_depth.load(std::memory_order_relaxed);
-        while (current_size > max_depth &&
-               !m_stats.max_queue_depth.compare_exchange_weak(
-                   max_depth, current_size, std::memory_order_relaxed)) {
-            // Retry if another thread updated max_depth concurrently
-        }
 
         if (current_size < m_depth) {
             // Space available - enqueue packet
-            auto bytes = data.size() * sizeof(T);
             m_queue.emplace_back(std::move(data), ts, m_metadata);
             m_metadata.reset();  // Clear latched metadata after use
+            update_queue_depth_metric(m_queue.size());
             m_cv.notify_one();   // Wake up one waiting get_data() call
         } else {
             // Queue full - drop packet and update statistics
-            m_stats.packets_dropped.fetch_add(1, std::memory_order_relaxed);
+            m_stats.record_drop();
 
             // Invoke overflow callback if set
             if (m_overflow_callback) {
