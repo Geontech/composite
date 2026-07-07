@@ -1,1219 +1,863 @@
 # composite
 
 **composite** is a lightweight framework for building componentized streaming applications.
-It provides a modular approach to constructing streaming workflows.
+Components are independent shared libraries, loaded at runtime and wired into a data-flow graph;
+the framework owns the threading, the lock-free data path, the property/configuration plane, and a
+REST control plane for runtime inspection and reconfiguration.
 
 ## Features
 
-- **Modular Architecture**: Build applications by composing reusable components.
-- **Lightweight Design**: Minimal overhead ensures high performance in streaming scenarios.
-- **Efficient Memory Management**: Minimize copies with smart pointer movement between component ports.
+- **Modular architecture** — build applications by composing reusable component `.so`s.
+- **Lock-free data path** — bounded single-producer/single-consumer ring ports with event-driven
+  (doorbell) wakeups; minimal copies via move-on-last-receiver buffer transfer.
+- **Typed configuration** — properties are native, schema-validated JSON bound directly to component
+  members, with optional whole-struct `config<T>` reflection.
+- **Observable** — a lock-free metrics registry exposed over REST/SSE, with optional OpenTelemetry export.
 
 ## Getting Started
 
 ### Prerequisites
 
-Ensure you have the following installed:
-
-- [CMake](https://cmake.org/) (version 3.15 or higher)
-- A compatible C++ compiler (e.g., GCC, Clang) with C++20 support
-- OpenSSL (version 3.0 or higher) if compiling with `-DCOMPOSITE_USE_OPENSSL=ON`
-- [nats.c](https://github.com/nats-io/nats.c) if compiling with `-DCOMPOSITE_USE_NATS=ON`
+- [CMake](https://cmake.org/) 3.15 or higher (3.22+ recommended)
+- A C++20 compiler (GCC 12+, Clang 15+)
+- OpenSSL 3.0+ — only if building with `-DCOMPOSITE_USE_OPENSSL=ON`
 
 ### Build and Install
 
-```cmake
+```bash
 cmake -B build
 cmake --build build [--parallel N]
 cmake --install build
 ```
 
+The install ships a relocatable CMake package and a pkg-config file; a downstream project consumes
+it with `find_package(composite)` (or `pkg-config composite`) and links the imported target
+`composite::composite`. `find_package(composite)` also works against the **build tree** (point
+`CMAKE_PREFIX_PATH` at the build directory) without installing.
+
 ### Build Options
 
-- `COMPOSITE_USE_NATS`: Enable components to publish data to a NATS server on a defined subject
-- `COMPOSITE_USE_OPENSSL`: Compile with OpenSSL support to enable a secure REST server
-- `COMPOSITE_USE_OPENTELEMETRY`: Enable OpenTelemetry OTLP metrics export (requires opentelemetry-cpp)
+- `COMPOSITE_USE_OPENSSL` (default OFF) — compile a TLS REST server (requires OpenSSL 3). When ON,
+  `composite-cli` requires client cert/key arguments at launch (see below).
+- `COMPOSITE_USE_OPENTELEMETRY` (default OFF) — enable OpenTelemetry OTLP metrics export (requires
+  opentelemetry-cpp).
+- `COMPOSITE_USE_DPDK` (default OFF) — build DPDK-backed source support.
 
 ## Composite CLI Application and Configuration
 
-The **composite** framework includes a command-line interface (CLI) application, `composite-cli`,
-for running and managing composite applications. This application uses a JSON file for its configuration.
+The framework ships `composite-cli`, which loads a JSON application file, wires the graph, starts the
+components, and serves the REST control plane.
 
-```bash
-$ composite-cli -h
+```text
 Usage: composite-cli [--help] [--version] [--server VAR] [--port VAR] [--log-level VAR] config-file
 
 Positional arguments:
-  config-file      application configuration file 
+  config-file              application configuration file
 
 Optional arguments:
-  -h, --help       shows help message and exits 
-  -v, --version    prints version information and exits 
-  -s, --server     REST server address [nargs=0..1] [default: "localhost"]
-  -p, --port       REST server port [nargs=0..1] [default: 5000]
-  -l, --log-level  log level [trace, debug, info, warning, error, critical, off] [nargs=0..1] [default: "info"]
+  -h, --help               shows help message and exits
+  -v, --version            prints version information and exits
+  -s, --server             REST server bind address           [default: "localhost"]
+  -p, --port               REST server port                   [default: 5000]
+  -l, --log-level          trace|debug|info|warning|error|critical|off  [default: "info"]
 ```
+
+Additional arguments appear depending on build options:
+
+- With `-DCOMPOSITE_USE_OPENSSL=ON` (TLS), client authentication is **required**:
+  `-c, --client-certificate <file>` (required), `-k, --client-key <file>` (required),
+  `-a, --certificate-authority <file>` (optional).
+- With `-DCOMPOSITE_USE_DPDK=ON`: `--list-dpdk-ports` enumerates DPDK-capable ports and exits.
+
+> The default (non-TLS) build serves **plain, unauthenticated HTTP** with a wide-open CORS policy.
+> Run it on a trusted interface, or build with OpenSSL for mutual-TLS.
 
 ### JSON Configuration File
 
-The `composite-cli` application requires a JSON file to define the structure and behavior of the streaming application.
-This file specifies the components, their properties, and how they are interconnected.
+The configuration file defines the components, their properties, and how they are connected.
 
 #### Schema Overview
 
-The main structure of the JSON configuration file includes the following top-level keys:
+Top-level keys:
 
-1. **name (optional, string):** Specifies a name for the application. If not provided, a default name will be generated.
+1. **name** (optional, string) — application name; a default is generated if omitted.
 
-```json
-{
-    "name": "my_streaming_application"
-    ...
-}
-```
-
-2. **properties (optional, object):** Defines application-level properties that can be applied to components.
-These properties are applied to all components and are applied before the component-level properties. All property
-values must be defined as strings.
+2. **properties** (optional, object) — application-level properties applied to all components
+   *before* their component-level properties. Property values are **native JSON**, typed to the
+   target C++ field — the framework validates and decodes each value against the property's
+   registered schema (a `bool` field takes `true`, a numeric field takes `123`/`2.5`, a list field
+   takes a JSON array, an enum field takes the enum-name string). They are **not** strings.
 
 ```json
 {
     "name": "my_streaming_application",
     "properties": {
-        "global_setting": "value1",
-        "feature_flags": {
-            "enable_x": "true"
-        }
+        "feature_flags": { "enable_x": true }
     }
-    ...
 }
 ```
 
-3. **components (required, array of objects):** An array where each object defines a component to be loaded into the application.
-Each component object must contain:
-    - **id (required, string):** A unique identifier for this component instance. This identifier is used when making connections (see below)
-      and is passed to the component's constructor.
-    - **library (required, string):** The shared library to load. Can be either:
-      - A filename (e.g., `"libmy_component.so"`) - searched in `LD_LIBRARY_PATH` and standard library paths
-      - An absolute path (e.g., `"/path/to/libmy_component.so"`) - loaded from the specified location
-    - **properties (optional, object):** Defines component-specific properties that can override application-level properties or
-      provide unique configurations for this component. Just as with application-level properties, all property values must be defined
-      as strings.
+3. **components** (required, array) — each object defines a component instance:
+   - **id** (required, string) — unique instance identifier; used for connections and passed to the
+     component constructor.
+   - **library** (required, string) — the shared library to load. A bare name (`"fft"` or
+     `"libfft.so"`) is resolved via `LD_LIBRARY_PATH` and standard paths; an absolute path loads
+     directly. A name without a `.so` suffix is expanded to `lib<name>.so`.
+   - **properties** (optional, object) — component-specific property values (native JSON, as above).
+   - **args** (optional, object) — construction-time arguments passed to the factory, chiefly the
+     template `"type"` discriminator (e.g. `{ "type": "cf32" }`) — distinct from runtime
+     `properties`. The legacy scalar `"create_arg": "cf32"` form is still accepted and mapped to
+     `{ "type": "cf32" }`.
 
 ```json
 {
-    "name": "my_streaming_application",
-    "properties": {
-        ...
-    },
     "components": [
         {
             "id": "my_component_instance",
             "library": "libmy_component.so",
-            "properties": {
-                "specific_param": "123",
-                "processing_gain": "2.5"
-            }
+            "properties": { "threshold": 123, "processing_gain": 2.5 }
         }
     ]
 }
 ```
 
-4. **connections (required, array of objects):** An array where each object defines a connection between an output
-port of one component and an input port of another component. Each connection object must contain:
-    - **output (required, object):** Specifies the source of the data. Must contain:
-      - `"component"`: The ID of the source component
-      - `"port"`: The name of the output port
-    - **input (required, object):** Specifies the destination of the data. Must contain:
-      - `"component"`: The ID of the target component
-      - `"port"`: The name of the input port
+4. **connections** (required, array) — each object connects one output port to one input port:
+   - **output** — `{ "component": "<source id>", "port": "<output port name>" }`
+   - **input**  — `{ "component": "<target id>", "port": "<input port name>" }`
 
 ```json
 {
-    "name": "my_streaming_application",
-    "properties": {
-        ...
-    },
     "components": [
-        {
-            "id": "sensor",
-            "library": "libsensor_reader.so"
-        },
-        {
-            "id": "processor",
-            "library": "libdata_processor.so"
-        },
-        {
-            "id": "writer",
-            "library": "libfile_writer.so"
-        }
+        { "id": "sensor",    "library": "libsensor_reader.so" },
+        { "id": "processor", "library": "libdata_processor.so" },
+        { "id": "writer",    "library": "libfile_writer.so" }
     ],
     "connections": [
-        {
-            "output": { "component": "sensor", "port": "raw_data" },
-            "input": { "component": "processor", "port": "data_in" }
-        },
-        {
-            "output": { "component": "processor", "port": "processed_data" },
-            "input": { "component": "writer", "port": "data_in" }
-        }
+        { "output": { "component": "sensor",    "port": "raw_data" },
+          "input":  { "component": "processor", "port": "data_in"  } },
+        { "output": { "component": "processor", "port": "processed_data" },
+          "input":  { "component": "writer",    "port": "data_in" } }
     ]
 }
 ```
 
-**Note**: An output port can be connected to multiple input ports (fan-out), but an input port can only receive from one output port.
+**Note:** an output port may fan out to multiple input ports, but an input port accepts exactly one
+producer (fan-in is rejected at connect time — it is the single-producer precondition of the SPSC ring).
 
 ## Component Interface
 
-The **composite** framework is designed around a component-based architecture.
-Each component follows a well-defined interface that allows it to be integrated into a larger streaming pipeline.
-
 ### Component Loading
 
-Components are dynamically loaded at runtime as shared libraries:
+Components are dynamically loaded shared libraries:
 
-- **Library Path**: The `library` field in configuration can specify either:
-  - A library filename (e.g., `"libmy_component.so"`) searched via `LD_LIBRARY_PATH` and standard locations
-  - An absolute path (e.g., `"/opt/components/libmy_component.so"`) for direct loading
-- **Factory Function**: Each component library must export a `create()` factory function with one of these signatures:
+- **Library path** — the `library` field resolves a bare name (via `LD_LIBRARY_PATH`/standard
+  locations) or an absolute path; a missing `.so` suffix becomes `lib<name>.so`.
+- **Factory ABI** — each component library exports exactly one factory plus an ABI-version handshake.
+  Declare them with the `COMPOSITE_REGISTER_*` macros from `<composite/core/register.hpp>` rather than
+  hand-writing the `extern "C"` block:
+
   ```cpp
-  // For simple components:
-  auto create(std::string_view id) -> std::shared_ptr<composite::component>
+  #include <composite/core/register.hpp>
 
-  // For components that need additional arguments:
-  auto create(std::string_view id, std::string_view arg) -> std::shared_ptr<composite::component>
+  // Non-templated component with a `MyComp(std::string_view id)` constructor:
+  COMPOSITE_REGISTER_SIMPLE(MyComp)
+
+  // Component whose concrete type is chosen at construction (a "type" discriminator):
+  COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
+                                   -> std::shared_ptr<composite::component> {
+      const auto type = args.type();                 // e.g. "cf32"
+      if (type == "cf32") return std::make_shared<my_fft<std::complex<float>>>(id);
+      if (type == "cf64") return std::make_shared<my_fft<std::complex<double>>>(id);
+      throw std::runtime_error("my_fft: unknown type '" + std::string{type} + "'");
+  })
   ```
-- **Component ID**: Each component instance must have a unique ID (required in configuration), which is passed to the constructor and used for connections and logging
+
+  Both macros emit the single signature the loader calls —
+  `create(std::string_view id, const composite::create_args& args)` — and a
+  `composite_abi_version()` symbol. The loader checks the ABI version (currently `1`) *before* calling
+  `create()` and refuses a library built against an incompatible framework, so a stale `.so` fails
+  cleanly instead of being called through a mismatched signature.
+
+- **Construction args** — pass construction-time arguments in an `"args"` object on the component
+  config; the factory reads them via `args.type()` / `args.value<T>("key")`. These are distinct from
+  runtime `properties`.
+
+  ```json
+  { "id": "fft1", "library": "fft", "args": { "type": "cf32" } }
+  ```
+
+- **Component ID** — each instance must have a unique `id`. The factory must thread the provided `id`
+  into the constructor (`composite::component(id)`); the loader **rejects** a component whose `id()`
+  differs from the configured id. The `dlopen` handle is tied to the returned component's lifetime, so
+  the library is unmapped only after the component is destroyed.
 
 ### Component Lifecycle
 
-Each component follows a well-defined lifecycle:
+1. **Construction** — ports and properties are registered in the constructor.
+2. **Initialize** — `initialize()` runs once (optional override) before the worker loop.
+3. **Start** — the component's worker thread starts (if `enabled` is `true`).
+4. **Process loop** — `process()` is called repeatedly on the worker thread.
+5. **Stop** — the worker is joined and resources are released.
 
-1. **Construction**: Component is instantiated, ports and properties are registered
-2. **Initialize**: `initialize()` method is called to set up resources (optional override)
-3. **Start**: Component thread is started (only if `enabled` property is `true`)
-4. **Process Loop**: `process()` method is called repeatedly in the component's dedicated thread
-5. **Stop**: Thread is stopped and resources are cleaned up
+Each component runs in its own `std::jthread`, named after the component id for debugging.
 
-**Thread Management**: Each component runs in its own `std::jthread` managed by the framework. The thread name is set to the component ID for debugging purposes.
+#### Enabling and disabling at runtime
 
-**Runtime Lifecycle Control**: Components can be dynamically enabled or disabled at runtime via the `enabled` property:
+`enabled` is a framework **spec/status virtual**, not a stored property. It defaults to `true`. Reads
+report the *desired* state; the component report also includes an observed `running` flag.
 
-- Setting `enabled=false` stops the component thread and pauses all input ports (sets queue depth to 0)
-  - Pausing input ports prevents memory bloat by immediately dropping incoming data instead of queuing it
-- Setting `enabled=true` restarts the component thread and restores saved input port queue depths
-  - After calling `set_properties()` to change the `enabled` property, you must call `apply_lifecycle_changes()` to apply the start/stop operation
-  - This two-step process prevents deadlocks by deferring thread operations until after property locks are released
+- A **RUNTIME-context** write to `enabled` **is** the start/stop action — it reconciles the worker
+  immediately. There is no separate "apply" step.
+- An **INITIALIZE-context** write only records the desired state; the application start sequence (or
+  `apply_lifecycle_changes()`) reconciles it.
+- `enabled` must be written as a JSON boolean; a non-boolean is rejected.
 
-**Example - Programmatic Enable/Disable**:
+Disabling a component stops its worker and pauses its input ports (sets their depth to 0, so incoming
+data is dropped rather than queued); re-enabling restarts the worker and restores the port depths.
+
 ```cpp
-// Disable a component at runtime
-component->set_properties({{"enabled", "false"}});
-component->apply_lifecycle_changes();  // Required to trigger stop
+// Disable a running component (RUNTIME context -> takes effect immediately):
+component->set_properties({{"enabled", false}}, composite::properties::config_type::RUNTIME);
 
-// Later, re-enable the component
-component->set_properties({{"enabled", "true"}});
-component->apply_lifecycle_changes();  // Required to trigger start
+// Re-enable it:
+component->set_properties({{"enabled", true}}, composite::properties::config_type::RUNTIME);
 ```
 
-> **Note**: When using the REST API to update properties, `apply_lifecycle_changes()` is called automatically by the server after property updates complete.
+> Over the REST API, `PATCH`/`PUT` writes are always RUNTIME-context, so writing `enabled` there
+> starts/stops the component immediately.
 
 ### Process Return Values
 
-The `process()` method must return a `composite::retval` enum value that controls the component's execution flow:
+`process()` returns a `composite::retval` that tells the worker loop what to do next:
 
-- `NORMAL`: Normal processing occurred. Component yields to allow other threads to run.
-- `NOOP`: No operation was performed (e.g., no data available). Component briefly sleeps before next iteration.
-- `FINISH`: Component requests graceful shutdown. The thread will terminate after this return.
-- `NO_YIELD`: Processing occurred but component should immediately call `process()` again without yielding.
+| Return | Meaning |
+|--------|---------|
+| `NORMAL` | Useful work was done. The worker loops, yielding (`sched_yield`) once per `yield_interval` consecutive `NORMAL`s (default 32) so a busy component doesn't monopolize a core. |
+| `NOOP` | No work was available (e.g. no input data). The worker arms the input **doorbell** and sleeps until a producer delivers data, a stop/reconfigure is requested, or the `noop_thread_delay` backstop (default 1 ms) elapses. **At end-of-stream** (every input drained *and* producer-closed) a `NOOP` is auto-promoted to `FINISH` so the component self-completes — see below. |
+| `AWAIT_OUTPUT` | The component is blocked on a **full downstream output** (it paced with `can_send()`). The worker sleeps until a consumer drains the downstream ring (reverse doorbell), or the backstop elapses. Use this for lossless backpressure. |
+| `FINISH` | Graceful shutdown — the worker exits the loop permanently. Synthesized automatically if `process()` throws, or when a `NOOP` coincides with end-of-stream (unless `finish_at_end` is set false). |
+| `NO_YIELD` | Work was done; loop again immediately without yielding (does not count toward the `yield_interval` streak). |
 
+The doorbell is a **latency optimization**, not the liveness mechanism: `noop_thread_delay`/`AWAIT_OUTPUT`
+always carry a timeout backstop, so a missed fast-wake degrades to that delay — never a hang.
+
+### Completion, end-of-stream, and sources
+
+A component that reaches the end of its work **self-terminates** — the basis for batch and
+file-processing pipelines that run to completion and stop on their own:
+
+- **EOS is the default — you don't write it.** When your `process()` returns `NOOP` and every input
+  has drained *and* its producer has closed (`inputs_at_end()`), the base auto-promotes that `NOOP`
+  to `FINISH`. So a plain consumer that returns `NOOP` on an empty read *already* self-completes when
+  the stream ends; no `inputs_at_end()` check is needed. Opt out with the `finish_at_end` property
+  (set false) for the rare component that must keep running past its inputs.
+- **Flushing held state.** If your component buffers data (a delay line, a framer's partial residue,
+  an accumulator), override `on_end_of_stream()` — it's called once on the worker thread just before
+  the synthesized `FINISH`/EOS, and may emit final packets via `send_data()`. (Distinct from
+  `on_finished(reason)`, which runs later in the completion tail for **resource release / recording**
+  — keep *that* one prompt; it runs before a concurrent property write can complete.)
+- Returning `FINISH` explicitly (or an unhandled `process()` throw) also ends the worker loop, and
+  `on_finished(reason)` is called once (`reason` is `completed` for `FINISH`, `error` for a throw).
+- On a `completed` finish the framework sends **end-of-stream (EOS)** on every output port. EOS is
+  out-of-band (a flag, not a ring packet), so the drop-on-full ring cannot lose it. A downstream
+  input reaches `at_end()` once drained, so the next consumer self-completes in turn — completion
+  propagates through the whole graph.
+- `is_finished()` / `finished_reason()` (and the `finished` / `finish_reason` fields of the component
+  report) expose the terminal state. `wait_until_finished([timeout])` — on both `component` and
+  `application` — blocks until the worker(s) exit; the app-level form is the natural join for a batch
+  run.
+
+```cpp
+composite::application app{"batch"};
+// ... add components, connect ...
+app.start();
+app.wait_until_finished();   // returns once a finite source drives the graph to completion
+app.stop();
+```
+
+**Sources.** Derive `source_component<OutBuf>` for a component with no data input: implement
+`produce()` returning `emit(buffer, ts)`, `idle()` (nothing yet — back off), or `done()` (end of
+stream → EOS + FINISH). Backpressure is automatic — when the downstream ring is full the base returns
+`AWAIT_OUTPUT` and does not call `produce()`, so a source paces to consumption instead of dropping.
+A concrete source **must** stop its worker while still fully alive — declare `component::auto_stop` as
+its **last** data member (the base cannot do this for you, since `produce()` is pure).
+
+**Resilience.** Set the `error_restart_max` / `error_restart_backoff_ms` properties to retry a
+throwing `process()` with exponential, stop-interruptible backoff instead of finishing on the first
+error. **Graceful shutdown:** `application::drain_stop(timeout)` stops the sources and lets EOS drain
+the graph to completion, then hard-stops any straggler.
 
 ## Ports
 
-The **composite** framework provides a type-safe, buffer-based port system for connecting components.
-The system facilitates the transfer of time-stamped contiguous data buffers and associated metadata between components,
-with support for zero-copy optimizations, backpressure management, and comprehensive statistics tracking.
+Ports transfer time-stamped, contiguous data buffers (and optional per-packet metadata) between
+components over a **bounded, lock-free, single-producer/single-consumer ring**.
 
-Each port is either an `input_port<BufferType>` or an `output_port<BufferType>`, where `BufferType` is one of:
-- `mutable_buffer<T>`: Exclusive ownership buffer backed by `std::unique_ptr<std::vector<T>>`
-- `immutable_buffer<T>`: Shared ownership buffer backed by `std::shared_ptr<const std::vector<T>>`
+Each port is an `input_port<BufferType>` or `output_port<BufferType>`, where `BufferType` is one of:
+- `mutable_buffer<T>` — exclusive-ownership, move-only buffer
+- `immutable_buffer<T>` — shared-ownership, read-only buffer
 
 ### Buffer Types
 
-**Mutable Buffers** (`mutable_buffer<T>`):
-- Support in-place modification via `operator[]` and iterators
-- Enable zero-copy transfer when moving between ports
-- Can be promoted to immutable buffers via `to_immutable()`
-- Ideal for in-place processing and single-consumer workflows
-- **Capacity management** (for dynamic containers like `std::vector`):
-  - `resize(new_size)`: Change buffer size, expanding or truncating as needed
-  - `reserve(new_capacity)`: Pre-allocate storage without changing size (avoids reallocations)
-  - `capacity()`: Query current allocated capacity
-  - `shrink_to_fit()`: Request reduction of capacity to match size
-  - `clear()`: Remove all elements while preserving capacity
-  - Example: `buffer.reserve(10000);  // Pre-allocate for 10k elements to avoid reallocation`
+**`mutable_buffer<T>`** — exclusive, **move-only** (the copy constructor is deleted; use `.copy()` for
+a deep copy). Supports in-place modification via `operator[]`/iterators/`as_span()`. Can be promoted to
+an immutable buffer with `std::move(buf).to_immutable()` (rvalue-qualified — it empties the source).
+When backed by a dynamic container it supports `resize`/`reserve`/`capacity`/`shrink_to_fit`/`clear`
+(these throw on an empty or non-dynamic buffer); `truncate(n)` logically shrinks (it cannot grow).
 
-**Immutable Buffers** (`immutable_buffer<T>`):
-- Read-only access to shared data
-- Enable zero-copy sharing across multiple consumers via `share()`
-- Backed by `shared_ptr` for efficient reference counting
-- Ideal for broadcast/fan-out scenarios
-- **Zero-copy slicing**: Create views of buffer subsets without copying data via `slice(offset, count)` or `slice_from(offset)`
-  - Slices share the underlying data with the parent buffer
-  - Use `immutable_buffer<T>::npos` as count parameter for "to end" semantics
-  - Example: `auto header = buffer.slice(0, 64);  // First 64 elements`
+**`immutable_buffer<T>`** — read-only, reference-counted (cheap to copy — a refcount bump). Ideal for
+fan-out. `share()` returns a zero-copy alias; `slice(offset, count)` / `slice_from(offset)` are
+zero-copy views over the same storage (use `immutable_buffer<T>::npos` for "to end").
+
+**`aligned_mem<T>`** — a SIMD-aligned backing store (requires `T` trivially copyable and trivially
+destructible). Construct buffers over it with `make_aligned_buffer<T>(alignment, count)` /
+`make_aligned_immutable_buffer<T>(alignment, count)`; the alignment must be a power of two and at least
+`alignof(std::max_align_t)`.
+
+Factory helpers (`<composite/buffers/buffer.hpp>`): `make_mutable<T>(size)` / `make_mutable<T>({...})`,
+`make_immutable<T>(size)` / `make_immutable<T>({...})`, `wrap_mutable`/`wrap_immutable`, and the
+aligned variants above.
 
 ### Output Port
 
-The `output_port` class is responsible for publishing time-stamped buffer data to one or more connected `input_port`
-instances or to a NATS subject if configured. It supports efficient transfer semantics by minimizing copies and
-adjusting behavior based on the mutability of connected inputs.
+`output_port<BufferType>` publishes time-stamped buffers (with optional metadata) to one or more
+connected input ports.
 
-#### Key Features
-
-- Compatible with both `mutable_buffer<T>` and `immutable_buffer<T>`
-- Ability to send metadata independently to connected input ports via `send_metadata()`
-- Forwards data intelligently by choosing to move, copy, or promote based on buffer types
-- **Statistics tracking**: Monitors packets/bytes transferred and throughput
-- **Backpressure support**: Query connected port capacity with `can_send()`
-
-#### Data Transfer Semantics
-
-Behavior is determined by the buffer types of the output and input ports. The system optimizes for minimal copies
-while respecting mutability constraints.
-
-From output_port         |   To input_port          |  Behavior
------------------------- |   ----------------------- |  --------
-`mutable_buffer<T>`      |   `mutable_buffer<T>`     |  Move (single output) or copy (fan-out)
-`mutable_buffer<T>`      |   `immutable_buffer<T>`   |  Promote to immutable (move)
-`immutable_buffer<T>`    |   `immutable_buffer<T>`   |  Share (zero-copy via `shared_ptr`)
-`immutable_buffer<T>`    |   `mutable_buffer<T>`     |  Deep-copy to new mutable buffer
-
-**Fan-out optimization** (mutable output to multiple inputs):
-- Copy for all but the last destination
-- Move to the final destination for efficiency
-
-#### Statistics
-
-Output ports track the following metrics (accessible via `stats()`):
-- `packets_transferred`: Number of packets successfully sent
-- `bytes_transferred`: Total bytes transmitted
-- `last_activity_ns`: Timestamp of last send operation
-- `throughput_mbps()`: Calculated throughput in megabits per second
-
-Use `reset_stats()` to clear all statistics counters.
-
-#### Backpressure
-
-- `can_send()`: Returns `true` if at least one connected input port has available capacity
-- Allows producers to check downstream capacity before generating new data
-
-#### Connection Management
-
-Output ports support dynamic runtime reconfiguration of connections:
-
-- `disconnect(input_port_base* port)`: Disconnect from a specific input port
-  - Returns `true` if the port was connected and is now disconnected
-  - Returns `false` if the port was not connected
-- `disconnect()`: Disconnect from all connected input ports
-  - Returns the number of ports that were disconnected
-- `is_connected()`: Check if connected to any input port
-- `is_connected_to(const input_port_base* port)`: Check if connected to a specific input port
-- `connection_count()`: Get the number of currently connected input ports
-- `connected_ports()`: Get a list of connected port names for introspection
-
-**Example:**
 ```cpp
-// Disconnect a specific connection
-bool was_connected = output.disconnect(&input1);
-
-// Disconnect all connections
-std::size_t count = output.disconnect();
-logger()->info("Disconnected {} connections", count);
-
-// Query connection state
-if (output.is_connected_to(&input2)) {
-    logger()->info("Still connected to input2");
-}
+out.send_data(std::move(buffer), ts);                 // no metadata
+out.send_data(std::move(buffer), ts, metadata);       // metadata rides with the packet
+out.send_batch(buffers_span, ts, metadata);           // amortized publish for a single consumer
 ```
 
-**Thread Safety:** All connection management operations are thread-safe and can be called while data is being transmitted.
+- **Single-producer:** `send_data`/`send_batch` must be called from one thread only (the component's
+  worker). The send path reads a lock-free cached connection snapshot; concurrent senders on the same
+  output are a data race. (Wiring/introspection methods *are* thread-safe — see below.)
+- **Minimal copies (move-on-last):** for the common 1:1 case the buffer (and its metadata) is *moved*
+  to the receiver — zero copies. On fan-out, earlier receivers get a share/copy and the last receiver
+  gets the move. An immutable→mutable hop deep-copies; a mutable→immutable hop promotes in place.
+- **Metadata** travels atomically with its packet as the optional third argument — there is no
+  separate "send metadata" call and no metadata/data race.
+- **Backpressure:** `can_send()` returns `true` if at least one connected input has capacity. Pair it
+  with the `AWAIT_OUTPUT` return value for lossless pacing.
 
-#### Metadata Transmission
+#### Connection Management (thread-safe)
 
-- An `output_port` can send metadata to all its connected `input_port` instances using the `send_metadata(const metadata&)` function.
-  - Updated metadata must be sent before the next data packet so that it can be associated correctly
-- This metadata is "latched" by the receiving input ports and is intended to be associated with the *next* data packet that is
-subsequently enqueued and retrieved from those input ports.
+`connect()` is normally driven by the application graph, but ports also support runtime
+reconfiguration, all under a mutex and safe to call while data flows:
+
+```cpp
+bool was = out.disconnect(&input1);    // disconnect one; false if it wasn't connected
+std::size_t n = out.disconnect();      // disconnect all; returns the count
+out.is_connected();  out.is_connected_to(&input2);
+out.connection_count();  out.connected_ports();   // introspection
+```
 
 ### Input Port
 
-The `input_port` class provides a thread-safe queue to receive time-stamped data buffers from an `output_port`.
-It can be configured with a depth limit and exposes methods for inspection, backpressure management, and statistics tracking.
+`input_port<BufferType>` receives packets into a **bounded lock-free SPSC ring**.
 
-#### Key Features
+- **Default depth is 1024** (rounded up to a power of two); configurable per port and at runtime via
+  `depth(std::size_t)`. The ring only grows while empty; raising the depth at runtime adjusts a soft
+  limit, it never reallocates a live ring.
+- **Drop-on-full at the producer:** when the ring is full, `send_data` drops the packet (it does
+  **not** block and the queue is **not** unbounded), increments `packets_dropped`, and fires the
+  overflow callback. Use `can_send()`/`AWAIT_OUTPUT` upstream for lossless flow.
+- `depth(0)` pauses the port — every packet is dropped (used by `enabled=false`).
 
-- Compatible with both `mutable_buffer<T>` and `immutable_buffer<T>`
-- Thread-safe receive queue with condition variable
-- Optional bounded queue depth (default: unbounded, i.e., `std::numeric_limits<std::size_t>::max()`)
-- **Multiple receive variants**: Default timeout (1s), custom timeout, or blocking indefinitely
-- **Statistics tracking**: Monitors packets transferred/dropped, queue depth, and throughput
-- **Backpressure API**: Query queue state with `is_full()` and `available_capacity()`
-- **Overflow callbacks**: Get notified when packets are dropped due to full queue
-- Methods to clear and inspect the current queue state
+#### Receiving data
 
-#### Lifecycle & Behavior
-
-- Data, along with its timestamp, is enqueued by an `output_port`'s `send_data()` method. If metadata was previously sent by the output port, that
-  metadata is packaged with this incoming data during the internal `add_data` call.
-- The internal queue honors the configured `depth` limit; data arriving when the queue is full (i.e., `m_queue.size() >= m_depth` when `add_data` is called) is dropped.
-  - The queue depth can be configured dynamically at runtime with the `input_port`'s `depth(std::size_t)` method.
-  - Setting a depth of 0 "disables" the port because all incoming data will be dropped.
-  - Dropped packets increment the `packets_dropped` counter and trigger the overflow callback if set.
-
-#### Receiving Data
-
-Three variants are available for retrieving data:
-
-1. **Default timeout** (1 second):
-   ```cpp
-   auto [buffer, ts, metadata] = input_port.get_data();
-   ```
-
-2. **Custom timeout**:
-   ```cpp
-   auto [buffer, ts, metadata] = input_port.get_data(std::chrono::milliseconds(500));
-   ```
-
-3. **Blocking** (waits indefinitely):
-   ```cpp
-   auto [buffer, ts, metadata] = input_port.get_data(composite::blocking);
-   ```
-
-Each method returns a `std::tuple<buffer_type, timestamp, std::optional<metadata>>`:
-- If data is available, the tuple contains the data, its timestamp, and any metadata that was associated with it.
-- If no data is received within the timeout (for non-blocking variants), an empty tuple is returned (buffer size will be 0).
-
-#### Statistics
-
-Input ports track the following metrics (accessible via `stats()`):
-- `packets_transferred`: Number of packets successfully received by consumers
-- `packets_dropped`: Number of packets dropped due to queue overflow
-- `bytes_transferred`: Total bytes received by consumers
-- `max_queue_depth`: High-water mark of queue depth
-- `last_activity_ns`: Timestamp of last receive operation
-- `throughput_mbps()`: Calculated throughput in megabits per second
-- `drop_rate()`: Ratio of dropped packets (0.0 to 1.0)
-
-Use `reset_stats()` to clear all statistics counters.
-
-#### Backpressure
-
-- `is_full()`: Returns `true` when queue depth equals configured limit
-- `available_capacity()`: Returns number of packets that can be queued before overflow
-- Allows upstream producers to implement flow control
-
-#### Overflow Handling
-
-Set a callback to be notified when packets are dropped:
-```cpp
-input_port.set_overflow_callback([](std::size_t dropped_count) {
-    // Handle overflow condition (e.g., log warning, alert monitoring system)
-});
-```
-
-The callback is invoked each time packets are dropped, with the count of dropped packets.
-
-#### Metadata Association
-
-- Metadata sent by an `output_port` is received by the `input_port` and stored in its internal `m_metadata` member. This is the "latching" mechanism.
-- When the next data packet is enqueued into the `input_port`, this latched `m_metadata` is bundled with that data packet and timestamp into a tuple,
-  which is then added to the queue.
-- Immediately after the latched m_metadata is used to form this tuple, the `input_port`'s internal m_metadata member is reset.
-  This makes the input port ready to latch new metadata for any subsequent data packets.
-
-### Transport System
-
-The **composite** framework provides a transport abstraction layer that allows output ports to publish data to external messaging systems.
-Transports enable components to send data outside the application to distributed systems, monitoring tools, or remote consumers.
-
-#### Transport Types
-
-The framework supports multiple transport backends:
-
-- **NATS**: Publish-subscribe messaging via NATS server (requires `-DCOMPOSITE_USE_NATS=ON`)
-  - Lightweight, high-performance messaging
-  - Subject-based routing and wildcards
-  - Quality of service guarantees
-
-Future transport types are planned.
-
-#### Attaching Transports to Output Ports
-
-Transports are attached to output ports at runtime, allowing components to send data to both connected input ports and external systems simultaneously:
+`try_get()` is the **canonical non-blocking read**. It returns
+`std::optional<std::tuple<BufferType, timestamp, std::optional<metadata>>>`: `std::nullopt` when the
+ring is empty, otherwise the packet — even one carrying a genuine zero-length buffer:
 
 ```cpp
-#include <composite/transports/nats/transport.hpp>
-
-// In component initialization or via configuration
-auto transport = std::make_unique<composite::nats::transport>(
-    "nats://localhost:4222",  // NATS server URL
-    "sensor.temperature"       // Subject/topic to publish to
-);
-
-// Attach to output port
-m_output_port.attach_transport(std::move(transport));
+auto pkt = in.try_get();
+if (!pkt) {
+    return composite::retval::NOOP;   // empty ring — idle on the doorbell (base auto-FINISHes at EOS)
+}
+auto& [buffer, ts, metadata] = *pkt;
+if (metadata.has_value()) { /* use *metadata */ }
 ```
 
-**Key Features:**
-- **Parallel Operation**: Transports operate alongside port-to-port connections without interference
-- **Statistics Tracking**: Each transport tracks packets sent, bytes transferred, failures, and throughput
-- **Error Handling**: Send failures are counted but don't block internal port connections
-- **Multiple Transports**: A single output port can have multiple transports attached
+> `get_data()` also exists and returns the tuple directly, signalling empty with an empty buffer
+> (`size() == 0`) — prefer `try_get()`, which distinguishes an empty ring from a real zero-length
+> packet. The worker, not the port, handles idle backoff (via the doorbell / `noop_thread_delay`),
+> so there is no blocking read; the old no-op `get_data(timeout)` / `get_data(blocking)` overloads
+> were removed.
 
-#### Transport Interface
+A batch consumer can drain several packets with a single ring advance: `get_batch(std::span<...> out)`
+returns the number moved.
 
-All transports implement a common interface (`transport_base`):
+#### Statistics, backpressure, overflow
 
-- `send(data, timestamp)`: Publish data buffer with timestamp to the transport
-- `is_connected()`: Check if transport is connected to its backend
-- `type()`: Get transport type enum (e.g., `transport_type::nats`)
-- `endpoint()`: Get human-readable endpoint description
-- **Statistics**: `packets_sent()`, `bytes_sent()`, `send_failures()`, `throughput_mbps()`
-- `reset_stats()`: Clear statistics counters
+Both port directions expose `stats()` — `packets_transferred()`, `packets_dropped()`,
+`bytes_transferred()`, `throughput_mbps()`, `drop_rate()`, `time_since_last_activity()` — and
+`reset_stats()`. (Live queue depth is published separately as the `composite.port.queue_depth`
+metric gauge, not via `stats()`.) Input ports expose `is_full()` / `available_capacity()`, and
+`set_overflow_callback([](std::size_t dropped){ ... })` to be notified of drops.
 
-#### NATS Transport
+### External Egress
 
-When built with NATS support, the NATS transport provides:
-
-- Automatic reconnection on connection failure
-- Subject-based pub/sub with wildcard support
-- Efficient binary data transmission
-- Configurable connection options (timeouts, retries, etc.)
-
-**Example Usage:**
-```cpp
-// Create NATS transport
-auto nats_transport = std::make_unique<composite::nats::transport>(
-    "nats://nats.example.com:4222",
-    "telemetry.sensor.data"
-);
-
-// Attach to output port
-output_port.attach_transport(std::move(nats_transport));
-
-// Data sent via send_data() is now published to both:
-// 1. Connected input ports (within application)
-// 2. NATS subject "telemetry.sensor.data" (external consumers)
-```
+There is no transport machinery on output ports. Publishing data outside the application (to NATS,
+ZeroMQ, UDP, a file, etc.) is modeled as an ordinary **sink component** with an input port, wired into
+the graph like any other connection. This keeps the hot path free of any per-send transport branch,
+makes egress opt-in per graph, and lets an egress backend be developed and tested as a normal
+component.
 
 ## Properties and Configuration
 
-Components in the **composite** framework are configurable through a property system managed by the `property_set` class. This allows for flexible
-adaptation of component behavior at initialization or, for certain properties, during runtime.
+Properties are **native, schema-validated JSON bound to component members**. A property's value lives
+in the member you register; the framework validates and commits writes, runs reactions, and exposes
+the value over config and REST. There are three authoring styles, all registered in the constructor
+and all coexisting in one component: per-property `add_property`, whole-struct `add_config<T>`, and
+keyed-map `add_keyed`.
 
-### Defining Properties
+### Configurability: INITIALIZE vs RUNTIME
 
-Properties are typically defined in a component's constructor by linking them to member variables. This is done using the `add_property()` method
-provided by the `component` base class:
+Every registration takes a configurability argument (default `INITIALIZE`):
 
-```cpp
-#include <composite/composite.hpp>
-#include <optional>
-#include <string>
+- `composite::properties::config_type::INITIALIZE` (alias `initialize`) — settable only during
+  initialization (config-file load / `set_properties(..., INITIALIZE)`). A runtime write to an
+  INITIALIZE-only property is rejected (`config_violation`).
+- `composite::properties::config_type::RUNTIME` (alias `runtime`) — settable while the component runs.
 
-class MyConfigurableComponent : public composite::component {
-public:
-    explicit MyConfigurableComponent(std::string_view id) : composite::component(id) {
-        // Define a mandatory integer property with units and runtime configurability
-        add_property("threshold", m_threshold)
-            .units("dB")
-            .configurability(composite::properties::config_type::RUNTIME);
+The REST control plane always writes in **RUNTIME** context, so only `RUNTIME` properties/fields are
+wire-writable on a live component.
 
-        // Define an optional string property (m_api_key is std::optional<std::string>)
-        // Default configurability is INITIALIZE, no units specified
-        add_property("api_key", m_api_key);
+### (a) Per-property: `add_property`
 
-        // Define a property that can only be set at initialization (default behavior)
-        add_property("buffer_size", m_buffer_size).units("elements");
-    }
-
-    // ... process() and other methods ...
-
-private:
-    // Member variables for properties
-    int32_t m_threshold{};
-    std::optional<std::string> m_api_key{}; // Initially no value
-    uint32_t m_buffer_size{1024};
-};
-```
-
-#### Key aspects of property definition:
-
-- **Type System**: The system automatically deduces the property type from the member variable's C++ type
-  (e.g., `int` becomes `"int32"`, `float` becomes `"float"`, `std::string` becomes `"string"`).
-  - `std::optional<T>` is supported for properties that may not always have a value. Its type will be represented as `"<type>?"`
-    (e.g., `std::optional<int>` corresponds to type string `"int32?"`).
-- **Fluent Configuration**: `add_property()` returns a reference that allows for chained calls to set metadata:
-  - `.units(std::string_view)`: Specifies units for the property (e.g., "ms", "items", "percent"). This is for informational purposes.
-  - `.configurability(composite::properties::config_type)`: Defines when the property can be changed:
-    - `composite::properties::config_type::INITIALIZE` (default): The property can only be set during initialization configuration of values from JSON file.
-    - `composite::properties::config_type::RUNTIME`: The property can be modified while the component is running.
-- **Reference Binding**: Properties are registered by passing a reference to the component's member variable.
-  The `property_set` directly reads and modifies this memory location when getting or setting property values.
-
-### List Properties
-
-For properties that represent collections of values, simply use `add_property()` with a `std::vector<T>`. List properties support indexing, appending, and clearing operations.
+`add_property(name, member_ref, configurability = INITIALIZE)` binds a member and returns a
+`typed_property<T>&` for fluent configuration:
 
 ```cpp
-#include <composite/composite.hpp>
-#include <vector>
-
-class MyComponentWithList : public composite::component {
-public:
-    explicit MyComponentWithList(std::string_view id) : composite::component(id) {
-        // Define a list property - just pass the vector member
-        add_property("thresholds", m_thresholds)
-            .configurability(composite::properties::config_type::RUNTIME);
-
-        // Add an indexed change listener for validation
-        add_property_change_listener("thresholds",
-            [this](std::size_t index) -> bool {
-                // Validate the value at the specified index
-                if (m_thresholds[index] < 0.0f || m_thresholds[index] > 100.0f) {
-                    logger()->warn("Threshold at index {} is out of range", index);
-                    return false; // Reject change
-                }
-                return true; // Accept change
-            });
-    }
-    // ... other methods and members ...
-private:
-    std::vector<float> m_thresholds{};
-};
-```
-
-**Accessing List Items in JSON:**
-- Replace entire list: `"thresholds": ["10.5", "20.0", "30.5"]`
-- Modify specific item: `"thresholds[0]": "15.0"`
-- Append new item: `"thresholds[]": "40.0"`
-
-### Structured Properties
-
-For more complex configurations, properties can be grouped into structures. This allows for namespaced properties
-(e.g., `"network.host"`, `"network.port"`) and better organization.
-
-To use a struct as a property, you must specialize `composite::properties::property_traits<T>` for your struct type:
-
-```cpp
-#include <composite/composite.hpp>
-#include <string>
-
-struct NetworkConfig {
-    std::string host{"localhost"};
-    uint16_t port{8080};
-    std::optional<std::string> protocol{};
-};
-
-// Specialize property_traits to register struct fields
-template<>
-struct composite::properties::property_traits<NetworkConfig> {
-    static constexpr std::string_view type_name = "network_config";
-    static void register_fields(composite::properties::property_set& ps, NetworkConfig& cfg) {
-        using composite::properties::config_type;
-        ps.add("host", cfg.host, config_type::RUNTIME);
-        ps.add("port", cfg.port);  // Default: INITIALIZE
-        ps.add("protocol", cfg.protocol);  // Optional property
-    }
-};
-
-class MyComponentWithStructProp : public composite::component {
-public:
-    explicit MyComponentWithStructProp(std::string_view id) : composite::component(id) {
-        // Simply add the struct as a property - fields are registered via property_traits
-        add_property("network", m_net_config, composite::properties::config_type::RUNTIME);
-    }
-    // ... other methods and members ...
-private:
-    NetworkConfig m_net_config;
-};
-```
-
-**Accessing Struct Fields in JSON:**
-- Set individual field: `"network.host": "192.168.1.1"`
-- Set multiple fields: `"network": {"host": "192.168.1.1", "port": "9000"}`
-
-### List-of-Structs Properties
-
-For advanced use cases, you can combine lists and structures. This creates a vector of structured objects.
-Like struct properties, you must specialize `property_traits` for the element type:
-
-```cpp
-#include <composite/composite.hpp>
-#include <vector>
-
-struct Connection {
-    std::string host{"localhost"};
-    uint16_t port{8080};
-};
-
-// Specialize property_traits for the struct type
-template<>
-struct composite::properties::property_traits<Connection> {
-    static constexpr std::string_view type_name = "connection";
-    static void register_fields(composite::properties::property_set& ps, Connection& conn) {
-        using composite::properties::config_type;
-        ps.add("host", conn.host, config_type::RUNTIME);
-        ps.add("port", conn.port, config_type::RUNTIME);
-    }
-};
-
-class MyComponentWithStructList : public composite::component {
-public:
-    explicit MyComponentWithStructList(std::string_view id) : composite::component(id) {
-        // Add the vector as a property - element fields are registered via property_traits
-        add_property("connections", m_connections, composite::properties::config_type::RUNTIME);
-
-        // Indexed change listener receives the index of modified/added item
-        add_property_change_listener("connections",
-            [this](std::size_t index) -> bool {
-                auto& conn = m_connections[index];
-                if (conn.port == 0) {
-                    logger()->error("Invalid port 0 at index {}", index);
-                    return false;
-                }
-                logger()->info("Connection {} validated: {}:{}", index, conn.host, conn.port);
-                return true;
-            });
-    }
-    // ... other methods and members ...
-private:
-    std::vector<Connection> m_connections{};
-};
-```
-
-**Accessing List-of-Structs in JSON:**
-- Replace entire list: `"connections": [{"host": "server1", "port": "8080"}, {"host": "server2", "port": "8081"}]`
-- Append new struct: `"connections[]": {"host": "server3", "port": "8082"}`
-- Modify field in item: `"connections[0].host": "new-server1"`
-
-### Setting and Retrieving Property Values
-
-While properties are defined within the component, their values are typically set externally (e.g., from a configuration file or via REST APIs).
-The `component` base class provides a `set_properties()` method that accepts a list of string-based key-value pairs. This method handles:
-
-- Resolving property names, including structured paths like `"network.port"`
-- Performing type conversion from the input string to the target property's actual C++ type
-- Validating changes against the property's configurability rules (INITIALIZE vs RUNTIME)
-- Invoking registered change listeners (see below)
-
-### Handling Property Changes
-
-Components can react to changes in their properties in two main ways:
-
-1. **Change Listeners**: A specific callback function can be attached to an individual property using the `property`'s `change_listener()` method.
-   This callback is invoked by `set_property` *before* the property is finalized but *after* the member variable has been tentatively
-   updated. If the callback returns `false`, the change is rejected, and the property value is reverted to its previous state.
-   For struct and list properties, parent/list listeners also fire when nested fields change (e.g., `"network.host"` or `"connections[0].host"`).
-
-   ```cpp
-   // Use the change_listener() method to add a callback
-   // Assume m_threshold is an int32_t member variable
-   add_property("threshold", m_threshold)
-       .units("percentage")
-       .configurability(composite::properties::config_type::RUNTIME)
-       .change_listener([this]() {
-           // Inside the listener, m_threshold already holds the new, proposed value
-           if (m_threshold < 0 || m_threshold > 100) {
-               logger()->warn("Proposed threshold {} is out of range [0, 100]. Change will be rejected.", m_threshold);
-               // Returning false will cause property_set to revert m_threshold to its previous value
-               return false; // Reject change
-           }
-           logger()->info("Threshold will be changed to: {}. Change accepted.", m_threshold);
-           // Perform any immediate actions needed due to this specific change
-           // For example: self->reconfigure_threshold_dependent_logic();
-           return true; // Accept change
-       });
-   ```
-
-   For **list properties**, change listeners receive the index of the modified/added/removed item. Struct list field updates also notify the list listener:
-   ```cpp
-   add_property_change_listener("thresholds",
-       [this](std::size_t index) -> bool {
-           // Validate the item at the specified index
-           if (m_thresholds[index] < 0.0f) {
-               return false; // Reject
-           }
-           logger()->info("Item {} updated to {}", index, m_thresholds[index]);
-           return true; // Accept
-       });
-   ```
-
-   **Contextual Change Listeners**: For more advanced use cases, listeners can receive a `change_type` parameter indicating what kind of change occurred:
-
-   - `change_type::SET` - A new value was set (e.g., optional property set from `nullopt`, or list item appended)
-   - `change_type::MODIFY` - An existing value was modified
-   - `change_type::RESET` - Value was reset (e.g., optional set to `nullopt`, list item deleted, or scalar reset to default)
-
-   ```cpp
-   // Contextual listener for optional properties - know if value is being set, modified, or cleared
-   add_property_change_listener("timeout",
-       [this](composite::properties::change_type ctx) -> bool {
-           using composite::properties::change_type;
-           if (ctx == change_type::SET) {
-               logger()->info("Timeout configured for the first time: {}", *m_timeout);
-           } else if (ctx == change_type::MODIFY) {
-               logger()->info("Timeout changed to: {}", *m_timeout);
-           } else if (ctx == change_type::RESET) {
-               logger()->info("Timeout cleared, will use default behavior");
-           }
-           return true;
-       });
-
-   // Contextual indexed listener for lists - know if item was added, modified, or removed
-   add_property_change_listener("connections",
-       [this](std::size_t index, composite::properties::change_type ctx) -> bool {
-           using composite::properties::change_type;
-           if (ctx == change_type::SET) {
-               logger()->info("New connection added at index {}", index);
-           } else if (ctx == change_type::MODIFY) {
-               logger()->info("Connection {} updated: host={}", index, m_connections[index].host);
-           } else if (ctx == change_type::RESET) {
-               logger()->info("Connection at index {} removed", index);
-           }
-           return true;
-       });
-   ```
-
-   Contextual listeners are backward compatible - if you register a simple listener (without `change_type`), it will still work. The system falls back to the simple listener if no contextual listener is registered.
-
-2. **`property_change_handler()`**: The `component` class provides a `virtual void property_change_handler()` method. This method is called
-   once at the end of a successful `set_properties()` call, after all specified properties have been updated and their individual change listeners
-   (if any) have approved the changes. Subclasses can override this method to perform more complex or coordinated reconfigurations based on the
-   new overall state of multiple properties.
-
-   ```cpp
-   // In MyComponent class
-   void property_change_handler() override {
-       // This method is called after one or more properties have been successfully updated.
-       logger()->info("Properties updated. Component will reconfigure based on new state.");
-       // Example: if m_buffer_size or other related properties changed, reallocate buffers or update internal structures.
-       // this->reinitialize_buffers_if_needed();
-       // this->update_processing_parameters();
-   }
-   ```
-
-### Runtime Property Control via REST API
-
-The **composite-cli** application provides a REST API for runtime property inspection and modification. The server runs on `localhost:5000` by default
-(configurable via `--server` and `--port` command-line arguments).
-
-**Key Endpoints:**
-
-- `GET /app` - Get full application state including all components and properties
-- `GET /app/components/:id` - Get specific component state
-- `PATCH /app/components/:id` - Update multiple properties atomically
-- `GET /app/components/:id/properties` - List all properties for a component
-- `GET /app/components/:id/properties/:name` - Get specific property value and metadata
-- `PUT /app/components/:id/properties/:name` - Update a scalar property
-- `DELETE /app/components/:id/properties/:name` - Reset property to default (null)
-
-**List Property Operations:**
-
-- `GET /app/components/:id/properties/:name/items` - Get all list items
-- `GET /app/components/:id/properties/:name/items/:index` - Get specific list item
-- `POST /app/components/:id/properties/:name/items` - Append new item to list
-- `PUT /app/components/:id/properties/:name/items/:index` - Update specific list item
-- `DELETE /app/components/:id/properties/:name/items/:index` - Remove list item
-
-**Struct Property Operations:**
-
-- `GET /app/components/:id/properties/:name/fields` - Get all struct fields
-- `GET /app/components/:id/properties/:name/fields/:field` - Get specific field value
-- `PATCH /app/components/:id/properties/:name/fields/:field` - Update specific field
-
-**Port Connection Operations:**
-
-- `GET /app/components/:id/ports` - List all ports for a component with connection status
-  - Returns port name, type (input/output), connection state, count, and connected port names
-- `GET /app/components/:id/ports/:port_name` - Get detailed information for a specific port
-- `POST /app/connections` - Create a new connection between component ports
-  - Request body: `{"output": {"component": "source_id", "port": "port_name"}, "input": {"component": "target_id", "port": "port_name"}}`
-  - Returns 201 Created with connection details on success
-- `DELETE /app/components/:id/ports/:port_name/connections` - Disconnect all connections from a port
-  - Returns the number of connections that were disconnected
-- `DELETE /app/connections` - Disconnect a specific connection between two ports
-  - Request body: `{"output": {"component": "source_id", "port": "port_name"}, "input": {"component": "target_id", "port": "port_name"}}`
-  - Mirrors the POST format for symmetric create/delete operations
-  - Returns 200 OK with connection details on success
-
-**Example REST API Usage:**
-
-```bash
-# Get all properties for a component
-curl http://localhost:5000/app/components/my_component/properties
-
-# Update a single scalar property
-curl -X PUT http://localhost:5000/app/components/my_component/properties/threshold \
-  -H "Content-Type: application/json" \
-  -d '{"value": "75.5"}'
-
-# Update multiple properties atomically (single lock, single property_change_handler call)
-curl -X PATCH http://localhost:5000/app/components/my_component \
-  -H "Content-Type: application/json" \
-  -d '{"properties": {"threshold": "75.5", "enabled": "true"}}'
-
-# Replace entire list property
-curl -X PATCH http://localhost:5000/app/components/my_component \
-  -H "Content-Type: application/json" \
-  -d '{"properties": {"thresholds": ["10.0", "20.0", "30.0"]}}'
-
-# Append item to list property
-curl -X POST http://localhost:5000/app/components/my_component/properties/thresholds/items \
-  -H "Content-Type: application/json" \
-  -d '{"value": "40.0"}'
-
-# Update struct field
-curl -X PATCH http://localhost:5000/app/components/my_component/properties/network/fields/host \
-  -H "Content-Type: application/json" \
-  -d '{"value": "192.168.1.100"}'
-
-# Batch update list-of-structs (clears list first, then adds both items)
-curl -X PATCH http://localhost:5000/app/components/my_component \
-  -H "Content-Type: application/json" \
-  -d '{"properties": {"connections": [
-    {"host": "server1", "port": "8080"},
-    {"host": "server2", "port": "8081"}
-  ]}}'
-
-# Get all ports for a component with connection status
-curl http://localhost:5000/app/components/source/ports
-
-# Get detailed information for a specific port
-curl http://localhost:5000/app/components/source/ports/data_out
-
-# Create a new connection between components
-curl -X POST http://localhost:5000/app/connections \
-  -H "Content-Type: application/json" \
-  -d '{"output": {"component": "source", "port": "data_out"}, "input": {"component": "sink", "port": "data_in"}}'
-
-# Disconnect all connections from a port
-curl -X DELETE http://localhost:5000/app/components/source/ports/data_out/connections
-
-# Disconnect a specific connection (mirrors POST format)
-curl -X DELETE http://localhost:5000/app/connections \
-  -H "Content-Type: application/json" \
-  -d '{"output": {"component": "source", "port": "data_out"}, "input": {"component": "sink", "port": "data_in"}}'
-```
-
-**Notes on REST API Behavior:**
-
-- Only properties marked with `config_type::RUNTIME` can be modified via REST API
-- PATCH requests are **atomic with rollback** - all properties updated under a single mutex lock:
-  - If any property update fails (validation error, type conversion error, or change listener rejection), all previously applied changes in that batch are automatically rolled back
-  - Either all properties are updated successfully, or none are modified
-  - This ensures consistent state even when updating multiple related properties
-- `property_change_handler()` is called once after all property changes validated and applied
-- For list properties, each individual POST creates a separate update (multiple handler calls)
-- PATCH with array replaces entire list (clears first, then adds items) - single handler call
-- **List deletions in batch updates**: Removing list items (setting indexed items to null) is not supported within multi-property batch updates due to rollback complexity. Use single-property DELETE requests instead.
-- Struct-list item updates via `PUT /items/:index` are applied atomically as a single change (one list listener notification).
-- Error responses include detailed information about validation failures
-
-## Metrics
-
-The **composite** framework includes a lightweight, high-performance metrics system for observability. Metrics are **always available** regardless of build options, with optional OpenTelemetry export when built with `-DCOMPOSITE_USE_OPENTELEMETRY=ON`.
-
-### Design Principles
-
-- **Minimal overhead**: Metrics use relaxed atomic operations
-- **Cache-line aligned**: No false sharing between metrics updated by different threads
-- **No allocations in hot path**: All allocations happen during metric registration
-- **Always-on**: Metrics work without OpenTelemetry; OTel is just one export mechanism
-- **Multiple export options**: REST API, Server-Sent Events (SSE) streaming, and OTLP
-
-### Metric Types
-
-| Type | Use Case | Operations |
-|------|----------|------------|
-| `counter<T>` | Monotonic totals (packets, bytes) | `inc()`, `add()`, `++`, `+=` |
-| `updown_counter<T>` | Non-monotonic sums (queue depth) | `inc()`, `dec()`, `add()`, `++`, `--`, `+=`, `-=` |
-| `gauge<T>` | Point-in-time values (CPU %) | `set()`, `=` |
-| `histogram` | Distributions (latencies) | `record()` |
-
-### Using Metrics in Components
-
-The `component` base class provides convenience methods for creating metrics. These methods automatically:
-- Namespace metric names with the component ID (e.g., `"packets_sent"` becomes `"my_component.packets_sent"`)
-- Add a `component_id` label to all metrics
-
-```cpp
-#include <composite/composite.hpp>
-
 class MyComponent : public composite::component {
 public:
     explicit MyComponent(std::string_view id) : composite::component(id) {
-        // Register metrics at construction (NOT hot path)
-        // Names are auto-prefixed with component ID, labels auto-include component_id
-        m_packets = &create_counter(
-            "packets_processed",           // becomes "{id}.packets_processed"
-            "Total packets processed",
-            "1"                            // unit
-        );
+        using enum composite::properties::config_type;
 
-        m_queue_depth = &create_updown_counter(
-            "queue_depth",
-            "Current queue depth"
-        );
+        add_property("threshold", m_threshold, RUNTIME)
+            .units("dB")
+            .validate([](const std::int32_t& v) { return v >= 0 && v <= 100; },
+                      "threshold must be in [0, 100]")
+            .on_change([this](const composite::properties::json& /*diff*/) {
+                logger()->info("threshold is now {}", m_threshold);
+            });
 
-        m_processing_time = &create_histogram_pow2(
-            "processing_time_ns",
-            "Processing time distribution",
-            "ns",
-            20  // 20 power-of-2 buckets covering 0 to ~500K
-        );
-
-        // Additional labels can be passed as the last parameter
-        m_bytes = &create_counter(
-            "bytes_processed",
-            "Total bytes processed",
-            "bytes",
-            {{"port", "eth0"}}  // Additional labels (component_id auto-added)
-        );
+        add_property("api_key", m_api_key);          // std::optional<std::string>, INITIALIZE-only
     }
-
-    auto process() -> composite::retval override {
-        auto start = std::chrono::steady_clock::now();
-
-        // Hot path - just atomic operations, minimal overhead
-        ++(*m_packets);                    // Increment counter
-        *m_queue_depth += 5;               // Adjust queue depth
-        --(*m_queue_depth);
-
-        // ... process data ...
-
-        // Record processing time
-        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        m_processing_time->record(static_cast<double>(elapsed_ns));
-
-        return composite::retval::NORMAL;
-    }
-
 private:
-    metrics::counter<uint64_t>* m_packets{};
-    metrics::counter<uint64_t>* m_bytes{};
-    metrics::updown_counter<int64_t>* m_queue_depth{};
-    metrics::histogram* m_processing_time{};
+    std::int32_t m_threshold{};
+    std::optional<std::string> m_api_key{};
 };
 ```
 
-**Available Methods:**
-- `create_counter(name, description, unit, labels)` → `metrics::counter<uint64_t>&`
-- `create_updown_counter(name, description, unit, labels)` → `metrics::updown_counter<int64_t>&`
-- `create_gauge(name, description, unit, labels)` → `metrics::gauge<double>&`
-- `create_histogram(name, description, unit, boundaries, labels)` → `metrics::histogram&`
-- `create_histogram_pow2(name, description, unit, num_buckets, labels)` → `metrics::histogram&`
+- **`.validate(fn)` / `.validate(fn, "reason")`** — the validator runs on a *candidate* value before
+  the live member is touched. Returning `false` rejects the write (nothing mutates); the optional
+  reason is surfaced in the error. The member already holds the candidate value inside the validator.
+- **`.on_change(fn)`** — a post-commit listener receiving the property's own JSON diff. A throwing
+  listener is logged as a warning (success-with-warnings), not turned into an error — the value is
+  already live.
+- **`.units("...")`** — an informational unit string for schema/introspection.
+- `T` may be a scalar, `bool`, `std::string`, an enum (declared with `COMPOSITE_ENUM`),
+  `std::optional<T>`, `std::vector<T>`, or a reflected struct. The type is deduced from the member.
 
-**Histogram Variants:**
-- `create_histogram` - Custom bucket boundaries (e.g., `{0.1, 0.5, 1.0, 5.0, 10.0}`)
-- `create_histogram_pow2` - Power-of-2 boundaries (1, 2, 4, 8, 16...) with O(1) bucket lookup via bit operations. Ideal for latency measurements spanning multiple orders of magnitude. Default: 20 buckets covering 1 to 524,288.
+### (b) Whole-struct: `config<T>` + `COMPOSITE_FIELDS`
 
-### Metrics REST API
+Group related fields into one reflected struct. Each field is projected as a top-level property (the
+wire format is unchanged), but the **whole struct is the validate/commit unit**, and you read fields
+through a zero-overhead `operator->`.
 
-The framework exposes metrics via REST endpoints:
+```cpp
+struct AmpConfig {
+    double      gain{1.0};
+    std::uint32_t fft_size{1024};
+    std::string window{"hann"};
 
-**GET /app/metrics** - Get snapshot of all metrics
-```bash
-curl http://localhost:5000/app/metrics
+    COMPOSITE_FIELDS(AmpConfig,
+        (gain,     runtime, range(0.0, 10.0), unit("dB"), doc("output gain")),
+        (fft_size, runtime, power_of_two, range(64, 65536)),
+        (window,   runtime, one_of("hann", "hamming", "blackman_harris")));
+};
+
+class Amp : public composite::component {
+public:
+    explicit Amp(std::string_view id) : composite::component(id) {
+        // Set whole-struct invariants and the reaction BEFORE add_config():
+        m_cfg.validate([](const AmpConfig& c) { return c.fft_size >= 64; }, "fft_size too small");
+        m_cfg.on_apply([this](const AmpConfig& prev, const composite::changes<AmpConfig>& ch) {
+            if (ch.changed(&AmpConfig::fft_size)) { rebuild_window(); }   // runs at worker loop-top
+        });
+        add_config(m_cfg);                 // baseline INITIALIZE; per-field `runtime` opts in
+    }
+
+    auto process() -> composite::retval override {
+        const double g = m_cfg->gain;      // zero-overhead live read
+        // ...
+        return composite::retval::NORMAL;
+    }
+private:
+    composite::config<AmpConfig> m_cfg;
+    void rebuild_window();
+};
 ```
 
-Response:
-```json
-{
-  "timestamp": "2025-01-15T12:34:56Z",
-  "count": 3,
-  "metrics": [
-    {
-      "name": "my_component.packets_processed",
-      "type": "counter",
-      "value": 12345,
-      "unit": "1",
-      "labels": {"component_id": "processor1"},
-      "description": "Total packets processed"
-    }
-  ]
+Per-field attributes (inside the `COMPOSITE_FIELDS(...)` parentheses): `runtime` (makes that field
+RUNTIME-configurable), `range(lo, hi)`, `unit("...")`, `doc("...")`, `power_of_two`,
+`one_of("a", "b", ...)`. An attribute on an incompatible field type is a **compile error**.
+
+The reaction `on_apply(prev, changes<T>)` queries what changed: `ch.changed(&T::field)` (the member
+pointer is compile-checked) and `ch.new_value(&T::field)` (the committed value, or `nullopt` if
+unchanged). **Important:** `on_apply` does **not** run on the writer's thread — it is staged and runs
+at the **worker loop-top** (the same thread as `process()`), so derived state is rebuilt safely before
+the next `process()`. When there is no live worker (initialization, a stopped component, a source with
+no loop), it runs inline. Do not assume the reaction has already executed when a `set_properties` /
+PATCH returns on a running component.
+
+> `COMPOSITE_STRUCT(T, ...)` is the simpler reflection macro (no per-field attributes). Use
+> `COMPOSITE_FIELDS_EXTERN` in the type's namespace for a struct you can't edit. Apply exactly one
+> reflection macro per type.
+
+### (c) Keyed collections: `add_keyed`
+
+`add_keyed(name, std::map<std::string, E>& member, configurability = INITIALIZE)` registers a map of
+reflected structs, addressed as nested JSON under the property name. It extends RFC-7396 over the map:
+a key set to `null` erases it, a key set to an object upserts/merges, and a top-level `null` clears the
+whole map.
+
+### Setting values, merge semantics, and reactions
+
+`set_properties(const json& values, config_type = INITIALIZE, bool allow_unknown = false)` applies a
+batch of values. It is **native JSON in** (not strings), **validate-all-then-commit-all** per
+component (a rejected value aborts the batch and nothing is committed — there is no post-commit
+rollback), and runs under a worker park so `process()` never observes a half-applied state.
+
+Writes follow **RFC-7396 JSON Merge Patch**: a nested object merges, an array or scalar replaces
+wholesale, and **`null` resets a field to its registered default** (re-running the member's
+initializer — not zero). Unknown fields are rejected with a "did you mean" hint.
+
+A component can react to a completed batch by overriding:
+
+```cpp
+auto property_change_handler(const composite::properties::json& diff) -> void override {
+    // `diff` is the aggregate {property: sub-diff} of everything that changed this batch.
+    if (diff.contains("threshold")) { /* react narrowly */ }
 }
 ```
 
-**Query Parameters:**
-- `?prefix=my_component` - Filter by metric name prefix
-- `?label_key=component_id&label_value=processor1` - Filter by label
+(The no-argument `property_change_handler()` is deprecated; prefer the `diff` form. For `config<T>`,
+prefer `on_apply` over this hook.)
 
-**GET /app/metrics/stream** - Server-Sent Events stream for real-time metrics
+### Runtime Property Control via REST API
+
+`composite-cli` serves a REST control plane (default `localhost:5000`; configure with `--server` /
+`--port`). All routes are under `/app`. Values are **native JSON** — `2.5`, `true`, `"hann"` — not
+stringified.
+
+**Application & components**
+
+| Method & path | Description |
+|---|---|
+| `GET /app/healthz` | Liveness — always returns `200`. |
+| `GET /app/openapi.json` | OpenAPI 3.1 description of this control plane (for client/UI generation). |
+| `GET /app` | Full application graph: `{ name, components, connections }`. |
+| `POST /app/start` | Start (reconcile to desired-`enabled`) every component. |
+| `POST /app/stop` | Stop every component's worker (the server keeps running). |
+| `GET /app/components` | Array of component documents. |
+| `POST /app/components` | Create + add a component at runtime (`{library, id, properties?}`). `201` on success; `409` on duplicate id. |
+| `GET /app/components/:id` | One component document (`404` if unknown). |
+| `DELETE /app/components/:id` | Stop, disconnect, and unload a component (`404` if unknown). |
+| `PATCH /app/components/:id` | Set a batch of `{ "properties": { ... } }` on one component (atomic per component). |
+| `PATCH /app/components` | Multi-component batch `{ "components": [ { id, properties }, ... ] }`. Per-component atomic but **not** transactional across components — returns **`207 Multi-Status`** if any component fails, with a per-component `results` array. |
+
+**Properties**
+
+| Method & path | Description |
+|---|---|
+| `GET /app/components/:id/schema` | JSON Schema of the component's properties (types, defaults, units, ranges, enum choices) — drives auto-generated config UIs. |
+| `GET /app/components/:id/properties` | Full property state. |
+| `GET /app/components/:id/properties/:name` | One property value. |
+| `PUT` or `PATCH /app/components/:id/properties/:name` | Set/merge one property. Body is the raw JSON value, or `{ "value": ... }`. |
+| `DELETE /app/components/:id/properties/:name` | Reset to the registered default (RFC-7396 `null`). |
+
+To mutate an element of a list/struct/keyed property, `PATCH` the whole property with a partial JSON
+object or array (`null` resets/erases). There are **no** `/items` or `/fields` sub-routes.
+
+**Ports & connections**
+
+| Method & path | Description |
+|---|---|
+| `GET /app/components/:id/ports` | List ports with connection status. |
+| `GET /app/components/:id/ports/:port_name` | One port's details. |
+| `POST /app/connections` | Create a connection (`{output:{component,port}, input:{component,port}}`). `201` on success. |
+| `DELETE /app/connections` | Remove a specific connection (same body shape as POST). |
+| `DELETE /app/components/:id/ports/:port_name/connections` | Disconnect all of a port's connections. |
+
+**Status codes & limits.** `201` on create; `207` on a partially-failed multi-component batch;
+`403` for a write to a non-runtime property (`config_violation`); `404` for an unknown property or
+component; `400` for a validation/decoding error; `409` for a duplicate component id; `500` otherwise.
+Request bodies are capped at 8 MiB; CORS is `*`. Only `RUNTIME` properties are writable over REST.
+
 ```bash
-curl http://localhost:5000/app/metrics/stream
+# Inspect
+curl -s http://localhost:5000/app/healthz
+curl -s http://localhost:5000/app/components/my_component/properties
+
+# Set one property (raw value, or {"value": ...} — both accepted) — note: native JSON, not strings
+curl -s -X PUT http://localhost:5000/app/components/my_component/properties/threshold \
+  -H 'Content-Type: application/json' -d '75.5'
+
+# Reset a property to its default
+curl -s -X DELETE http://localhost:5000/app/components/my_component/properties/threshold
+
+# Update several properties on one component atomically
+curl -s -X PATCH http://localhost:5000/app/components/my_component \
+  -H 'Content-Type: application/json' \
+  -d '{"properties": {"threshold": 75.5, "enabled": true}}'
+
+# Multi-component batch (may return 207 Multi-Status with a per-component results array)
+curl -s -X PATCH http://localhost:5000/app/components \
+  -H 'Content-Type: application/json' \
+  -d '{"components": [{"id":"src","properties":{"rate":500}},
+                      {"id":"snk","properties":{"gain":2}}]}'
+
+# Connect two ports (201 Created)
+curl -s -X POST http://localhost:5000/app/connections \
+  -H 'Content-Type: application/json' \
+  -d '{"output": {"component": "src", "port": "data_out"},
+       "input":  {"component": "snk", "port": "data_in"}}'
 ```
 
-**SSE Query Parameters:**
-- `?interval=1000` - Push interval in ms (default 1000, min 100, max 60000)
-- `?prefix=my_component` - Filter by metric name prefix
-- `?label_key=component_id&label_value=processor1` - Filter by label
+A TLS build (`-DCOMPOSITE_USE_OPENSSL=ON`) requires client cert/key at launch and `https://`:
+
+```bash
+composite-cli app.json -c client.crt -k client.key -a ca.crt
+curl --cert client.crt --key client.key --cacert ca.crt https://localhost:5000/app/healthz
+```
+
+## Metrics
+
+The framework includes a lock-free metrics registry for observability, always available and
+independent of build options (OpenTelemetry is one optional export path).
+
+### Model: label-only
+
+Metric **names are global and used verbatim** — they are **not** prefixed with the component id.
+A component's identity is carried in an automatically-added **`component_id` label**, so several
+components can share a metric name (e.g. `packets_sent`) and be told apart by label. A metric's
+identity is its name plus its (order-independent) label set. On component destruction, the framework
+removes that component's metrics by label.
+
+> The only dotted metric names are the framework's own lifecycle metrics
+> (`composite.component.process_calls`, `noop_count`, `process_time`, `state`).
+
+### Metric types
+
+| Type | Use | Operations |
+|------|-----|-----------|
+| `counter<uint64_t>` | monotonic totals | `inc()`, `add()`, `++`, `+=` |
+| `updown_counter<int64_t>` | non-monotonic sums | `inc()`, `dec()`, `add()`, `++`, `--`, `+=`, `-=` |
+| `gauge<double>` | point-in-time values | `set()`, `=` |
+| `histogram` | distributions | `record()` |
+
+All instances are cache-line aligned (no false sharing) and use relaxed atomics — recording is
+allocation-free and safe to call concurrently. (`histogram::reset()` is not safe against concurrent
+`record()`.)
+
+### Using metrics in a component
+
+Register at construction (not on the hot path); cache the returned reference; record in `process()`:
+
+```cpp
+class MyComponent : public composite::component {
+public:
+    explicit MyComponent(std::string_view id) : composite::component(id) {
+        // Name is used verbatim; a {"component_id", id} label is added automatically.
+        m_packets = &create_counter("packets_processed", "Total packets processed", "1");
+        m_latency = &create_histogram_pow2("processing_time_ns", "Processing time", "ns", 20);
+        // Extra labels may be passed as the last argument: create_counter(..., {{"port","eth0"}});
+    }
+
+    auto process() -> composite::retval override {
+        const auto start = std::chrono::steady_clock::now();
+        // ... process ...
+        ++(*m_packets);
+        m_latency->record(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        return composite::retval::NORMAL;
+    }
+private:
+    composite::metrics::counter<std::uint64_t>* m_packets{};
+    composite::metrics::histogram* m_latency{};
+};
+```
+
+Convenience methods on `component`: `create_counter`, `create_updown_counter`, `create_gauge`,
+`create_histogram(name, desc, unit, boundaries, labels)`, and
+`create_histogram_pow2(name, desc, unit, num_buckets, labels)`.
+
+`create_histogram_pow2` pre-computes power-of-two boundaries (1, 2, 4, …, `2^(num_buckets-2)`);
+`num_buckets` is in `[2, 64]` (default 20 → top boundary `2^18 = 262144`). Bucket lookup is the same
+O(log n) binary search as any histogram — the powers of two are just convenient boundaries.
+
+### Metrics REST API
+
+```bash
+# Snapshot of all metrics (optionally filtered)
+curl -s "http://localhost:5000/app/metrics"
+curl -s "http://localhost:5000/app/metrics?prefix=composite.component"
+curl -s "http://localhost:5000/app/metrics?label_key=component_id&label_value=processor1"
+
+# Server-Sent Events stream (interval ms in [100, 60000], default 1000; max 8 concurrent streams)
+curl -N "http://localhost:5000/app/metrics/stream?interval=2000"
+```
+
+Each metric serializes as `{ name, description, unit, type, labels, value, timestamp }` (timestamps
+are ISO-8601 UTC). For a histogram, `value` is `{ count, sum, boundaries, bucket_counts }`. The
+envelope is `{ timestamp, metrics: [...], count }`.
+
+### Registry query API
+
+```cpp
+auto& registry = composite::metrics::registry::instance();
+auto all  = registry.snapshot_all();
+auto some = registry.snapshot_by_prefix("composite.component.");
+auto byl  = registry.snapshot_by_label("component_id", "processor1");
+auto n    = registry.metric_count();
+```
 
 ### OpenTelemetry Export
 
-When built with `-DCOMPOSITE_USE_OPENTELEMETRY=ON`, metrics can be exported via OTLP to collectors like Grafana Agent, Jaeger, or the OpenTelemetry Collector.
+Built with `-DCOMPOSITE_USE_OPENTELEMETRY=ON`, metrics can be pushed via OTLP. Configure under a
+`telemetry` key in the application JSON:
 
-**JSON Configuration:**
 ```json
 {
   "telemetry": {
     "enabled": true,
     "service_name": "my_streaming_app",
-    "service_version": "1.0.0",
     "export_interval": 10000,
-    "exporter": {
-      "endpoint": "http://otel-collector:4318",
-      "protocol": "http/protobuf",
-      "timeout": 10000,
-      "headers": "Authorization=Bearer token"
-    }
+    "exporter": { "endpoint": "http://otel-collector:4318", "protocol": "http/protobuf" }
   }
 }
 ```
 
-**Exporter Protocol:**
-- `http/protobuf` (default) - Binary protobuf encoding, most efficient
-- `http/json` - JSON encoding, useful for debugging
-- `grpc` - Auto-converted to `http/protobuf` with endpoint port 4317→4318
-
-**Environment Variable Fallbacks:**
-- `OTEL_SERVICE_NAME` → `service_name`
-- `OTEL_EXPORTER_OTLP_ENDPOINT` → `exporter.endpoint`
-- `OTEL_EXPORTER_OTLP_PROTOCOL` → `exporter.protocol`
-- `OTEL_EXPORTER_OTLP_TIMEOUT` → `exporter.timeout`
-- `OTEL_EXPORTER_OTLP_HEADERS` → `exporter.headers`
-- `OTEL_METRIC_EXPORT_INTERVAL` → `export_interval`
-
-JSON configuration takes precedence over environment variables.
-
-### Registry Query API
-
-For custom monitoring integrations, the registry provides direct query methods:
-
-```cpp
-auto& registry = metrics::registry::instance();
-
-// Get all metrics
-auto all = registry.snapshot_all();
-
-// Filter by name prefix
-auto app_metrics = registry.snapshot_by_prefix("app.");
-
-// Filter by label
-auto port_metrics = registry.snapshot_by_label("port", "eth0");
-
-// Get metric count
-auto count = registry.metric_count();
-```
+`protocol` is `http/protobuf` (default), `http/json`, or `grpc` (auto-mapped to `http/protobuf`,
+port 4317→4318). The standard `OTEL_*` environment variables are honored as fallbacks
+(`OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_METRIC_EXPORT_INTERVAL`); the JSON
+configuration takes precedence.
 
 ## Implementing a Component
 
-To create a new component, developers must implement the required interface functions, ensuring
-compatibility with the **composite** framework. Example:
+A minimal component subclasses `composite::component`, registers its ports and properties in the
+constructor, implements `process()`, and registers a factory. A working, CI-built version of this
+lives in [`examples/passthrough_gain/`](examples/passthrough_gain).
 
 ```cpp
-#include <composite/composite.hpp>
+// component.hpp
+#include <composite/core/component.hpp>
 
-class MyComponent : public composite::component {
+class passthrough_gain : public composite::component {
 public:
-    explicit MyComponent(std::string_view id) : composite::component(id) {
-        // Add ports to port set
-        add_port(&m_in_port);
-        add_port(&m_out_port);
-
-        // Add properties to configure
-        add_property("processing_gain", m_processing_gain)
-            .units("factor")
-            .configurability(composite::properties::config_type::RUNTIME)
-            .change_listener([this]() {
-                logger()->info("Change listener validating new processing_gain value: {}", m_processing_gain);
-                // Add validation logic as needed
-                // ...
-                // return false; // reject change if invalid value
-                return true; // accept change
-            });
-    }
-
-    ~MyComponent() final = default;
-
-    // Implement the pure virtual function defined in composite::component
-    auto process() -> composite::retval override {
-        using enum composite::retval;
-
-        // Get data from an input port (if available)
-        // get_data() returns a tuple: {data_buffer, timestamp, optional_metadata}
-        auto [buffer, ts, metadata] = m_in_port.get_data();
-        if (buffer.size() == 0) {
-            // No data received within the timeout
-            return NOOP; // Indicate no operation was performed, component will sleep briefly
-        }
-
-        // Check if metadata was received with this data packet
-        if (metadata.has_value()) {
-            // Printing metadata for debug purposes
-            logger()->debug("Received metadata with data packet: {}", metadata->to_string());
-
-            // Process metadata as needed
-            // ...
-
-            // Send metadata downstream for follow-on components
-            // Any updated metadata must be sent before the next data packet is sent
-            m_out_port.send_metadata(metadata.value());
-        }
-
-        // User-defined processing logic
-        // Example: Apply gain (actual processing depends on data content)
-        logger()->debug("Processing data (size: {}) with gain: {}", buffer.size(), m_processing_gain);
-
-        // This example modifies the data in-place using mutable_buffer
-        for (std::size_t i = 0; i < buffer.size(); ++i) {
-            buffer[i] *= m_processing_gain;
-        }
-
-        // Send data via an output port (buffer is moved)
-        m_out_port.send_data(std::move(buffer), ts);
-
-        return NORMAL; // indicate normal processing occurred, component will yield
-    }
-
-    auto property_change_handler() -> void override {
-        logger()->info("Properties have been updated. Current gain: {}", m_processing_gain);
-        // Potentially reconfigure aspects of the component based on new property values
-    }
+    explicit passthrough_gain(std::string_view id);
+    ~passthrough_gain() override = default;
+    auto process() -> composite::retval override;
 
 private:
-    // Ports using mutable buffers for in-place processing
-    composite::input_port<composite::mutable_buffer<float>> m_in_port{"data_in"};
-    composite::output_port<composite::mutable_buffer<float>> m_out_port{"data_out"};
+    composite::input_port<composite::mutable_buffer<float>>  m_in{"data_in"};
+    composite::output_port<composite::mutable_buffer<float>> m_out{"data_out"};
+    float m_gain{1.0F};
 
-    // Properties
-    float m_processing_gain{1.0f}; // example property with a default value
-
-}; // class MyComponent
-
-// Export the factory function for dynamic loading
-extern "C" {
-    auto create(std::string_view id) -> std::shared_ptr<composite::component> {
-        return std::make_shared<MyComponent>(id);
-    }
-}
+    // MUST be the last data member: its destructor stops the worker first, while the
+    // members process() touches are still alive (otherwise: destruction-order use-after-free).
+    composite::component::auto_stop m_auto_stop{*this};
+};
 ```
 
-**Factory Function Requirements:**
-- Must be declared `extern "C"` to prevent C++ name mangling
-- Must be named `create`
-- Must accept `std::string_view id` as the first parameter
-- For components that need additional configuration, add a second `std::string_view arg` parameter
-- Must return `std::shared_ptr<composite::component>`
+```cpp
+// component.cpp
+#include "component.hpp"
+#include <composite/core/register.hpp>
+
+passthrough_gain::passthrough_gain(std::string_view id) : composite::component(id) {
+    using enum composite::properties::config_type;
+    add_port(&m_in);
+    add_port(&m_out);
+    add_property("gain", m_gain, RUNTIME)
+        .units("factor")
+        .validate([](const float& g) { return g >= 0.0F; }, "gain must be >= 0");
+}
+
+auto passthrough_gain::process() -> composite::retval {
+    using enum composite::retval;
+
+    auto pkt = m_in.try_get();           // canonical read: nullopt == empty ring
+    if (!pkt) { return NOOP; }           // idle on the doorbell; base auto-FINISHes at end-of-stream
+    auto& [buffer, ts, metadata] = *pkt;
+
+    for (std::size_t i = 0; i < buffer.size(); ++i) { buffer[i] *= m_gain; }
+
+    // Metadata (if any) rides atomically with the packet as the optional third argument.
+    m_out.send_data(std::move(buffer), ts, metadata);
+    return NORMAL;
+}
+
+// Emits the create(id, args) ABI + the composite_abi_version() handshake.
+COMPOSITE_REGISTER_SIMPLE(passthrough_gain)
+```
+
+**Factory registration:**
+- `COMPOSITE_REGISTER_SIMPLE(Class)` — for a component with a `Class(std::string_view id)` constructor
+  and no construction-time discriminator.
+- `COMPOSITE_REGISTER_COMPONENT(factory)` — when the concrete type is chosen at construction:
+  `factory` is any callable `(std::string_view id, const composite::create_args& args) ->
+  std::shared_ptr<composite::component>` that inspects `args.type()` / `args.value<T>("key")` and
+  returns the right instance (throw on an unknown type — the loader turns it into a clean load
+  failure).
+
+Both macros also emit `composite_abi_version()`; never hand-write the `extern "C" create` block.
+
+### Building a component as a loadable module
+
+A component is a CMake `MODULE` library linking the imported `composite::composite` target:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(passthrough_gain LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(composite REQUIRED)
+
+add_library(passthrough_gain MODULE component.cpp)   # -> libpassthrough_gain.so (dlopen'd at runtime)
+target_link_libraries(passthrough_gain PRIVATE composite::composite)
+
+include(GNUInstallDirs)
+install(TARGETS passthrough_gain LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+```
+
+### High-throughput components: `pipeline_component`
+
+For one-in/one-out components that benefit from an internal worker pool with **order-preserving**
+output, derive from `pipeline_component<InBuf, OutBuf>` instead of `component`. It owns the pool and a
+slot ring that re-serializes out-of-order completions back to submission order; `process()` is `final`.
+Override three hooks instead:
+
+- `prepare(metadata&)` — main thread, arrival order (e.g. stamp annotations).
+- `work(InBuf in, timestamp ts, const metadata& md) -> OutBuf` — runs concurrently on the pool.
+- `finalize(OutBuf& out, timestamp ts, metadata& md) -> bool` — main thread, submission order;
+  return `false` to drop the packet.
+
+`num_workers` is auto-registered as a RUNTIME property (range 1..1024); changing it drains the pool and
+rebuilds it at the new size. Because only the main thread sends, the single-producer invariant holds.
+The `fft` and `psd` components in `composite-comps` are built on it.
+
+## Versioning & ABI
+
+- The package is versioned with **SemVer**; the installed CMake config declares
+  `COMPATIBILITY SameMinorVersion`, so `find_package(composite x.y)` accepts the same `x.y` line.
+- The component **ABI version** is independent and currently `1` (`composite::abi_version`). The loader
+  refuses any `.so` whose `composite_abi_version()` doesn't match. Rebuild components against the
+  framework when the ABI version changes.
+
+See [CHANGELOG.md](CHANGELOG.md) for the 0.5 API migration table (old → new) and release notes.
