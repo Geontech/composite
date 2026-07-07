@@ -1,0 +1,3 @@
+# Mechanical reformatting commits (git blame --ignore-revs-file aware tools skip these)
+# style: clang-format the tree to the house style
+151059726e3780430149c543774ca3cd968b303c

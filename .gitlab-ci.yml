@@ -16,15 +16,15 @@ stages:
     - cmake --version && g++ --version | head -1
 
 # ---------------------------------------------------------------------------
-# Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3). Establishes the
-# .clang-tidy (concurrency-*/bugprone-*) and .clang-format house style and
-# surfaces findings. allow_failure until the existing tree is brought into
-# compliance; then drop allow_failure (and tighten .clang-tidy WarningsAsErrors).
+# Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3). The tree is
+# clang-format-clean (formatted with the image's clang-format; re-run inside
+# gcc:14 if versions disagree locally), so the format gate is mandatory.
+# clang-tidy surfaces findings as warnings (WarningsAsErrors is still empty);
+# tighten it once the outstanding findings are burned down.
 # ---------------------------------------------------------------------------
 lint:tidy-format:
   stage: lint
   image: gcc:14
-  allow_failure: true
   before_script:
     - apt-get update -qq && apt-get install -y -qq cmake git clang-tidy clang-format nlohmann-json3-dev
   script:
