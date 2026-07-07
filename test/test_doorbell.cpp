@@ -28,7 +28,9 @@ public:
         auto [buf, ts, md] = in.get_data();
         (void)ts;
         (void)md;
-        if (buf.size() == 0) { return retval::NOOP; }  // empty ring -> idle
+        if (buf.size() == 0) {
+            return retval::NOOP;
+        } // empty ring -> idle
         processed.fetch_add(1, std::memory_order_release);
         return retval::NORMAL;
     }
@@ -37,13 +39,18 @@ public:
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 template <typename Pred>
 static bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) { return true; }
+        if (pred()) {
+            return true;
+        }
         std::this_thread::yield();
     }
     return pred();
@@ -68,14 +75,14 @@ int main() {
 
         c.set_properties(json{{"noop_thread_delay", k_fallback_ns}}, config_type::INITIALIZE);
         c.start();
-        std::this_thread::sleep_for(150ms);  // let the worker reach armed + sleeping
+        std::this_thread::sleep_for(150ms); // let the worker reach armed + sleeping
         check(c.processed.load() == 0, "nothing processed before any data");
 
         const auto t0 = std::chrono::steady_clock::now();
         src.send_data(make_immutable<float>({1.0F, 2.0F, 3.0F}), timestamp{});
         const bool got = wait_until([&] { return c.processed.load() == 1; }, 1s);
-        const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::steady_clock::now() - t0).count();
+        const auto dt_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         check(got, "packet processed via doorbell (not the ~4s NOOP fallback)");
         check(dt_ms < 500, "doorbell wake latency well under the NOOP fallback");
         std::printf("doorbell single-hop wake latency: %lld ms\n", (long long)dt_ms);
@@ -112,16 +119,18 @@ int main() {
         c.set_properties(json{{"noop_thread_delay", k_fallback_ns}}, config_type::INITIALIZE);
         c.start();
         check(wait_until([&] { return c.is_running(); }, 1s), "sink3 running");
-        std::this_thread::sleep_for(150ms);  // worker reaches armed + sleeping on the ~4s fallback
+        std::this_thread::sleep_for(150ms); // worker reaches armed + sleeping on the ~4s fallback
         const auto t0 = std::chrono::steady_clock::now();
         c.stop();
-        const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::steady_clock::now() - t0).count();
+        const auto dt_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         check(!c.is_running(), "sink3 stopped");
         check(dt_ms < 500, "stop() wakes the idle worker immediately (not the ~4s NOOP fallback)");
         std::printf("idle-worker stop latency: %lld ms\n", (long long)dt_ms);
     }
 
-    if (g_fails == 0) { std::puts("DOORBELL OK"); }
+    if (g_fails == 0) {
+        std::puts("DOORBELL OK");
+    }
     return g_fails == 0 ? 0 : 1;
 }

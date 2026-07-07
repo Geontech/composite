@@ -50,7 +50,9 @@ public:
     /// for every field type incl. nested structs), or nullopt if it did not change.
     template <typename M>
     [[nodiscard]] auto new_value(M T::* member) const -> std::optional<M> {
-        if (!changed(member)) { return std::nullopt; }
+        if (!changed(member)) {
+            return std::nullopt;
+        }
         return m_live->*member;
     }
 
@@ -58,7 +60,9 @@ public:
     [[nodiscard]] auto changed_fields() const -> std::vector<std::string> {
         std::vector<std::string> out;
         if (m_diff->is_object()) {
-            for (auto it = m_diff->begin(); it != m_diff->end(); ++it) { out.push_back(it.key()); }
+            for (auto it = m_diff->begin(); it != m_diff->end(); ++it) {
+                out.push_back(it.key());
+            }
         }
         return out;
     }
@@ -73,14 +77,21 @@ private:
     static auto name_of(M T::* member) -> std::string_view {
         std::string_view found{};
         bool matched = false;
-        std::apply([&](auto&&... f) {
-            ([&] {
-                using F = std::decay_t<decltype(f)>;
-                if constexpr (std::is_same_v<typename F::member_type, M>) {
-                    if (f.ptr == member) { found = f.name; matched = true; }
-                }
-            }(), ...);
-        }, reflect::descriptor<T>::fields());
+        std::apply(
+            [&](auto&&... f) {
+                (
+                    [&] {
+                        using F = std::decay_t<decltype(f)>;
+                        if constexpr (std::is_same_v<typename F::member_type, M>) {
+                            if (f.ptr == member) {
+                                found = f.name;
+                                matched = true;
+                            }
+                        }
+                    }(),
+                    ...);
+            },
+            reflect::descriptor<T>::fields());
         if (!matched) {
             throw std::logic_error("changes<T>: pointer-to-member is not a reflected field of T");
         }
@@ -88,7 +99,7 @@ private:
     }
 
     const reflect::json* m_diff;
-    const T* m_live;  ///< the committed (post-change) value; source of new_value()
+    const T* m_live; ///< the committed (post-change) value; source of new_value()
 };
 
 } // namespace composite

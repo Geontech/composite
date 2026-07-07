@@ -474,7 +474,7 @@ TEST_CASE("aligned buffer factory functions", "[aligned_mem][buffer][factory]") 
         // Can use dynamic operations
         buffer.resize(200);
         REQUIRE(buffer.size() == 200);
-        REQUIRE(buffer[0] == 42.0f);  // Data preserved
+        REQUIRE(buffer[0] == 42.0f); // Data preserved
 
         // Alignment maintained after resize
         addr = reinterpret_cast<std::uintptr_t>(buffer.data());
@@ -492,7 +492,7 @@ TEST_CASE("aligned buffer factory functions", "[aligned_mem][buffer][factory]") 
         REQUIRE((addr % 64) == 0);
 
         // Can read elements
-        REQUIRE(buffer[0] == 0);  // Default-initialized
+        REQUIRE(buffer[0] == 0); // Default-initialized
 
         // Can share (zero-copy)
         auto shared1 = buffer.share();
@@ -520,7 +520,7 @@ TEST_CASE("aligned buffer factory functions", "[aligned_mem][buffer][factory]") 
         // Verify alignment for AVX intrinsics
         auto addr = reinterpret_cast<std::uintptr_t>(buffer.data());
         REQUIRE((addr % AVX_ALIGNMENT) == 0);
-        REQUIRE(buffer.size() % 8 == 0);  // Multiple of AVX vector width
+        REQUIRE(buffer.size() % 8 == 0); // Multiple of AVX vector width
 
         // Data is correct
         REQUIRE(buffer[0] == 0.0f);

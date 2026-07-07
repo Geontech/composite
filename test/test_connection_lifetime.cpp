@@ -14,7 +14,10 @@ using namespace composite;
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 
 int main() {
@@ -25,8 +28,8 @@ int main() {
             input_port<immutable_buffer<float>> in{"in", 8};
             check(out.connect(&in), "connect out->in");
             check(out.connection_count() == 1, "1 connection after connect");
-            out.send_data(make_immutable<float>({1.0F}), timestamp{});  // sanity: send to a live input
-        }  // ~in -> must deregister from `out`
+            out.send_data(make_immutable<float>({1.0F}), timestamp{}); // sanity: send to a live input
+        } // ~in -> must deregister from `out`
         check(out.connection_count() == 0, "input deregistered from output on its destruction");
         // The crux: this send must NOT dereference the freed input (ASan would flag a UAF).
         out.send_data(make_immutable<float>({2.0F}), timestamp{});
@@ -40,13 +43,13 @@ int main() {
         {
             output_port<immutable_buffer<float>> out{"out2"};
             check(out.connect(&in), "connect out2->in2");
-        }  // ~out -> clears in.m_producer + releases the claim; ~in (later) must see null and not touch freed `out`
+        } // ~out -> clears in.m_producer + releases the claim; ~in (later) must see null and not touch freed `out`
         // The input is reconnectable now that its producer is gone (claim released).
         output_port<immutable_buffer<float>> out2{"out2b"};
         check(out2.connect(&in), "input reconnectable after its producer was destroyed");
         check(out2.connection_count() == 1, "reconnected to a new producer");
         std::puts("case2 (output-first destroy) ok");
-    }  // ~out2b first (clears in2's back-ptr), then ~in2 (no-op) — no UAF either way
+    } // ~out2b first (clears in2's back-ptr), then ~in2 (no-op) — no UAF either way
 
     // ---- (3) fan-out: destroy one consumer; the other + sends stay valid ----
     {
@@ -58,13 +61,15 @@ int main() {
             check(out.connect(&b), "connect b");
             check(out.connection_count() == 2, "2 connections");
             out.send_data(make_immutable<float>({3.0F}), timestamp{});
-        }  // ~b -> deregisters, leaving a
+        } // ~b -> deregisters, leaving a
         check(out.connection_count() == 1, "fan-out drops only the destroyed consumer");
-        out.send_data(make_immutable<float>({4.0F}), timestamp{});  // to `a` only — no UAF on freed `b`
+        out.send_data(make_immutable<float>({4.0F}), timestamp{}); // to `a` only — no UAF on freed `b`
         check(out.connection_count() == 1, "still 1 after post-destroy send");
         std::puts("case3 (fan-out partial destroy) ok");
     }
 
-    if (g_fails == 0) { std::puts("CONNECTION LIFETIME OK"); }
+    if (g_fails == 0) {
+        std::puts("CONNECTION LIFETIME OK");
+    }
     return g_fails == 0 ? 0 : 1;
 }

@@ -27,8 +27,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <format>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -96,7 +96,8 @@ using registration_callback = std::function<void(const metric_metadata&, void*)>
  * @param metric_name Name of the metric being registered
  * @param error Exception that was thrown (as exception_ptr)
  */
-using error_callback = std::function<void(std::size_t observer_id, const std::string& metric_name, std::exception_ptr error)>;
+using error_callback =
+    std::function<void(std::size_t observer_id, const std::string& metric_name, std::exception_ptr error)>;
 
 /**
  * @brief Callback signature for metric deregistration observers
@@ -113,8 +114,7 @@ using deregistration_callback = std::function<void(const metric_metadata&)>;
  */
 class duplicate_metric_error : public std::runtime_error {
 public:
-    explicit duplicate_metric_error(const std::string& name)
-        : std::runtime_error("Metric already exists: " + name) {}
+    explicit duplicate_metric_error(const std::string& name) : std::runtime_error("Metric already exists: " + name) {}
 };
 
 /**
@@ -215,7 +215,6 @@ inline auto sanitize_for_metric_name(std::string_view id) -> std::string {
     return result;
 }
 
-
 /**
  * @brief Validate a metric name follows OpenTelemetry naming conventions
  *
@@ -251,20 +250,15 @@ inline auto validate_metric_name(std::string_view name) -> void {
         bool is_valid = std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
 
         if (!is_valid) {
-            throw invalid_metric_name_error(
-                std::string{name},
-                "contains invalid character '" + std::string(1, c) +
-                "' at position " + std::to_string(i) +
-                " (allowed: a-z, A-Z, 0-9, _, .)"
-            );
+            throw invalid_metric_name_error(std::string{name}, "contains invalid character '" + std::string(1, c) +
+                                                                   "' at position " + std::to_string(i) +
+                                                                   " (allowed: a-z, A-Z, 0-9, _, .)");
         }
 
         if (c == '.') {
             if (prev_was_dot) {
-                throw invalid_metric_name_error(
-                    std::string{name},
-                    "contains consecutive dots at position " + std::to_string(i)
-                );
+                throw invalid_metric_name_error(std::string{name},
+                                                "contains consecutive dots at position " + std::to_string(i));
             }
             prev_was_dot = true;
         } else {
@@ -303,12 +297,8 @@ inline auto validate_labels(const labels_t& labels) -> void {
             char c = key[i];
             bool is_valid = std::isalnum(static_cast<unsigned char>(c)) || c == '_';
             if (!is_valid) {
-                throw invalid_label_error(
-                    key,
-                    "contains invalid character '" + std::string(1, c) +
-                    "' at position " + std::to_string(i) +
-                    " (allowed: a-z, A-Z, 0-9, _)"
-                );
+                throw invalid_label_error(key, "contains invalid character '" + std::string(1, c) + "' at position " +
+                                                   std::to_string(i) + " (allowed: a-z, A-Z, 0-9, _)");
             }
         }
 
@@ -316,10 +306,7 @@ inline auto validate_labels(const labels_t& labels) -> void {
         for (std::size_t i = 0; i < value.size(); ++i) {
             unsigned char c = static_cast<unsigned char>(value[i]);
             if (std::iscntrl(c) && c != '\t') {
-                throw invalid_label_error(
-                    key,
-                    "value contains control character at position " + std::to_string(i)
-                );
+                throw invalid_label_error(key, "value contains control character at position " + std::to_string(i));
             }
         }
     }
@@ -334,10 +321,7 @@ inline auto validate_labels(const labels_t& labels) -> void {
  * @param labels Labels to normalize (modified in place)
  */
 inline auto normalize_labels(labels_t& labels) -> void {
-    std::sort(labels.begin(), labels.end(),
-        [](const label_pair& a, const label_pair& b) {
-            return a.first < b.first;
-        });
+    std::sort(labels.begin(), labels.end(), [](const label_pair& a, const label_pair& b) { return a.first < b.first; });
 }
 
 /**
@@ -432,12 +416,8 @@ public:
      * @return Reference to the created counter
      * @throws duplicate_metric_error if a counter with same name+labels exists
      */
-    auto create_counter(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        labels_t labels = {}
-    ) -> counter<uint64_t>& {
+    auto create_counter(std::string name, std::string description = "", std::string unit = "1", labels_t labels = {})
+        -> counter<uint64_t>& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -452,7 +432,8 @@ public:
             if (auto* existing = find_counter(name, labels); existing != nullptr) {
                 throw duplicate_metric_error(name);
             }
-            auto& ref = create_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
+            auto& ref =
+                create_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
             result_ptr = &ref;
             meta_copy = m_counter_metadata.back();
             observers_copy = m_observers;
@@ -470,12 +451,8 @@ public:
      * Unlike create_counter(), this is idempotent - calling multiple times
      * with the same name+labels returns the same counter.
      */
-    auto get_or_create_counter(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        labels_t labels = {}
-    ) -> counter<uint64_t>& {
+    auto get_or_create_counter(std::string name, std::string description = "", std::string unit = "1",
+                               labels_t labels = {}) -> counter<uint64_t>& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -491,7 +468,8 @@ public:
             if (auto* existing = find_counter(name, labels); existing != nullptr) {
                 return *existing;
             }
-            auto& ref = create_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
+            auto& ref =
+                create_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
             result_ptr = &ref;
             created = true;
             meta_copy = m_counter_metadata.back();
@@ -516,12 +494,8 @@ public:
      * @return Reference to the created counter
      * @throws duplicate_metric_error if an updown_counter with same name+labels exists
      */
-    auto create_updown_counter(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        labels_t labels = {}
-    ) -> updown_counter<int64_t>& {
+    auto create_updown_counter(std::string name, std::string description = "", std::string unit = "1",
+                               labels_t labels = {}) -> updown_counter<int64_t>& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -536,7 +510,8 @@ public:
             if (auto* existing = find_updown_counter(name, labels); existing != nullptr) {
                 throw duplicate_metric_error(name);
             }
-            auto& ref = create_updown_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
+            auto& ref =
+                create_updown_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
             result_ptr = &ref;
             meta_copy = m_updown_counter_metadata.back();
             observers_copy = m_observers;
@@ -551,12 +526,8 @@ public:
     /**
      * @brief Get existing updown_counter or create new one (idempotent)
      */
-    auto get_or_create_updown_counter(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        labels_t labels = {}
-    ) -> updown_counter<int64_t>& {
+    auto get_or_create_updown_counter(std::string name, std::string description = "", std::string unit = "1",
+                                      labels_t labels = {}) -> updown_counter<int64_t>& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -572,7 +543,8 @@ public:
             if (auto* existing = find_updown_counter(name, labels); existing != nullptr) {
                 return *existing;
             }
-            auto& ref = create_updown_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
+            auto& ref =
+                create_updown_counter_impl(std::move(name), std::move(description), std::move(unit), std::move(labels));
             result_ptr = &ref;
             created = true;
             meta_copy = m_updown_counter_metadata.back();
@@ -597,12 +569,8 @@ public:
      * @return Reference to the created gauge
      * @throws duplicate_metric_error if a gauge with same name+labels exists
      */
-    auto create_gauge(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        labels_t labels = {}
-    ) -> gauge<double>& {
+    auto create_gauge(std::string name, std::string description = "", std::string unit = "1", labels_t labels = {})
+        -> gauge<double>& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -632,12 +600,8 @@ public:
     /**
      * @brief Get existing gauge or create new one (idempotent)
      */
-    auto get_or_create_gauge(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        labels_t labels = {}
-    ) -> gauge<double>& {
+    auto get_or_create_gauge(std::string name, std::string description = "", std::string unit = "1",
+                             labels_t labels = {}) -> gauge<double>& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -679,13 +643,8 @@ public:
      * @return Reference to the created histogram
      * @throws duplicate_metric_error if a histogram with same name+labels exists
      */
-    auto create_histogram(
-        std::string name,
-        std::string description,
-        std::string unit,
-        std::vector<double> boundaries,
-        labels_t labels = {}
-    ) -> histogram& {
+    auto create_histogram(std::string name, std::string description, std::string unit, std::vector<double> boundaries,
+                          labels_t labels = {}) -> histogram& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -700,7 +659,8 @@ public:
             if (auto* existing = find_histogram(name, labels); existing != nullptr) {
                 throw duplicate_metric_error(name);
             }
-            auto& ref = create_histogram_impl(std::move(name), std::move(description), std::move(unit), std::move(boundaries), std::move(labels));
+            auto& ref = create_histogram_impl(std::move(name), std::move(description), std::move(unit),
+                                              std::move(boundaries), std::move(labels));
             result_ptr = &ref;
             meta_copy = m_histogram_metadata.back();
             observers_copy = m_observers;
@@ -715,13 +675,8 @@ public:
     /**
      * @brief Get existing histogram or create new one (idempotent)
      */
-    auto get_or_create_histogram(
-        std::string name,
-        std::string description,
-        std::string unit,
-        std::vector<double> boundaries,
-        labels_t labels = {}
-    ) -> histogram& {
+    auto get_or_create_histogram(std::string name, std::string description, std::string unit,
+                                 std::vector<double> boundaries, labels_t labels = {}) -> histogram& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -737,7 +692,8 @@ public:
             if (auto* existing = find_histogram(name, labels); existing != nullptr) {
                 return *existing;
             }
-            auto& ref = create_histogram_impl(std::move(name), std::move(description), std::move(unit), std::move(boundaries), std::move(labels));
+            auto& ref = create_histogram_impl(std::move(name), std::move(description), std::move(unit),
+                                              std::move(boundaries), std::move(labels));
             result_ptr = &ref;
             created = true;
             meta_copy = m_histogram_metadata.back();
@@ -763,13 +719,8 @@ public:
      * @return Reference to the created histogram
      * @throws duplicate_metric_error if a histogram with same name+labels exists
      */
-    auto create_histogram_pow2(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        std::size_t num_buckets = 20,
-        labels_t labels = {}
-    ) -> histogram& {
+    auto create_histogram_pow2(std::string name, std::string description = "", std::string unit = "1",
+                               std::size_t num_buckets = 20, labels_t labels = {}) -> histogram& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -784,7 +735,8 @@ public:
             if (auto* existing = find_histogram(name, labels); existing != nullptr) {
                 throw duplicate_metric_error(name);
             }
-            auto& ref = create_histogram_pow2_impl(std::move(name), std::move(description), std::move(unit), num_buckets, std::move(labels));
+            auto& ref = create_histogram_pow2_impl(std::move(name), std::move(description), std::move(unit),
+                                                   num_buckets, std::move(labels));
             result_ptr = &ref;
             meta_copy = m_histogram_metadata.back();
             observers_copy = m_observers;
@@ -799,13 +751,8 @@ public:
     /**
      * @brief Get existing histogram or create new one with power-of-2 boundaries (idempotent)
      */
-    auto get_or_create_histogram_pow2(
-        std::string name,
-        std::string description = "",
-        std::string unit = "1",
-        std::size_t num_buckets = 20,
-        labels_t labels = {}
-    ) -> histogram& {
+    auto get_or_create_histogram_pow2(std::string name, std::string description = "", std::string unit = "1",
+                                      std::size_t num_buckets = 20, labels_t labels = {}) -> histogram& {
         validate_metric_name(name);
         validate_labels(labels);
         normalize_labels(labels);
@@ -821,7 +768,8 @@ public:
             if (auto* existing = find_histogram(name, labels); existing != nullptr) {
                 return *existing;
             }
-            auto& ref = create_histogram_pow2_impl(std::move(name), std::move(description), std::move(unit), num_buckets, std::move(labels));
+            auto& ref = create_histogram_pow2_impl(std::move(name), std::move(description), std::move(unit),
+                                                   num_buckets, std::move(labels));
             result_ptr = &ref;
             created = true;
             meta_copy = m_histogram_metadata.back();
@@ -853,8 +801,7 @@ public:
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_counters.size(); ++i) {
-                if (m_counter_metadata[i].name == name &&
-                    labels_equal(m_counter_metadata[i].labels, labels)) {
+                if (m_counter_metadata[i].name == name && labels_equal(m_counter_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_counter_metadata[i]);
                     m_counters.erase(m_counters.begin() + static_cast<std::ptrdiff_t>(i));
                     m_counter_metadata.erase(m_counter_metadata.begin() + static_cast<std::ptrdiff_t>(i));
@@ -904,8 +851,7 @@ public:
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_gauges.size(); ++i) {
-                if (m_gauge_metadata[i].name == name &&
-                    labels_equal(m_gauge_metadata[i].labels, labels)) {
+                if (m_gauge_metadata[i].name == name && labels_equal(m_gauge_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_gauge_metadata[i]);
                     m_gauges.erase(m_gauges.begin() + static_cast<std::ptrdiff_t>(i));
                     m_gauge_metadata.erase(m_gauge_metadata.begin() + static_cast<std::ptrdiff_t>(i));
@@ -929,8 +875,7 @@ public:
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_histograms.size(); ++i) {
-                if (m_histogram_metadata[i].name == name &&
-                    labels_equal(m_histogram_metadata[i].labels, labels)) {
+                if (m_histogram_metadata[i].name == name && labels_equal(m_histogram_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_histogram_metadata[i]);
                     m_histograms.erase(m_histograms.begin() + static_cast<std::ptrdiff_t>(i));
                     m_histogram_metadata.erase(m_histogram_metadata.begin() + static_cast<std::ptrdiff_t>(i));
@@ -961,7 +906,7 @@ public:
             auto lock = std::unique_lock{m_mutex};
 
             // Remove counters
-            for (auto it = m_counters.begin(); it != m_counters.end(); ) {
+            for (auto it = m_counters.begin(); it != m_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_counters.begin());
                 if (m_counter_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_counter_metadata[idx]));
@@ -973,19 +918,20 @@ public:
             }
 
             // Remove updown_counters
-            for (auto it = m_updown_counters.begin(); it != m_updown_counters.end(); ) {
+            for (auto it = m_updown_counters.begin(); it != m_updown_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_updown_counters.begin());
                 if (m_updown_counter_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_updown_counter_metadata[idx]));
                     it = m_updown_counters.erase(it);
-                    m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
+                    m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() +
+                                                    static_cast<std::ptrdiff_t>(idx));
                 } else {
                     ++it;
                 }
             }
 
             // Remove gauges
-            for (auto it = m_gauges.begin(); it != m_gauges.end(); ) {
+            for (auto it = m_gauges.begin(); it != m_gauges.end();) {
                 auto idx = static_cast<std::size_t>(it - m_gauges.begin());
                 if (m_gauge_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_gauge_metadata[idx]));
@@ -997,7 +943,7 @@ public:
             }
 
             // Remove histograms
-            for (auto it = m_histograms.begin(); it != m_histograms.end(); ) {
+            for (auto it = m_histograms.begin(); it != m_histograms.end();) {
                 auto idx = static_cast<std::size_t>(it - m_histograms.begin());
                 if (m_histogram_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_histogram_metadata[idx]));
@@ -1040,7 +986,7 @@ public:
             };
 
             // Remove counters
-            for (auto it = m_counters.begin(); it != m_counters.end(); ) {
+            for (auto it = m_counters.begin(); it != m_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_counters.begin());
                 if (has_label(m_counter_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_counter_metadata[idx]));
@@ -1052,19 +998,20 @@ public:
             }
 
             // Remove updown_counters
-            for (auto it = m_updown_counters.begin(); it != m_updown_counters.end(); ) {
+            for (auto it = m_updown_counters.begin(); it != m_updown_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_updown_counters.begin());
                 if (has_label(m_updown_counter_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_updown_counter_metadata[idx]));
                     it = m_updown_counters.erase(it);
-                    m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
+                    m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() +
+                                                    static_cast<std::ptrdiff_t>(idx));
                 } else {
                     ++it;
                 }
             }
 
             // Remove gauges
-            for (auto it = m_gauges.begin(); it != m_gauges.end(); ) {
+            for (auto it = m_gauges.begin(); it != m_gauges.end();) {
                 auto idx = static_cast<std::size_t>(it - m_gauges.begin());
                 if (has_label(m_gauge_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_gauge_metadata[idx]));
@@ -1076,7 +1023,7 @@ public:
             }
 
             // Remove histograms
-            for (auto it = m_histograms.begin(); it != m_histograms.end(); ) {
+            for (auto it = m_histograms.begin(); it != m_histograms.end();) {
                 auto idx = static_cast<std::size_t>(it - m_histograms.begin());
                 if (has_label(m_histogram_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_histogram_metadata[idx]));
@@ -1120,15 +1067,13 @@ public:
             auto lock = std::unique_lock{m_mutex};
 
             id = m_next_observer_id++;
-            m_observers[id] = callback;  // Store callback (not moved, we need it below)
+            m_observers[id] = callback; // Store callback (not moved, we need it below)
             error_handler_copy = m_error_handler;
 
             if (notify_existing) {
                 // Collect all existing metrics while holding lock
-                existing_metrics.reserve(
-                    m_counters.size() + m_updown_counters.size() +
-                    m_gauges.size() + m_histograms.size()
-                );
+                existing_metrics.reserve(m_counters.size() + m_updown_counters.size() + m_gauges.size() +
+                                         m_histograms.size());
 
                 for (std::size_t i = 0; i < m_counters.size(); ++i) {
                     existing_metrics.emplace_back(m_counter_metadata[i], m_counters[i].get());
@@ -1215,74 +1160,37 @@ public:
         auto lock = std::shared_lock{m_mutex};
         auto now = std::chrono::system_clock::now();
         std::vector<metric_snapshot> snapshots;
-        snapshots.reserve(
-            m_counters.size() +
-            m_updown_counters.size() +
-            m_gauges.size() +
-            m_histograms.size()
-        );
+        snapshots.reserve(m_counters.size() + m_updown_counters.size() + m_gauges.size() + m_histograms.size());
 
         // Counters
         for (std::size_t i = 0; i < m_counters.size(); ++i) {
             const auto& meta = m_counter_metadata[i];
-            snapshots.push_back({
-                meta.name,
-                meta.description,
-                meta.unit,
-                meta.type,
-                meta.labels,
-                m_counters[i]->value(),
-                now
-            });
+            snapshots.push_back(
+                {meta.name, meta.description, meta.unit, meta.type, meta.labels, m_counters[i]->value(), now});
         }
 
         // UpDown Counters
         for (std::size_t i = 0; i < m_updown_counters.size(); ++i) {
             const auto& meta = m_updown_counter_metadata[i];
-            snapshots.push_back({
-                meta.name,
-                meta.description,
-                meta.unit,
-                meta.type,
-                meta.labels,
-                m_updown_counters[i]->value(),
-                now
-            });
+            snapshots.push_back(
+                {meta.name, meta.description, meta.unit, meta.type, meta.labels, m_updown_counters[i]->value(), now});
         }
 
         // Gauges
         for (std::size_t i = 0; i < m_gauges.size(); ++i) {
             const auto& meta = m_gauge_metadata[i];
-            snapshots.push_back({
-                meta.name,
-                meta.description,
-                meta.unit,
-                meta.type,
-                meta.labels,
-                m_gauges[i]->value(),
-                now
-            });
+            snapshots.push_back(
+                {meta.name, meta.description, meta.unit, meta.type, meta.labels, m_gauges[i]->value(), now});
         }
 
         // Histograms - use atomic snapshot for consistency
         for (std::size_t i = 0; i < m_histograms.size(); ++i) {
             const auto& meta = m_histogram_metadata[i];
             const auto& h = *m_histograms[i];
-            auto data = h.snapshot();  // Atomic snapshot of bucket_counts, count, sum
-            snapshots.push_back({
-                meta.name,
-                meta.description,
-                meta.unit,
-                meta.type,
-                meta.labels,
-                histogram_snapshot{
-                    h.boundaries(),
-                    std::move(data.bucket_counts),
-                    data.count,
-                    data.sum
-                },
-                now
-            });
+            auto data = h.snapshot(); // Atomic snapshot of bucket_counts, count, sum
+            snapshots.push_back(
+                {meta.name, meta.description, meta.unit, meta.type, meta.labels,
+                 histogram_snapshot{h.boundaries(), std::move(data.bucket_counts), data.count, data.sum}, now});
         }
 
         return snapshots;
@@ -1317,10 +1225,8 @@ public:
      * @return Vector of matching metric snapshots
      */
     [[nodiscard]]
-    auto snapshot_by_label(
-        std::string_view label_key,
-        std::string_view label_value
-    ) const -> std::vector<metric_snapshot> {
+    auto snapshot_by_label(std::string_view label_key, std::string_view label_value) const
+        -> std::vector<metric_snapshot> {
         auto all = snapshot_all();
         std::vector<metric_snapshot> filtered;
 
@@ -1342,10 +1248,7 @@ public:
     [[nodiscard]]
     auto metric_count() const -> std::size_t {
         auto lock = std::shared_lock{m_mutex};
-        return m_counters.size() +
-               m_updown_counters.size() +
-               m_gauges.size() +
-               m_histograms.size();
+        return m_counters.size() + m_updown_counters.size() + m_gauges.size() + m_histograms.size();
     }
 
 #ifdef COMPOSITE_TESTING
@@ -1361,12 +1264,8 @@ public:
         std::vector<metric_metadata> all_metadata;
         {
             auto lock = std::unique_lock{m_mutex};
-            all_metadata.reserve(
-                m_counter_metadata.size() +
-                m_updown_counter_metadata.size() +
-                m_gauge_metadata.size() +
-                m_histogram_metadata.size()
-            );
+            all_metadata.reserve(m_counter_metadata.size() + m_updown_counter_metadata.size() +
+                                 m_gauge_metadata.size() + m_histogram_metadata.size());
             for (const auto& meta : m_counter_metadata) {
                 all_metadata.push_back(meta);
             }
@@ -1399,7 +1298,7 @@ public:
             m_histogram_metadata.clear();
         }
     }
-#endif  // COMPOSITE_TESTING
+#endif // COMPOSITE_TESTING
 
     // Disable copy/move (singleton)
     registry(const registry&) = delete;
@@ -1421,12 +1320,9 @@ private:
      * @param observers_copy Copy of observers map (taken while lock was held)
      * @param error_handler_copy Copy of error handler (taken while lock was held)
      */
-    auto notify_registration_unlocked(
-        const metric_metadata& meta,
-        void* ptr,
-        const std::unordered_map<std::size_t, registration_callback>& observers_copy,
-        const error_callback& error_handler_copy
-    ) -> void {
+    auto notify_registration_unlocked(const metric_metadata& meta, void* ptr,
+                                      const std::unordered_map<std::size_t, registration_callback>& observers_copy,
+                                      const error_callback& error_handler_copy) -> void {
         for (const auto& [id, callback] : observers_copy) {
             try {
                 callback(meta, ptr);
@@ -1496,8 +1392,7 @@ private:
      */
     auto find_counter(std::string_view name, const labels_t& labels) -> counter<uint64_t>* {
         for (std::size_t i = 0; i < m_counters.size(); ++i) {
-            if (m_counter_metadata[i].name == name &&
-                labels_equal(m_counter_metadata[i].labels, labels)) {
+            if (m_counter_metadata[i].name == name && labels_equal(m_counter_metadata[i].labels, labels)) {
                 return m_counters[i].get();
             }
         }
@@ -1522,8 +1417,7 @@ private:
      */
     auto find_gauge(std::string_view name, const labels_t& labels) -> gauge<double>* {
         for (std::size_t i = 0; i < m_gauges.size(); ++i) {
-            if (m_gauge_metadata[i].name == name &&
-                labels_equal(m_gauge_metadata[i].labels, labels)) {
+            if (m_gauge_metadata[i].name == name && labels_equal(m_gauge_metadata[i].labels, labels)) {
                 return m_gauges[i].get();
             }
         }
@@ -1535,8 +1429,7 @@ private:
      */
     auto find_histogram(std::string_view name, const labels_t& labels) -> histogram* {
         for (std::size_t i = 0; i < m_histograms.size(); ++i) {
-            if (m_histogram_metadata[i].name == name &&
-                labels_equal(m_histogram_metadata[i].labels, labels)) {
+            if (m_histogram_metadata[i].name == name && labels_equal(m_histogram_metadata[i].labels, labels)) {
                 return m_histograms[i].get();
             }
         }
@@ -1554,60 +1447,69 @@ private:
      */
     auto check_metric_limit() const -> void {
         if (m_max_metrics > 0) {
-            auto current = m_counters.size() + m_updown_counters.size() +
-                          m_gauges.size() + m_histograms.size();
+            auto current = m_counters.size() + m_updown_counters.size() + m_gauges.size() + m_histograms.size();
             if (current >= m_max_metrics) {
                 throw metric_limit_exceeded_error(m_max_metrics);
             }
         }
     }
 
-    auto create_counter_impl(std::string name, std::string description, std::string unit, labels_t labels) -> counter<uint64_t>& {
+    auto create_counter_impl(std::string name, std::string description, std::string unit, labels_t labels)
+        -> counter<uint64_t>& {
         check_metric_limit();
         m_counters.push_back(std::make_unique<counter<uint64_t>>());
-        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::counter, std::move(labels)};
+        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::counter,
+                             std::move(labels)};
         auto* ptr = m_counters.back().get();
         m_counter_metadata.push_back(std::move(meta));
         // Note: Caller is responsible for notifying observers after releasing lock
         return *ptr;
     }
 
-    auto create_updown_counter_impl(std::string name, std::string description, std::string unit, labels_t labels) -> updown_counter<int64_t>& {
+    auto create_updown_counter_impl(std::string name, std::string description, std::string unit, labels_t labels)
+        -> updown_counter<int64_t>& {
         check_metric_limit();
         m_updown_counters.push_back(std::make_unique<updown_counter<int64_t>>());
-        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::updown_counter, std::move(labels)};
+        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::updown_counter,
+                             std::move(labels)};
         auto* ptr = m_updown_counters.back().get();
         m_updown_counter_metadata.push_back(std::move(meta));
         // Note: Caller is responsible for notifying observers after releasing lock
         return *ptr;
     }
 
-    auto create_gauge_impl(std::string name, std::string description, std::string unit, labels_t labels) -> gauge<double>& {
+    auto create_gauge_impl(std::string name, std::string description, std::string unit, labels_t labels)
+        -> gauge<double>& {
         check_metric_limit();
         m_gauges.push_back(std::make_unique<gauge<double>>());
-        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::gauge, std::move(labels)};
+        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::gauge,
+                             std::move(labels)};
         auto* ptr = m_gauges.back().get();
         m_gauge_metadata.push_back(std::move(meta));
         // Note: Caller is responsible for notifying observers after releasing lock
         return *ptr;
     }
 
-    auto create_histogram_impl(std::string name, std::string description, std::string unit, std::vector<double> boundaries, labels_t labels) -> histogram& {
+    auto create_histogram_impl(std::string name, std::string description, std::string unit,
+                               std::vector<double> boundaries, labels_t labels) -> histogram& {
         check_metric_limit();
         m_histograms.push_back(std::make_unique<histogram>(std::move(boundaries)));
-        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::histogram, std::move(labels)};
+        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::histogram,
+                             std::move(labels)};
         auto* ptr = m_histograms.back().get();
         m_histogram_metadata.push_back(std::move(meta));
         // Note: Caller is responsible for notifying observers after releasing lock
         return *ptr;
     }
 
-    auto create_histogram_pow2_impl(std::string name, std::string description, std::string unit, std::size_t num_buckets, labels_t labels) -> histogram& {
+    auto create_histogram_pow2_impl(std::string name, std::string description, std::string unit,
+                                    std::size_t num_buckets, labels_t labels) -> histogram& {
         check_metric_limit();
         auto boundaries = histogram::power_of_2_boundaries(num_buckets);
         m_histograms.push_back(std::make_unique<histogram>(std::move(boundaries)));
         m_histograms.back()->enable_power_of_2_lookup();
-        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::histogram, std::move(labels)};
+        metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::histogram,
+                             std::move(labels)};
         auto* ptr = m_histograms.back().get();
         m_histogram_metadata.push_back(std::move(meta));
         // Note: Caller is responsible for notifying observers after releasing lock

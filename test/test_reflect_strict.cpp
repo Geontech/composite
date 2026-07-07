@@ -19,7 +19,10 @@ using rfl::json;
 enum class Window { hann, hamming };
 COMPOSITE_ENUM(Window, hann, hamming);
 
-struct Net { std::string host; std::uint16_t port{}; };
+struct Net {
+    std::string host;
+    std::uint16_t port{};
+};
 COMPOSITE_STRUCT(Net, host, port);
 
 struct Cfg {
@@ -31,42 +34,52 @@ struct Cfg {
     Net net;
     std::optional<double> bandwidth;
     std::vector<std::uint16_t> taps;
-    json meta;  // opaque leaf
+    json meta; // opaque leaf
 };
 COMPOSITE_STRUCT(Cfg, channels, offset, gain, enabled, window, net, bandwidth, taps, meta);
 
 // Nested struct with non-zero member initializers, to prove a nested-field null
 // resets to the initializer (not the zero value).
-struct Inner { int delay{50}; double scale{2.0}; };
+struct Inner {
+    int delay{50};
+    double scale{2.0};
+};
 COMPOSITE_STRUCT(Inner, delay, scale);
-struct Outer { Inner sub; int top{7}; };
+struct Outer {
+    Inner sub;
+    int top{7};
+};
 COMPOSITE_STRUCT(Outer, sub, top);
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 
 // Run merge(patch) on a fresh Cfg; assert it throws and that SOME accumulated
 // error has the given path and a message containing `substr`. Returns the error
 // count so callers can assert accumulation.
-static std::size_t expect_fail(const char* patch_json, const char* path,
-                               const char* substr, const char* what) {
+static std::size_t expect_fail(const char* patch_json, const char* path, const char* substr, const char* what) {
     Cfg c;
     try {
         rfl::merge(c, json::parse(patch_json));
     } catch (const rfl::decode_failure& e) {
         bool found = false;
         for (const auto& err : e.errors) {
-            if (err.path == path && err.message.find(substr) != std::string::npos) { found = true; }
+            if (err.path == path && err.message.find(substr) != std::string::npos) {
+                found = true;
+            }
         }
         check(found, what);
         return e.errors.size();
     } catch (...) {
-        check(false, what);  // wrong exception type
+        check(false, what); // wrong exception type
         return 0;
     }
-    check(false, what);  // did not throw at all
+    check(false, what); // did not throw at all
     return 0;
 }
 
@@ -95,9 +108,8 @@ int main() {
 
     // ---- error accumulation: one patch, several problems, all reported ----
     {
-        const std::size_t n = expect_fail(
-            R"({"channels": 70000, "gain": "x", "bogus": 1})",
-            "channels", "out of range", "accumulation: channels still reported");
+        const std::size_t n = expect_fail(R"({"channels": 70000, "gain": "x", "bogus": 1})", "channels", "out of range",
+                                          "accumulation: channels still reported");
         check(n == 3, "all three problems accumulated into one failure");
     }
 
@@ -111,8 +123,10 @@ int main() {
 
         // the documented invariant merge(a, diff(a,b)) == b must hold even when b
         // removes a key from an opaque json leaf (the merge_patch form broke this).
-        Cfg av; av.meta = json::parse(R"({"x": 1, "y": 2})");
-        Cfg bv; bv.meta = json::parse(R"({"x": 1})");  // dropped "y"
+        Cfg av;
+        av.meta = json::parse(R"({"x": 1, "y": 2})");
+        Cfg bv;
+        bv.meta = json::parse(R"({"x": 1})"); // dropped "y"
         Cfg a_copy = av;
         rfl::merge(a_copy, rfl::diff(av, bv));
         check(rfl::equal(a_copy, bv), "json leaf diff->merge round-trips (removed key really dropped)");
@@ -144,7 +158,10 @@ int main() {
         check(c.taps.size() == 3 && c.taps[2] == 3, "vector replace");
     }
 
-    if (g_fails != 0) { std::fprintf(stderr, "%d strict-decode check(s) FAILED\n", g_fails); return 1; }
+    if (g_fails != 0) {
+        std::fprintf(stderr, "%d strict-decode check(s) FAILED\n", g_fails);
+        return 1;
+    }
     std::puts("REFLECT STRICT-DECODE TESTS PASSED");
     return 0;
 }

@@ -73,8 +73,7 @@ public:
 
         /// Emit a packet on the output port. Latch the metadata_ptr in the source and pass
         /// the same instance every packet (rebuild via composite::make_metadata on change).
-        static auto emit(OutBuf b, timestamp t, composite::metadata_ptr m = nullptr)
-            -> produce_result {
+        static auto emit(OutBuf b, timestamp t, composite::metadata_ptr m = nullptr) -> produce_result {
             return produce_result{produce_status::data, std::move(b), t, std::move(m)};
         }
         /// Nothing to produce right now — back off (NOOP).
@@ -83,8 +82,7 @@ public:
         static auto done() -> produce_result { return produce_result{produce_status::done, {}, {}, {}}; }
     };
 
-    explicit source_component(std::string_view id, std::string_view out_name = "out")
-        : component(id), m_out(out_name) {
+    explicit source_component(std::string_view id, std::string_view out_name = "out") : component(id), m_out(out_name) {
         add_port(&m_out);
     }
 
@@ -109,7 +107,7 @@ private:
         // We HELD it (never dropped) and pulled nothing new from the source until it lands.
         if (m_pending.has_value()) {
             if (m_out.producer_is_connected() && !m_out.producer_can_send()) {
-                return retval::AWAIT_OUTPUT;  // still full — wait on the reverse doorbell
+                return retval::AWAIT_OUTPUT; // still full — wait on the reverse doorbell
             }
             m_out.send_data(std::move(m_pending->buffer), m_pending->ts, std::move(m_pending->md));
             m_pending.reset();
@@ -117,35 +115,35 @@ private:
         }
         auto r = produce();
         switch (r.status) {
-            case produce_status::data:
-                // Pace against downstream backpressure (reverse doorbell): if the output ring is
-                // full, HOLD this packet and AWAIT_OUTPUT instead of dropping it — and do NOT pull the
-                // next item until this one lands. Backpressure gates only DATA; done()/idle below stay
-                // reachable, so a source at EOF still signals end-of-stream even when the downstream is
-                // full or paused. Gated on producer_is_connected() so an unconnected source (can_send
-                // is false purely for lack of a consumer, not backpressure) still runs. The producer_*
-                // variants are the lock-free single-producer path (this worker is the sole producer on
-                // m_out), avoiding the per-iteration connection-snapshot tax.
-                //
-                if (m_out.producer_is_connected() && !m_out.producer_can_send()) {
-                    m_pending = std::move(r);
-                    return retval::AWAIT_OUTPUT;
-                }
-                m_out.send_data(std::move(r.buffer), r.ts, std::move(r.md));
-                return retval::NORMAL;
-            case produce_status::done:
-                // FINISH -> finish_reason::completed -> the base auto-sends EOS on m_out, so the
-                // downstream graph reaches at_end() and completes in turn. Reachable regardless of
-                // backpressure — EOS is out-of-band, never gated by can_send().
-                return retval::FINISH;
-            case produce_status::idle:
-                break;
+        case produce_status::data:
+            // Pace against downstream backpressure (reverse doorbell): if the output ring is
+            // full, HOLD this packet and AWAIT_OUTPUT instead of dropping it — and do NOT pull the
+            // next item until this one lands. Backpressure gates only DATA; done()/idle below stay
+            // reachable, so a source at EOF still signals end-of-stream even when the downstream is
+            // full or paused. Gated on producer_is_connected() so an unconnected source (can_send
+            // is false purely for lack of a consumer, not backpressure) still runs. The producer_*
+            // variants are the lock-free single-producer path (this worker is the sole producer on
+            // m_out), avoiding the per-iteration connection-snapshot tax.
+            //
+            if (m_out.producer_is_connected() && !m_out.producer_can_send()) {
+                m_pending = std::move(r);
+                return retval::AWAIT_OUTPUT;
+            }
+            m_out.send_data(std::move(r.buffer), r.ts, std::move(r.md));
+            return retval::NORMAL;
+        case produce_status::done:
+            // FINISH -> finish_reason::completed -> the base auto-sends EOS on m_out, so the
+            // downstream graph reaches at_end() and completes in turn. Reachable regardless of
+            // backpressure — EOS is out-of-band, never gated by can_send().
+            return retval::FINISH;
+        case produce_status::idle:
+            break;
         }
         return retval::NOOP;
     }
 
     output_port<OutBuf> m_out;
-    std::optional<produce_result> m_pending;  // produced packet awaiting a free downstream slot (worker-thread only)
+    std::optional<produce_result> m_pending; // produced packet awaiting a free downstream slot (worker-thread only)
     // NOTE: no auto_stop here on purpose. A base-class member auto_stop cannot make destruction safe
     // (produce() is pure here; see the class doc's "Destruction" note) — the worker must be stopped by
     // the LEAF, while the leaf vtable is still intact.

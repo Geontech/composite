@@ -19,8 +19,8 @@
 
 #ifdef COMPOSITE_USE_OPENTELEMETRY
 
-#include "composite/telemetry/manager.hpp"
 #include "composite/metrics/metrics.hpp"
+#include "composite/telemetry/manager.hpp"
 
 #include <opentelemetry/exporters/otlp/otlp_http_metric_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_http_metric_exporter_options.h>
@@ -71,13 +71,12 @@ struct callback_context_base {
 /**
  * @brief Typed callback context for metric callbacks
  */
-template<typename T>
+template <typename T>
 struct callback_context : callback_context_base {
     T* metric;
     std::vector<std::pair<std::string, std::string>> labels;
 
-    callback_context(T* m, std::vector<std::pair<std::string, std::string>> l)
-        : metric(m), labels(std::move(l)) {}
+    callback_context(T* m, std::vector<std::pair<std::string, std::string>> l) : metric(m), labels(std::move(l)) {}
 };
 
 /**
@@ -88,8 +87,7 @@ struct bucket_context : callback_context_base {
     std::size_t bucket_idx;
     std::vector<std::pair<std::string, std::string>> labels;
 
-    bucket_context(metrics::histogram* h, std::size_t idx,
-                   std::vector<std::pair<std::string, std::string>> l)
+    bucket_context(metrics::histogram* h, std::size_t idx, std::vector<std::pair<std::string, std::string>> l)
         : hist(h), bucket_idx(idx), labels(std::move(l)) {}
 };
 
@@ -101,10 +99,10 @@ struct bucket_context : callback_context_base {
  * C++ destroys members in reverse order of declaration.
  */
 struct instrument_entry {
-    std::unique_ptr<callback_context_base> context;  // Destroyed last
-    opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument;  // Destroyed first
-    std::string metric_name;  // Native metric name for lookup
-    metrics::labels_t metric_labels;  // Labels for distinguishing metrics with same name
+    std::unique_ptr<callback_context_base> context;                                  // Destroyed last
+    opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument; // Destroyed first
+    std::string metric_name;                                                         // Native metric name for lookup
+    metrics::labels_t metric_labels; // Labels for distinguishing metrics with same name
 };
 
 /**
@@ -112,7 +110,7 @@ struct instrument_entry {
  */
 struct manager::impl {
     std::atomic<bool> initialized{false};
-    std::mutex init_mutex;  // Guards initialization to prevent races
+    std::mutex init_mutex; // Guards initialization to prevent races
     telemetry::config config;
 
     // OTel meter for creating instruments
@@ -151,7 +149,7 @@ auto manager::is_initialized() const -> bool {
  */
 static auto normalize_protocol(std::string protocol) -> std::string {
     std::transform(protocol.begin(), protocol.end(), protocol.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return protocol;
 }
 
@@ -210,9 +208,8 @@ static auto apply_protocol_config(telemetry::config& cfg, const std::string& req
     auto protocol = normalize_protocol(requested_protocol);
 
     if (protocol == "grpc") {
-        spdlog::warn(
-            "telemetry: OTLP protocol 'grpc' requested but only HTTP is supported; "
-            "forcing http/protobuf");
+        spdlog::warn("telemetry: OTLP protocol 'grpc' requested but only HTTP is supported; "
+                     "forcing http/protobuf");
         fix_grpc_endpoint(cfg.exporter.endpoint);
         cfg.exporter.protocol = "http/protobuf";
     } else if (protocol == "http/json") {
@@ -294,8 +291,7 @@ static auto apply_env_defaults(telemetry::config& cfg) -> void {
 
 static auto ensure_http_metrics_path(std::string endpoint) -> std::string {
     constexpr std::string_view path = "/v1/metrics";
-    if (endpoint.size() >= path.size() &&
-        endpoint.compare(endpoint.size() - path.size(), path.size(), path) == 0) {
+    if (endpoint.size() >= path.size() && endpoint.compare(endpoint.size() - path.size(), path.size(), path) == 0) {
         return endpoint;
     }
     if (!endpoint.empty() && endpoint.back() == '/') {
@@ -307,8 +303,7 @@ static auto ensure_http_metrics_path(std::string endpoint) -> std::string {
 /**
  * @brief Convert native labels to OTel KeyValueIterable
  */
-static auto labels_to_kv(const metrics::labels_t& labels)
-    -> std::vector<std::pair<std::string, std::string>> {
+static auto labels_to_kv(const metrics::labels_t& labels) -> std::vector<std::pair<std::string, std::string>> {
     std::vector<std::pair<std::string, std::string>> kv;
     kv.reserve(labels.size());
     for (const auto& [k, v] : labels) {
@@ -320,8 +315,7 @@ static auto labels_to_kv(const metrics::labels_t& labels)
 /**
  * @brief Parse header string in "key=value,key2=value2" format
  */
-static auto parse_headers(const std::string& header_str)
-    -> std::vector<std::pair<std::string, std::string>> {
+static auto parse_headers(const std::string& header_str) -> std::vector<std::pair<std::string, std::string>> {
     std::vector<std::pair<std::string, std::string>> headers;
     if (header_str.empty()) {
         return headers;
@@ -330,19 +324,21 @@ static auto parse_headers(const std::string& header_str)
     std::size_t pos = 0;
     while (pos < header_str.size()) {
         auto comma = header_str.find(',', pos);
-        auto segment = (comma != std::string::npos)
-            ? header_str.substr(pos, comma - pos)
-            : header_str.substr(pos);
+        auto segment = (comma != std::string::npos) ? header_str.substr(pos, comma - pos) : header_str.substr(pos);
 
         auto eq = segment.find('=');
         if (eq != std::string::npos && eq > 0) {
             auto key = segment.substr(0, eq);
             auto value = segment.substr(eq + 1);
             // Trim whitespace
-            while (!key.empty() && std::isspace(static_cast<unsigned char>(key.front()))) key.erase(0, 1);
-            while (!key.empty() && std::isspace(static_cast<unsigned char>(key.back()))) key.pop_back();
-            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(0, 1);
-            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+            while (!key.empty() && std::isspace(static_cast<unsigned char>(key.front())))
+                key.erase(0, 1);
+            while (!key.empty() && std::isspace(static_cast<unsigned char>(key.back())))
+                key.pop_back();
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+                value.erase(0, 1);
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+                value.pop_back();
             if (!key.empty()) {
                 headers.emplace_back(std::move(key), std::move(value));
             }
@@ -365,7 +361,7 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
 
     if (!cfg.enabled) {
         spdlog::debug("telemetry: OTLP export disabled by configuration");
-        m_impl->initialized.store(false);  // Not really initialized
+        m_impl->initialized.store(false); // Not really initialized
         return true;
     }
 
@@ -374,7 +370,7 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
     apply_env_defaults(m_impl->config);
 
     spdlog::info("telemetry: initializing OTLP export (service: {}, endpoint: {}, protocol: {})",
-        m_impl->config.service_name, m_impl->config.exporter.endpoint, m_impl->config.exporter.protocol);
+                 m_impl->config.service_name, m_impl->config.exporter.endpoint, m_impl->config.exporter.protocol);
 
     try {
         // Configure OTLP HTTP metric exporter
@@ -404,8 +400,7 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         reader_opts.export_interval_millis = m_impl->config.export_interval;
         reader_opts.export_timeout_millis = m_impl->config.exporter.timeout;
 
-        auto reader = sdk_metrics::PeriodicExportingMetricReaderFactory::Create(
-            std::move(exporter), reader_opts);
+        auto reader = sdk_metrics::PeriodicExportingMetricReaderFactory::Create(std::move(exporter), reader_opts);
 
         // Create meter provider with resource attributes
         // Using OTel semantic convention attribute names directly
@@ -417,42 +412,34 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         }
         auto res = resource::Resource::Create(resource_attrs);
 
-        auto provider = sdk_metrics::MeterProviderFactory::Create(
-            std::make_unique<sdk_metrics::ViewRegistry>(), res);
+        auto provider = sdk_metrics::MeterProviderFactory::Create(std::make_unique<sdk_metrics::ViewRegistry>(), res);
 
         auto* sdk_provider = static_cast<sdk_metrics::MeterProvider*>(provider.get());
         sdk_provider->AddMetricReader(std::move(reader));
 
         // Set as global provider (convert unique_ptr to nostd::shared_ptr)
-        opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> shared_provider(
-            provider.release());
+        opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> shared_provider(provider.release());
         otel_metrics::Provider::SetMeterProvider(shared_provider);
 
         // Get meter for our instrumentation
         m_impl->meter = otel_metrics::Provider::GetMeterProvider()->GetMeter(
-            "composite",
-            m_impl->config.service_version.empty() ? "0.0.0" : m_impl->config.service_version);
+            "composite", m_impl->config.service_version.empty() ? "0.0.0" : m_impl->config.service_version);
 
         // Register as an observer on the native metrics registry
         // This callback is invoked for existing metrics and any future metrics
         auto& registry = metrics::registry::instance();
 
-        m_impl->registration_observer_id = registry.add_observer(
-            [this](const metrics::metric_metadata& meta, void* metric_ptr) {
-                create_otel_instrument(meta, metric_ptr);
-            },
-            true  // notify for existing metrics
-        );
+        m_impl->registration_observer_id =
+            registry.add_observer([this](const metrics::metric_metadata& meta,
+                                         void* metric_ptr) { create_otel_instrument(meta, metric_ptr); },
+                                  true // notify for existing metrics
+            );
 
         // Register deregistration observer to clean up OTel instruments when metrics are removed
         m_impl->deregistration_observer_id = registry.add_deregistration_observer(
-            [this](const metrics::metric_metadata& meta) {
-                remove_otel_instrument(meta);
-            }
-        );
+            [this](const metrics::metric_metadata& meta) { remove_otel_instrument(meta); });
 
-        spdlog::info("telemetry: OTLP export initialized (interval: {}ms)",
-            m_impl->config.export_interval.count());
+        spdlog::info("telemetry: OTLP export initialized (interval: {}ms)", m_impl->config.export_interval.count());
         return true;
 
     } catch (const std::exception& e) {
@@ -485,7 +472,7 @@ auto manager::shutdown() -> void {
     // Clear instruments and their contexts (prevents memory leaks)
     {
         auto inst_lock = std::lock_guard{m_impl->instrument_mutex};
-        m_impl->instruments.clear();  // unique_ptr contexts are automatically deleted
+        m_impl->instruments.clear(); // unique_ptr contexts are automatically deleted
     }
 
     // Reset meter. Assignment, not .reset(): nostd::shared_ptr only grew reset() in newer
@@ -493,8 +480,7 @@ auto manager::shutdown() -> void {
     m_impl->meter = opentelemetry::nostd::shared_ptr<otel_metrics::Meter>{};
 
     // Replace global provider with noop to flush pending exports
-    opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> noop_provider(
-        new otel_metrics::NoopMeterProvider());
+    opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> noop_provider(new otel_metrics::NoopMeterProvider());
     otel_metrics::Provider::SetMeterProvider(noop_provider);
 
     m_impl->initialized.store(false);
@@ -535,8 +521,8 @@ auto manager::remove_otel_instrument(const metrics::metric_metadata& meta) -> vo
 
     // Remove all instruments matching this metric name AND labels
     // (histograms have multiple: _count, _sum, _bucket, but all share the same base name/labels)
-    auto it = std::remove_if(m_impl->instruments.begin(), m_impl->instruments.end(),
-        [&meta](const instrument_entry& entry) {
+    auto it =
+        std::remove_if(m_impl->instruments.begin(), m_impl->instruments.end(), [&meta](const instrument_entry& entry) {
             return entry.metric_name == meta.name && labels_match(entry.metric_labels, meta.labels);
         });
 
@@ -547,10 +533,7 @@ auto manager::remove_otel_instrument(const metrics::metric_metadata& meta) -> vo
     }
 }
 
-auto manager::create_otel_instrument(
-    const metrics::metric_metadata& meta,
-    void* metric_ptr
-) -> void {
+auto manager::create_otel_instrument(const metrics::metric_metadata& meta, void* metric_ptr) -> void {
     if (!m_impl->meter) {
         return;
     }
@@ -562,16 +545,15 @@ auto manager::create_otel_instrument(
         auto labels = labels_to_kv(meta.labels);
 
         switch (meta.type) {
-            case metrics::metric_type::counter: {
+        case metrics::metric_type::counter: {
             auto* native = static_cast<metrics::counter<uint64_t>*>(metric_ptr);
 
             // Create context with proper ownership
             auto ctx = std::make_unique<callback_context<metrics::counter<uint64_t>>>(native, labels);
-            auto* ctx_ptr = ctx.get();  // Raw pointer for callback
+            auto* ctx_ptr = ctx.get(); // Raw pointer for callback
 
             // Create instrument
-            auto instrument = m_impl->meter->CreateInt64ObservableCounter(
-                meta.name, meta.description, meta.unit);
+            auto instrument = m_impl->meter->CreateInt64ObservableCounter(meta.name, meta.description, meta.unit);
 
             // Register callback with raw pointer (context owned by instrument_entry)
             instrument->AddCallback(
@@ -579,8 +561,8 @@ auto manager::create_otel_instrument(
                     auto* c = static_cast<callback_context<metrics::counter<uint64_t>>*>(state);
                     auto value = to_otel_int64(c->metric->value());
                     if (auto* obs = opentelemetry::nostd::get_if<
-                            opentelemetry::nostd::shared_ptr<
-                                opentelemetry::metrics::ObserverResultT<int64_t>>>(&result)) {
+                            opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
+                            &result)) {
                         (*obs)->Observe(value, c->labels);
                     }
                 },
@@ -597,15 +579,14 @@ auto manager::create_otel_instrument(
             auto ctx = std::make_unique<callback_context<metrics::updown_counter<int64_t>>>(native, labels);
             auto* ctx_ptr = ctx.get();
 
-            auto instrument = m_impl->meter->CreateInt64ObservableUpDownCounter(
-                meta.name, meta.description, meta.unit);
+            auto instrument = m_impl->meter->CreateInt64ObservableUpDownCounter(meta.name, meta.description, meta.unit);
 
             instrument->AddCallback(
                 [](opentelemetry::metrics::ObserverResult result, void* state) {
                     auto* c = static_cast<callback_context<metrics::updown_counter<int64_t>>*>(state);
                     if (auto* obs = opentelemetry::nostd::get_if<
-                            opentelemetry::nostd::shared_ptr<
-                                opentelemetry::metrics::ObserverResultT<int64_t>>>(&result)) {
+                            opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
+                            &result)) {
                         (*obs)->Observe(c->metric->value(), c->labels);
                     }
                 },
@@ -622,15 +603,14 @@ auto manager::create_otel_instrument(
             auto ctx = std::make_unique<callback_context<metrics::gauge<double>>>(native, labels);
             auto* ctx_ptr = ctx.get();
 
-            auto instrument = m_impl->meter->CreateDoubleObservableGauge(
-                meta.name, meta.description, meta.unit);
+            auto instrument = m_impl->meter->CreateDoubleObservableGauge(meta.name, meta.description, meta.unit);
 
             instrument->AddCallback(
                 [](opentelemetry::metrics::ObserverResult result, void* state) {
                     auto* c = static_cast<callback_context<metrics::gauge<double>>*>(state);
                     if (auto* obs = opentelemetry::nostd::get_if<
-                            opentelemetry::nostd::shared_ptr<
-                                opentelemetry::metrics::ObserverResultT<double>>>(&result)) {
+                            opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<double>>>(
+                            &result)) {
                         (*obs)->Observe(c->metric->value(), c->labels);
                     }
                 },
@@ -652,15 +632,15 @@ auto manager::create_otel_instrument(
                 auto ctx = std::make_unique<callback_context<metrics::histogram>>(native, labels);
                 auto* ctx_ptr = ctx.get();
 
-                auto instrument = m_impl->meter->CreateInt64ObservableCounter(
-                    meta.name + "_count", meta.description + " (count)", "1");
+                auto instrument = m_impl->meter->CreateInt64ObservableCounter(meta.name + "_count",
+                                                                              meta.description + " (count)", "1");
 
                 instrument->AddCallback(
                     [](opentelemetry::metrics::ObserverResult result, void* state) {
                         auto* c = static_cast<callback_context<metrics::histogram>*>(state);
                         if (auto* obs = opentelemetry::nostd::get_if<
-                                opentelemetry::nostd::shared_ptr<
-                                    opentelemetry::metrics::ObserverResultT<int64_t>>>(&result)) {
+                                opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
+                                &result)) {
                             (*obs)->Observe(static_cast<int64_t>(c->metric->count()), c->labels);
                         }
                     },
@@ -674,15 +654,15 @@ auto manager::create_otel_instrument(
                 auto ctx = std::make_unique<callback_context<metrics::histogram>>(native, labels);
                 auto* ctx_ptr = ctx.get();
 
-                auto instrument = m_impl->meter->CreateDoubleObservableGauge(
-                    meta.name + "_sum", meta.description + " (sum)", meta.unit);
+                auto instrument = m_impl->meter->CreateDoubleObservableGauge(meta.name + "_sum",
+                                                                             meta.description + " (sum)", meta.unit);
 
                 instrument->AddCallback(
                     [](opentelemetry::metrics::ObserverResult result, void* state) {
                         auto* c = static_cast<callback_context<metrics::histogram>*>(state);
                         if (auto* obs = opentelemetry::nostd::get_if<
-                                opentelemetry::nostd::shared_ptr<
-                                    opentelemetry::metrics::ObserverResultT<double>>>(&result)) {
+                                opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<double>>>(
+                                &result)) {
                             (*obs)->Observe(c->metric->sum(), c->labels);
                         }
                     },
@@ -693,9 +673,7 @@ auto manager::create_otel_instrument(
 
             // Export each bucket as a cumulative counter with "le" label
             for (std::size_t i = 0; i <= boundaries.size(); ++i) {
-                std::string le_value = (i < boundaries.size())
-                    ? std::to_string(boundaries[i])
-                    : "+Inf";
+                std::string le_value = (i < boundaries.size()) ? std::to_string(boundaries[i]) : "+Inf";
 
                 auto bucket_labels = labels;
                 bucket_labels.emplace_back("le", le_value);
@@ -703,8 +681,8 @@ auto manager::create_otel_instrument(
                 auto ctx = std::make_unique<bucket_context>(native, i, bucket_labels);
                 auto* ctx_ptr = ctx.get();
 
-                auto instrument = m_impl->meter->CreateInt64ObservableCounter(
-                    meta.name + "_bucket", meta.description + " (bucket)", "1");
+                auto instrument = m_impl->meter->CreateInt64ObservableCounter(meta.name + "_bucket",
+                                                                              meta.description + " (bucket)", "1");
 
                 instrument->AddCallback(
                     [](opentelemetry::metrics::ObserverResult result, void* state) {
@@ -715,8 +693,8 @@ auto manager::create_otel_instrument(
                             cumulative += static_cast<int64_t>(counts[j]);
                         }
                         if (auto* obs = opentelemetry::nostd::get_if<
-                                opentelemetry::nostd::shared_ptr<
-                                    opentelemetry::metrics::ObserverResultT<int64_t>>>(&result)) {
+                                opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
+                                &result)) {
                             (*obs)->Observe(cumulative, c->labels);
                         }
                     },
@@ -725,17 +703,15 @@ auto manager::create_otel_instrument(
                 m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
             }
 
-            spdlog::debug("telemetry: created OTel histogram metrics for '{}' ({} buckets)",
-                meta.name, boundaries.size() + 1);
+            spdlog::debug("telemetry: created OTel histogram metrics for '{}' ({} buckets)", meta.name,
+                          boundaries.size() + 1);
             break;
         }
         }
     } catch (const std::exception& e) {
-        spdlog::error("telemetry: failed to create OTel instrument for '{}': {}",
-            meta.name, e.what());
+        spdlog::error("telemetry: failed to create OTel instrument for '{}': {}", meta.name, e.what());
     } catch (...) {
-        spdlog::error("telemetry: failed to create OTel instrument for '{}': unknown error",
-            meta.name);
+        spdlog::error("telemetry: failed to create OTel instrument for '{}': unknown error", meta.name);
     }
 }
 

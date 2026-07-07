@@ -52,9 +52,7 @@ public:
      * @brief Gets the name of the application.
      * @return A constant reference to the application's name.
      */
-    auto name() const noexcept -> const std::string& {
-        return m_name;
-    }
+    auto name() const noexcept -> const std::string& { return m_name; }
 
     /**
      * @brief Initializes all components managed by the application.
@@ -85,7 +83,7 @@ public:
         std::vector<std::string> failures;
         for (auto& component : snapshot()) {
             try {
-                component->apply_lifecycle_changes();  // starts iff desired-enabled, atomically
+                component->apply_lifecycle_changes(); // starts iff desired-enabled, atomically
             } catch (const std::exception& e) {
                 failures.emplace_back(component->id() + ": " + e.what());
             } catch (...) {
@@ -94,7 +92,9 @@ public:
         }
         if (!failures.empty()) {
             std::string msg = "component(s) failed to start:";
-            for (const auto& f : failures) { msg += " [" + f + "]"; }
+            for (const auto& f : failures) {
+                msg += " [" + f + "]";
+            }
             throw std::runtime_error(msg);
         }
     }
@@ -110,7 +110,7 @@ public:
             // its own error; here we continue.
             try {
                 component->stop();
-            } catch (...) {  // NOLINT(bugprone-empty-catch) — shutdown is best-effort per component
+            } catch (...) { // NOLINT(bugprone-empty-catch) — shutdown is best-effort per component
             }
         }
     }
@@ -174,7 +174,9 @@ public:
             auto has_incoming = [&](const std::string& id) {
                 for (const auto& c : comps) {
                     for (const auto& conn : c->connections()) {
-                        if (conn.input.first == id) { return true; }
+                        if (conn.input.first == id) {
+                            return true;
+                        }
                     }
                 }
                 return false;
@@ -243,9 +245,7 @@ public:
      * A copy (not a reference) so callers iterate a stable list without holding
      * the registry lock and without racing a concurrent add/clear.
      */
-    auto components() const -> std::vector<component_ptr> {
-        return snapshot();
-    }
+    auto components() const -> std::vector<component_ptr> { return snapshot(); }
 
     /**
      * @brief Acquire the topology lock that serializes edge mutation.
@@ -301,7 +301,7 @@ public:
             if (target == nullptr) {
                 return {nullptr};
             }
-            others = m_components;  // remaining peers (potential producers into / consumers of target)
+            others = m_components; // remaining peers (potential producers into / consumers of target)
         }
         // Stop the target so its worker is not sending/receiving during teardown.
         target->stop();
@@ -348,10 +348,10 @@ private:
         return m_components;
     }
 
-    std::string m_name;                          ///< The name of the application.
-    mutable std::shared_mutex m_mtx;             ///< Guards m_components (readers shared, mutators unique).
-    mutable std::mutex m_topology_mtx;           ///< Serializes edge mutation (connect/disconnect/remove); see topology_lock().
-    std::vector<component_ptr> m_components;      ///< Components managed by this application.
+    std::string m_name;                ///< The name of the application.
+    mutable std::shared_mutex m_mtx;   ///< Guards m_components (readers shared, mutators unique).
+    mutable std::mutex m_topology_mtx; ///< Serializes edge mutation (connect/disconnect/remove); see topology_lock().
+    std::vector<component_ptr> m_components; ///< Components managed by this application.
 
 }; // class application
 

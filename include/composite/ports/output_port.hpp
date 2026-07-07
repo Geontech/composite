@@ -24,7 +24,8 @@ namespace composite {
  *
  * output_port is specialized for immutable_buffer<T> and mutable_buffer<T>.
  */
-template <typename BufferType> class output_port;
+template <typename BufferType>
+class output_port;
 
 /**
  * @brief Output port specialization for immutable buffers
@@ -59,11 +60,11 @@ template <typename BufferType> class output_port;
  * output.send_data(std::move(buffer), timestamp::now());
  * @endcode
  */
-template<typename T>
+template <typename T>
 class output_port<immutable_buffer<T>> : public output_port_base {
 public:
-    using buffer_type = immutable_buffer<T>;  ///< Buffer type for this port
-    using value_type = T;                     ///< Element type stored in buffers
+    using buffer_type = immutable_buffer<T>; ///< Buffer type for this port
+    using value_type = T;                    ///< Element type stored in buffers
 
     /**
      * @brief Inherit constructor from output_port_base
@@ -79,17 +80,13 @@ public:
      * @brief Get type index for element type T
      * @return std::type_index for type T
      */
-    auto element_type() const -> std::type_index override {
-        return std::type_index(typeid(T));
-    }
+    auto element_type() const -> std::type_index override { return std::type_index(typeid(T)); }
 
     /**
      * @brief Get type identifier for element type T
      * @return Hash code from typeid(T)
      */
-    auto element_type_id() const -> std::size_t override {
-        return typeid(T).hash_code();
-    }
+    auto element_type_id() const -> std::size_t override { return typeid(T).hash_code(); }
 
     /**
      * @brief Check if this port uses mutable buffers
@@ -119,19 +116,22 @@ public:
      * Updates statistics (packets, bytes, throughput) and checks queue capacity.
      * If an input port is full, the packet is dropped at that port (not here).
      */
-    auto send_data(buffer_type buffer, timestamp ts,
-                   composite::metadata_ptr md = nullptr) -> void {
+    auto send_data(buffer_type buffer, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
         // Update outgoing statistics
         m_stats.record_transfer(buffer.size() * sizeof(T));
 
         // Lock-free snapshot of the fan-out list (mutated only via connect/disconnect).
-        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
+        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
 
-        if (ports->empty()) { return; }
+        if (ports->empty()) {
+            return;
+        }
 
         if (ports->size() == 1) {
             auto* port = ports->front();
-            if (port == nullptr) { return; }
+            if (port == nullptr) {
+                return;
+            }
             if (port->is_mutable()) {
                 // immutable → mutable: deep copy (mutable needs independent storage)
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
@@ -149,7 +149,9 @@ public:
         // last gets the pointer by move.
         for (std::size_t i = 0; i + 1 < ports->size(); ++i) {
             auto* port = (*ports)[i];
-            if (port == nullptr) { continue; }
+            if (port == nullptr) {
+                continue;
+            }
             if (port->is_mutable()) {
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
                 auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
@@ -189,9 +191,8 @@ public:
      *        add_batch (single ring publish); otherwise it falls back to per-buffer
      *        send_data (fan-out / mutable targets). Buffers are consumed.
      */
-    auto send_batch(std::span<buffer_type> bufs, timestamp ts,
-                    composite::metadata_ptr md = nullptr) -> void {
-        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
+    auto send_batch(std::span<buffer_type> bufs, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
+        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr && !ports->front()->is_mutable()) {
             auto* ip = static_cast<input_port<immutable_buffer<T>>*>(ports->front());
             std::vector<typename input_port<immutable_buffer<T>>::queue_type> batch;
@@ -209,13 +210,14 @@ public:
             ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(batch));
             return;
         }
-        for (auto& b : bufs) { send_data(std::move(b), ts, md); }
+        for (auto& b : bufs) {
+            send_data(std::move(b), ts, md);
+        }
     }
 
     /// Convenience overload: wraps a plain metadata value (allocates per call).
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, std::optional<composite::metadata> md) -> void {
-        send_batch(bufs, ts,
-                   md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
+        send_batch(bufs, ts, md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
     }
 
 }; // class output_port<immutable_buffer<T>>
@@ -257,11 +259,11 @@ public:
  * output.send_data(std::move(buffer), timestamp::now());
  * @endcode
  */
-template<typename T>
+template <typename T>
 class output_port<mutable_buffer<T>> : public output_port_base {
 public:
-    using buffer_type = mutable_buffer<T>;  ///< Buffer type for this port
-    using value_type = T;                   ///< Element type stored in buffers
+    using buffer_type = mutable_buffer<T>; ///< Buffer type for this port
+    using value_type = T;                  ///< Element type stored in buffers
 
     /**
      * @brief Inherit constructor from output_port_base
@@ -277,17 +279,13 @@ public:
      * @brief Get type index for element type T
      * @return std::type_index for type T
      */
-    auto element_type() const -> std::type_index override {
-        return std::type_index(typeid(T));
-    }
+    auto element_type() const -> std::type_index override { return std::type_index(typeid(T)); }
 
     /**
      * @brief Get type identifier for element type T
      * @return Hash code from typeid(T)
      */
-    auto element_type_id() const -> std::size_t override {
-        return typeid(T).hash_code();
-    }
+    auto element_type_id() const -> std::size_t override { return typeid(T).hash_code(); }
 
     /**
      * @brief Check if this port uses mutable buffers
@@ -314,19 +312,22 @@ public:
      * This strategy minimizes copies while maintaining correctness -
      * each receiver gets independent ownership of the data.
      */
-    auto send_data(buffer_type buffer, timestamp ts,
-                   composite::metadata_ptr md = nullptr) -> void {
+    auto send_data(buffer_type buffer, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
         // Update statistics
         m_stats.record_transfer(buffer.size() * sizeof(T));
 
         // Lock-free snapshot of the fan-out list (mutated only via connect/disconnect).
-        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
+        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
 
-        if (ports->empty()) { return; };
+        if (ports->empty()) {
+            return;
+        };
 
         if (ports->size() == 1) {
             auto* port = ports->front();
-            if (port == nullptr) { return; };
+            if (port == nullptr) {
+                return;
+            };
 
             if (port->is_mutable()) {
                 // Mutable to mutable: direct move
@@ -341,7 +342,9 @@ public:
             // Fan-out: handle multiple outputs (all share the one metadata instance)
             for (std::size_t i = 0; i < ports->size() - 1; ++i) {
                 auto* port = (*ports)[i];
-                if (port == nullptr) { continue; };
+                if (port == nullptr) {
+                    continue;
+                };
 
                 if (port->is_mutable()) {
                     auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
@@ -382,9 +385,8 @@ public:
      *        promoted for immutable); per-buffer send_data fallback for fan-out.
      *        Buffers are consumed.
      */
-    auto send_batch(std::span<buffer_type> bufs, timestamp ts,
-                    composite::metadata_ptr md = nullptr) -> void {
-        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
+    auto send_batch(std::span<buffer_type> bufs, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
+        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr) {
             auto* port = ports->front();
             if (port->is_mutable()) {
@@ -408,13 +410,14 @@ public:
             }
             return;
         }
-        for (auto& b : bufs) { send_data(std::move(b), ts, md); }
+        for (auto& b : bufs) {
+            send_data(std::move(b), ts, md);
+        }
     }
 
     /// Convenience overload: wraps a plain metadata value (allocates per call).
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, std::optional<composite::metadata> md) -> void {
-        send_batch(bufs, ts,
-                   md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
+        send_batch(bufs, ts, md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
     }
 
 }; // output_port<mutable_buffer<T>>

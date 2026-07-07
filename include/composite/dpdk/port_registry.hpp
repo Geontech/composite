@@ -27,29 +27,33 @@ struct rte_mempool;
 
 namespace composite::dpdk {
 
-class queue_lease;  // RAII auto-release handle, defined after port_registry below
+class queue_lease; // RAII auto-release handle, defined after port_registry below
 
 class port_registry {
 public:
     struct port_info {
         uint16_t port_id{};
         uint16_t num_rx_queues{};
-        std::vector<bool> queue_allocated;   ///< per-queue allocation flags
+        std::vector<bool> queue_allocated; ///< per-queue allocation flags
         rte_mempool* mempool{nullptr};
     };
 
     /// Record a configured port. Rejects (returns false) a duplicate interface
     /// name or a duplicate port_id — the previous code silently overwrote the
     /// interface entry, losing the first port's queue bookkeeping.
-    auto register_port(const std::string& interface, uint16_t port_id,
-                       uint16_t num_rx_queues, rte_mempool* mempool) -> bool {
+    auto register_port(const std::string& interface, uint16_t port_id, uint16_t num_rx_queues, rte_mempool* mempool)
+        -> bool {
         std::scoped_lock lk{m_mtx};
-        if (m_interface_to_port.contains(interface)) { return false; }
-        for (const auto& [iface, info] : m_interface_to_port) {
-            if (info.port_id == port_id) { return false; }
+        if (m_interface_to_port.contains(interface)) {
+            return false;
         }
-        m_interface_to_port.emplace(interface,
-            port_info{port_id, num_rx_queues, std::vector<bool>(num_rx_queues, false), mempool});
+        for (const auto& [iface, info] : m_interface_to_port) {
+            if (info.port_id == port_id) {
+                return false;
+            }
+        }
+        m_interface_to_port.emplace(
+            interface, port_info{port_id, num_rx_queues, std::vector<bool>(num_rx_queues, false), mempool});
         m_configured_ports.push_back(port_id);
         return true;
     }
@@ -60,8 +64,7 @@ public:
         return m_mempools.emplace(name, mempool).second;
     }
 
-    [[nodiscard]] auto get_port_id_for_interface(const std::string& interface) const
-        -> std::optional<uint16_t> {
+    [[nodiscard]] auto get_port_id_for_interface(const std::string& interface) const -> std::optional<uint16_t> {
         std::scoped_lock lk{m_mtx};
         auto it = m_interface_to_port.find(interface);
         return it == m_interface_to_port.end() ? std::nullopt : std::optional{it->second.port_id};
@@ -76,7 +79,9 @@ public:
     [[nodiscard]] auto is_port_configured(uint16_t port_id) const -> bool {
         std::scoped_lock lk{m_mtx};
         for (auto id : m_configured_ports) {
-            if (id == port_id) { return true; }
+            if (id == port_id) {
+                return true;
+            }
         }
         return false;
     }
@@ -84,7 +89,9 @@ public:
     [[nodiscard]] auto is_queue_available(const std::string& interface, uint16_t queue_id) const -> bool {
         std::scoped_lock lk{m_mtx};
         auto it = m_interface_to_port.find(interface);
-        if (it == m_interface_to_port.end() || queue_id >= it->second.num_rx_queues) { return false; }
+        if (it == m_interface_to_port.end() || queue_id >= it->second.num_rx_queues) {
+            return false;
+        }
         return !it->second.queue_allocated[queue_id];
     }
 
@@ -93,8 +100,12 @@ public:
     auto allocate_queue(const std::string& interface, uint16_t queue_id) -> bool {
         std::scoped_lock lk{m_mtx};
         auto it = m_interface_to_port.find(interface);
-        if (it == m_interface_to_port.end() || queue_id >= it->second.num_rx_queues) { return false; }
-        if (it->second.queue_allocated[queue_id]) { return false; }
+        if (it == m_interface_to_port.end() || queue_id >= it->second.num_rx_queues) {
+            return false;
+        }
+        if (it->second.queue_allocated[queue_id]) {
+            return false;
+        }
         it->second.queue_allocated[queue_id] = true;
         return true;
     }
@@ -103,7 +114,9 @@ public:
     auto allocate_next_available_queue(const std::string& interface) -> std::optional<uint16_t> {
         std::scoped_lock lk{m_mtx};
         auto it = m_interface_to_port.find(interface);
-        if (it == m_interface_to_port.end()) { return std::nullopt; }
+        if (it == m_interface_to_port.end()) {
+            return std::nullopt;
+        }
         auto& info = it->second;
         for (uint16_t q = 0; q < info.num_rx_queues; ++q) {
             if (!info.queue_allocated[q]) {
@@ -128,8 +141,12 @@ public:
     auto release_queue(const std::string& interface, uint16_t queue_id) -> bool {
         std::scoped_lock lk{m_mtx};
         auto it = m_interface_to_port.find(interface);
-        if (it == m_interface_to_port.end() || queue_id >= it->second.num_rx_queues) { return false; }
-        if (!it->second.queue_allocated[queue_id]) { return false; }
+        if (it == m_interface_to_port.end() || queue_id >= it->second.num_rx_queues) {
+            return false;
+        }
+        if (!it->second.queue_allocated[queue_id]) {
+            return false;
+        }
         it->second.queue_allocated[queue_id] = false;
         return true;
     }
@@ -167,11 +184,10 @@ private:
 /// even on an error path that never reaches an explicit release_queue() call.
 class queue_lease {
 public:
-    queue_lease() = default;  ///< empty / falsy lease (allocation failed)
+    queue_lease() = default; ///< empty / falsy lease (allocation failed)
 
     queue_lease(port_registry* registry, std::string interface, uint16_t queue_id)
-        : m_registry(registry), m_interface(std::move(interface)), m_queue_id(queue_id),
-          m_held(true) {}
+        : m_registry(registry), m_interface(std::move(interface)), m_queue_id(queue_id), m_held(true) {}
 
     queue_lease(const queue_lease&) = delete;
     auto operator=(const queue_lease&) -> queue_lease& = delete;
@@ -180,7 +196,7 @@ public:
 
     auto operator=(queue_lease&& other) noexcept -> queue_lease& {
         if (this != &other) {
-            reset();  // release anything we currently hold before taking over
+            reset(); // release anything we currently hold before taking over
             m_registry = other.m_registry;
             m_interface = std::move(other.m_interface);
             m_queue_id = other.m_queue_id;
@@ -214,14 +230,11 @@ private:
     bool m_held{false};
 };
 
-inline auto port_registry::lease_queue(const std::string& interface, uint16_t queue_id)
-    -> queue_lease {
-    return allocate_queue(interface, queue_id) ? queue_lease{this, interface, queue_id}
-                                               : queue_lease{};
+inline auto port_registry::lease_queue(const std::string& interface, uint16_t queue_id) -> queue_lease {
+    return allocate_queue(interface, queue_id) ? queue_lease{this, interface, queue_id} : queue_lease{};
 }
 
-inline auto port_registry::lease_next_available_queue(const std::string& interface)
-    -> queue_lease {
+inline auto port_registry::lease_next_available_queue(const std::string& interface) -> queue_lease {
     auto q = allocate_next_available_queue(interface);
     return q ? queue_lease{this, interface, *q} : queue_lease{};
 }

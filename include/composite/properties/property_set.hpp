@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "config.hpp"   // composite::config<T>, config_binding_base/config_binding<T>
+#include "config.hpp" // composite::config<T>, config_binding_base/config_binding<T>
 #include "typed.hpp"
 
 #include <functional>
@@ -37,8 +37,7 @@ class property_set {
 public:
     /// Register a scalar/enum/optional/vector/reflected-struct property.
     template <typename T>
-    auto add(std::string_view name, T& ref, config_type cfg = config_type::INITIALIZE)
-        -> typed_property<T>& {
+    auto add(std::string_view name, T& ref, config_type cfg = config_type::INITIALIZE) -> typed_property<T>& {
         auto prop = std::make_unique<typed_property<T>>(std::string{name}, &ref, cfg);
         auto& ref_out = *prop;
         insert(std::string{name}, std::move(prop));
@@ -47,8 +46,8 @@ public:
 
     /// Register a keyed collection (std::map<std::string, E>, E reflected).
     template <typename E>
-    auto add_keyed(std::string_view name, std::map<std::string, E>& ref,
-                   config_type cfg = config_type::INITIALIZE) -> keyed_collection<E>& {
+    auto add_keyed(std::string_view name, std::map<std::string, E>& ref, config_type cfg = config_type::INITIALIZE)
+        -> keyed_collection<E>& {
         auto prop = std::make_unique<keyed_collection<E>>(std::string{name}, &ref, cfg);
         auto& ref_out = *prop;
         insert(std::string{name}, std::move(prop));
@@ -65,14 +64,14 @@ public:
         -> ::composite::config<T>& {
         auto binding = std::make_unique<config_binding<T>>(cfg, default_cfg);
         auto* raw = binding.get();
-        for (const auto& f : raw->field_names()) {                 // all-or-nothing collision check
+        for (const auto& f : raw->field_names()) { // all-or-nothing collision check
             if (m_props.find(f) != m_props.end() || m_field_owner.find(f) != m_field_owner.end()) {
                 throw std::logic_error("composite: duplicate property/field registration: " + f);
             }
         }
         for (const auto& f : raw->field_names()) {
             m_field_owner.emplace(f, raw);
-            m_order.push_back(f);                                  // field name at the wire top level
+            m_order.push_back(f); // field name at the wire top level
         }
         m_bindings.push_back(std::move(binding));
         return cfg;
@@ -104,8 +103,7 @@ public:
      * @throws unknown_property / config_violation / validation_error — and on any
      *         throw, every prepared candidate is aborted (nothing is committed).
      */
-    auto apply(const json& obj, config_type ctx = config_type::INITIALIZE,
-               bool allow_unknown = false) -> json {
+    auto apply(const json& obj, config_type ctx = config_type::INITIALIZE, bool allow_unknown = false) -> json {
         if (!obj.is_object()) {
             throw validation_error("property_set apply expects a JSON object");
         }
@@ -131,15 +129,22 @@ public:
         // across multiple config<T> (commit/notify inherit this order).
         std::vector<property_base*> prepared;
         try {
-            for (auto& [p, v] : plain) { p->prepare(*v, ctx); prepared.push_back(p); }
+            for (auto& [p, v] : plain) {
+                p->prepare(*v, ctx);
+                prepared.push_back(p);
+            }
             for (const auto& bptr : m_bindings) {
                 auto git = grouped.find(bptr.get());
-                if (git == grouped.end()) { continue; }
+                if (git == grouped.end()) {
+                    continue;
+                }
                 bptr->prepare(git->second, ctx);
                 prepared.push_back(bptr.get());
             }
         } catch (...) {
-            for (auto* p : prepared) { p->abort(); }
+            for (auto* p : prepared) {
+                p->abort();
+            }
             throw;
         }
 
@@ -147,7 +152,9 @@ public:
         std::vector<std::pair<property_base*, json>> committed;
         for (auto* p : prepared) {
             json d = p->commit();
-            if (!d.is_null()) { committed.emplace_back(p, std::move(d)); }
+            if (!d.is_null()) {
+                committed.emplace_back(p, std::move(d));
+            }
         }
 
         // Phase 3: the batch is fully live. Notify plain props in REGISTRATION order
@@ -159,17 +166,22 @@ public:
         std::map<std::string, std::pair<property_base*, const json*>> plain_committed;
         std::vector<std::pair<config_binding_base*, const json*>> binding_committed;
         for (auto& [p, d] : committed) {
-            if (auto* b = dynamic_cast<config_binding_base*>(p)) { binding_committed.emplace_back(b, &d); }
-            else { plain_committed.emplace(p->name(), std::pair{p, &d}); }
+            if (auto* b = dynamic_cast<config_binding_base*>(p)) {
+                binding_committed.emplace_back(b, &d);
+            } else {
+                plain_committed.emplace(p->name(), std::pair{p, &d});
+            }
         }
         for (const auto& name : m_order) {
             auto it = plain_committed.find(name);
-            if (it == plain_committed.end()) { continue; }  // field names + unchanged props
+            if (it == plain_committed.end()) {
+                continue;
+            } // field names + unchanged props
             diffs[name] = *it->second.second;
             notify_guarded(it->second.first, name, *it->second.second);
         }
         for (auto& [b, dptr] : binding_committed) {
-            diffs.update(*dptr);  // field-flat merge into the aggregate diff
+            diffs.update(*dptr); // field-flat merge into the aggregate diff
             notify_guarded(b, b->name(), *dptr);
         }
         return diffs;
@@ -180,7 +192,9 @@ public:
     /// worker. No-op when no config<T> is registered (the common case) — a bare loop over
     /// an empty vector. Each binding's run_pending() is itself a no-op when nothing is staged.
     auto run_pending_reactions() -> void {
-        for (const auto& b : m_bindings) { b->run_pending(); }
+        for (const auto& b : m_bindings) {
+            b->run_pending();
+        }
     }
 
     /// Optional sink for exceptions thrown by post-commit on_change listeners. Set
@@ -194,9 +208,10 @@ public:
     /// Apply a single named property/field value. Delegated to the batch path so a
     /// single config-field write routes through the grouping pre-pass (whole-struct
     /// commit); for a plain property this is a one-key batch (identical result).
-    auto apply(std::string_view name, const json& value,
-               config_type ctx = config_type::INITIALIZE) -> bool {
-        if (!contains(name)) { throw unknown_property(std::string{name}); }
+    auto apply(std::string_view name, const json& value, config_type ctx = config_type::INITIALIZE) -> bool {
+        if (!contains(name)) {
+            throw unknown_property(std::string{name});
+        }
         return !apply(json{{std::string{name}, value}}, ctx).empty();
     }
 
@@ -205,7 +220,9 @@ public:
     [[nodiscard]] auto get(std::string_view name) const -> T {
         if (const auto* p = find(name)) {
             const auto* tp = dynamic_cast<const typed_property<T>*>(p);
-            if (tp == nullptr) { throw validation_error(std::string{name} + " (type mismatch)"); }
+            if (tp == nullptr) {
+                throw validation_error(std::string{name} + " (type mismatch)");
+            }
             return tp->get();
         }
         if (auto it = m_field_owner.find(name); it != m_field_owner.end()) {
@@ -221,14 +238,16 @@ public:
     /// Config fields appear at the top level alongside plain properties.
     [[nodiscard]] auto encode() const -> json {
         json o = json::object();
-        std::map<const config_binding_base*, json> binding_cache;  // encode each struct once
+        std::map<const config_binding_base*, json> binding_cache; // encode each struct once
         for (const auto& n : m_order) {
             if (auto pit = m_props.find(n); pit != m_props.end()) {
                 o[n] = pit->second->encode();
             } else if (auto fit = m_field_owner.find(n); fit != m_field_owner.end()) {
                 const auto* b = fit->second;
                 auto cit = binding_cache.find(b);
-                if (cit == binding_cache.end()) { cit = binding_cache.emplace(b, b->encode_all()).first; }
+                if (cit == binding_cache.end()) {
+                    cit = binding_cache.emplace(b, b->encode_all()).first;
+                }
                 o[n] = cit->second.at(n);
             }
         }
@@ -257,9 +276,13 @@ private:
         try {
             p->notify(diff);
         } catch (const std::exception& ex) {
-            if (m_listener_error_sink) { m_listener_error_sink(name, ex.what()); }
+            if (m_listener_error_sink) {
+                m_listener_error_sink(name, ex.what());
+            }
         } catch (...) {
-            if (m_listener_error_sink) { m_listener_error_sink(name, "unknown exception"); }
+            if (m_listener_error_sink) {
+                m_listener_error_sink(name, "unknown exception");
+            }
         }
     }
 
@@ -280,7 +303,7 @@ private:
     }
 
     std::map<std::string, std::unique_ptr<property_base>, std::less<>> m_props;
-    std::vector<std::string> m_order;  ///< registration order for stable encode/describe
+    std::vector<std::string> m_order; ///< registration order for stable encode/describe
     std::function<void(const std::string&, const char*)> m_listener_error_sink;
     // config<T> support: each top-level field name routes to its owning binding;
     // m_bindings owns the binding objects (one per registered config<T>).

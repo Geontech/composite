@@ -24,8 +24,9 @@ namespace {
 class self_writer : public component {
 public:
     explicit self_writer(std::string_view id) : component(id) {
-        add_property("count", m_count, config_type::RUNTIME)
-            .on_change([this](const json&) { m_notifies.fetch_add(1, std::memory_order_relaxed); });
+        add_property("count", m_count, config_type::RUNTIME).on_change([this](const json&) {
+            m_notifies.fetch_add(1, std::memory_order_relaxed);
+        });
     }
     auto process() -> retval override {
         // Worker mutating its OWN property mid-process() — the re-entrancy case.
@@ -34,7 +35,7 @@ public:
     }
     int m_count{0};
     std::atomic<std::uint64_t> m_notifies{0};
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 } // namespace
 
@@ -47,8 +48,10 @@ int main() {
 
     std::thread reader([&] {
         while (!stop.load(std::memory_order_acquire)) {
-            auto state = comp->property_state();  // takes the shared read lock
-            if (state.contains("count")) { reads.fetch_add(1, std::memory_order_relaxed); }
+            auto state = comp->property_state(); // takes the shared read lock
+            if (state.contains("count")) {
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     });
 
@@ -59,7 +62,7 @@ int main() {
     for (int i = 0; i < 2000 && comp->m_notifies.load() == 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    comp->stop();  // worker joined here -> m_count is stable for the main thread
+    comp->stop(); // worker joined here -> m_count is stable for the main thread
     stop.store(true, std::memory_order_release);
     reader.join();
 
@@ -71,8 +74,7 @@ int main() {
         std::printf("FAIL: on_change never fired during worker self-write\n");
         return 1;
     }
-    std::printf("WORKER SELF-WRITE OK: count=%d notifies=%llu concurrent_reads=%llu\n",
-                comp->m_count, (unsigned long long)comp->m_notifies.load(),
-                (unsigned long long)reads.load());
+    std::printf("WORKER SELF-WRITE OK: count=%d notifies=%llu concurrent_reads=%llu\n", comp->m_count,
+                (unsigned long long)comp->m_notifies.load(), (unsigned long long)reads.load());
     return 0;
 }

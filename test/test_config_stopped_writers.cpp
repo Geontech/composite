@@ -52,9 +52,9 @@ public:
     auto process() -> retval override { return retval::NOOP; }
 
     config<scfg> m_cfg{};
-    std::string m_mirror{};                    // written only by on_apply
+    std::string m_mirror{}; // written only by on_apply
     std::atomic<long> m_applies{0};
-    component::auto_stop m_auto_stop{*this};    // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 
 int main() {
@@ -78,8 +78,8 @@ int main() {
     w2.join();
 
     // Correctness is TSan's job here; the counters just prove the reactions actually ran.
-    std::printf("K1 stopped-writer TSan: applies=%ld mirror=%s\n",
-                comp->m_applies.load(std::memory_order_relaxed), comp->m_mirror.c_str());
+    std::printf("K1 stopped-writer TSan: applies=%ld mirror=%s\n", comp->m_applies.load(std::memory_order_relaxed),
+                comp->m_mirror.c_str());
     if (comp->m_applies.load(std::memory_order_relaxed) == 0) {
         std::fprintf(stderr, "FAIL: no reactions ran\n");
         return 1;

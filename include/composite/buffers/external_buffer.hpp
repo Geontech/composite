@@ -63,8 +63,14 @@ public:
     auto begin() noexcept -> iterator { return data(); }
     auto begin() const noexcept -> const_iterator { return data(); }
     auto cbegin() const noexcept -> const_iterator { return begin(); }
-    auto end() noexcept -> iterator { auto* p = data(); return (p == nullptr || size() == 0) ? p : p + size(); }
-    auto end() const noexcept -> const_iterator { auto* p = data(); return (p == nullptr || size() == 0) ? p : p + size(); }
+    auto end() noexcept -> iterator {
+        auto* p = data();
+        return (p == nullptr || size() == 0) ? p : p + size();
+    }
+    auto end() const noexcept -> const_iterator {
+        auto* p = data();
+        return (p == nullptr || size() == 0) ? p : p + size();
+    }
     auto cend() const noexcept -> const_iterator { return end(); }
     T& operator[](std::size_t index) const {
         assert(m_data && index < m_size);
@@ -96,7 +102,7 @@ public:
             throw std::invalid_argument("external_buffer::take: n exceeds buffer size");
         }
         external_buffer<T> view;
-        view.m_data = std::move(m_data);  // same data pointer + release, smaller logical size
+        view.m_data = std::move(m_data); // same data pointer + release, smaller logical size
         view.m_size = n;
         return view;
     }
@@ -106,12 +112,15 @@ private:
     template <typename Release>
     static auto make_guard(Release&& release) {
         return [rel = std::forward<Release>(release)](T* p) noexcept {
-            try { rel(p); } catch (...) { /* release must not throw; swallow */ }
+            try {
+                rel(p);
+            } catch (...) { /* release must not throw; swallow */
+            }
         };
     }
 
-    std::shared_ptr<T> m_data;   ///< data pointer + inline custom deleter (the release)
-    std::size_t m_size{0};       ///< element count
+    std::shared_ptr<T> m_data; ///< data pointer + inline custom deleter (the release)
+    std::size_t m_size{0};     ///< element count
 
 }; // class external_buffer
 

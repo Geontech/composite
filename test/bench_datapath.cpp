@@ -40,7 +40,8 @@ namespace {
 double g_seconds = 1.0;
 
 // Keep the optimizer honest (DoNotOptimize-style barrier; no -Wvolatile).
-template <typename T> void sink_value(const T& v) {
+template <typename T>
+void sink_value(const T& v) {
     asm volatile("" : : "r,m"(v) : "memory");
 }
 
@@ -71,9 +72,12 @@ void bench_pool() {
         const std::size_t iters = 200000;
         auto t0 = clk::now();
         for (std::size_t i = 0; i < iters; ++i) {
-            auto b = pool->acquire();             // lock-free pop
-            if (b) { (*b)[0] = static_cast<float>(i); sink_value((*b)[0]); }
-        }                                          // released here (lock-free push)
+            auto b = pool->acquire(); // lock-free pop
+            if (b) {
+                (*b)[0] = static_cast<float>(i);
+                sink_value((*b)[0]);
+            }
+        } // released here (lock-free push)
         auto pool_ns = std::chrono::duration<double>(clk::now() - t0).count() / iters * 1e9;
         t0 = clk::now();
         for (std::size_t i = 0; i < iters; ++i) {
@@ -104,11 +108,14 @@ void bench_handoff_1to1() {
         const std::uint64_t count = 2'000'000;
 
         std::thread cons([&] {
-            while (!go.load(std::memory_order_acquire)) { /* spin */ }
+            while (!go.load(std::memory_order_acquire)) { /* spin */
+            }
             std::uint64_t got = 0;
             while (got < count) {
                 auto [buf, ts, md] = in.get_data();
-                if (buf.size() != 0) { ++got; }
+                if (buf.size() != 0) {
+                    ++got;
+                }
             }
             received.store(got, std::memory_order_release);
         });
@@ -116,7 +123,9 @@ void bench_handoff_1to1() {
         go.store(true, std::memory_order_release);
         auto t0 = clk::now();
         for (std::uint64_t i = 0; i < count; ++i) {
-            while (in.is_full()) { std::this_thread::yield(); }
+            while (in.is_full()) {
+                std::this_thread::yield();
+            }
             auto b = make_mutable<float>(n);
             out.send_data(std::move(b), timestamp{});
         }
@@ -145,11 +154,14 @@ void bench_handoff_1toN() {
         std::vector<std::thread> cons;
         for (int k = 0; k < N; ++k) {
             cons.emplace_back([&, k] {
-                while (!go.load(std::memory_order_acquire)) {}
+                while (!go.load(std::memory_order_acquire)) {
+                }
                 std::uint64_t got = 0;
                 while (got < count) {
                     auto [buf, ts, md] = ins[k]->get_data();
-                    if (buf.size() != 0) { ++got; }
+                    if (buf.size() != 0) {
+                        ++got;
+                    }
                 }
             });
         }
@@ -162,13 +174,22 @@ void bench_handoff_1toN() {
             bool any_full = true;
             while (any_full) {
                 any_full = false;
-                for (auto& in : ins) { if (in->is_full()) { any_full = true; break; } }
-                if (any_full) { std::this_thread::yield(); }
+                for (auto& in : ins) {
+                    if (in->is_full()) {
+                        any_full = true;
+                        break;
+                    }
+                }
+                if (any_full) {
+                    std::this_thread::yield();
+                }
             }
             auto b = make_immutable<float>(n);
             out.send_data(std::move(b), timestamp{});
         }
-        for (auto& c : cons) { c.join(); }
+        for (auto& c : cons) {
+            c.join();
+        }
         auto dt = std::chrono::duration<double>(clk::now() - t0).count();
         std::printf("%-12zu %16.2f\n", n, count / dt / 1e6);
     }
@@ -181,13 +202,20 @@ class bench_passthrough : public component {
 public:
     input_port<immutable_buffer<float>> in{"in"};
     output_port<immutable_buffer<float>> out{"out"};
-    explicit bench_passthrough(std::string_view id) : component(id) { add_port(in); add_port(out); }
+    explicit bench_passthrough(std::string_view id) : component(id) {
+        add_port(in);
+        add_port(out);
+    }
     auto process() -> retval override {
         // Pace via can_send() (reverse doorbell): if the downstream ring is full, leave our
         // input queued (lossless backpressure) and idle on AWAIT_OUTPUT until a slot frees.
-        if (!out.can_send()) { return retval::AWAIT_OUTPUT; }
+        if (!out.can_send()) {
+            return retval::AWAIT_OUTPUT;
+        }
         auto [buf, ts, md] = in.get_data();
-        if (buf.size() == 0) { return retval::NOOP; }
+        if (buf.size() == 0) {
+            return retval::NOOP;
+        }
         out.send_data(std::move(buf), ts, md);
         return retval::NORMAL;
     }
@@ -202,8 +230,11 @@ public:
     explicit bench_sink(std::string_view id) : component(id) { add_port(in); }
     auto process() -> retval override {
         auto [buf, ts, md] = in.get_data();
-        (void)ts; (void)md;
-        if (buf.size() == 0) { return retval::NOOP; }
+        (void)ts;
+        (void)md;
+        if (buf.size() == 0) {
+            return retval::NOOP;
+        }
         received.fetch_add(1, std::memory_order_release);
         return retval::NORMAL;
     }
@@ -220,7 +251,7 @@ void bench_latency_hops() {
     std::printf("\n== first-packet latency across N component hops (doorbell wake; m_delay=50ms) ==\n");
     std::printf("doorbell wakes each idle hop on arrival; without it the floor would be ~N*50ms.\n");
     std::printf("%-8s %14s %14s %14s %20s\n", "hops(N)", "median us", "p99 us", "max us", "no-doorbell floor");
-    const long m_delay_ns = 50'000'000;  // 50 ms NOOP backoff
+    const long m_delay_ns = 50'000'000; // 50 ms NOOP backoff
     for (int N : {1, 2, 4, 8}) {
         // N components: [0..N-2] pass-through, [N-1] sink. inject feeds component 0.
         std::vector<std::shared_ptr<bench_passthrough>> pts;
@@ -236,10 +267,14 @@ void bench_latency_hops() {
             inject.connect(&sink->in);
         } else {
             inject.connect(&pts.front()->in);
-            for (std::size_t i = 0; i + 1 < pts.size(); ++i) { pts[i]->connect("out", pts[i + 1], "in"); }
+            for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+                pts[i]->connect("out", pts[i + 1], "in");
+            }
             pts.back()->connect("out", sink, "in");
         }
-        for (auto& p : pts) { p->start(); }
+        for (auto& p : pts) {
+            p->start();
+        }
         sink->start();
 
         const int trials = 100;
@@ -247,18 +282,21 @@ void bench_latency_hops() {
         lat_us.reserve(trials);
         std::uint64_t expect = 0;
         for (int t = 0; t < trials; ++t) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));  // let the chain go idle (armed + sleeping)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2)); // let the chain go idle (armed + sleeping)
             ++expect;
             auto t0 = clk::now();
             inject.send_data(make_immutable<float>({1.0F}), timestamp{});
             const auto deadline = clk::now() + std::chrono::seconds(2);
-            while (sink->received.load(std::memory_order_acquire) < expect && clk::now() < deadline) { }
+            while (sink->received.load(std::memory_order_acquire) < expect && clk::now() < deadline) {
+            }
             lat_us.push_back(std::chrono::duration<double>(clk::now() - t0).count() * 1e6);
         }
         std::sort(lat_us.begin(), lat_us.end());
-        std::printf("%-8d %14.1f %14.1f %14.1f %17dms\n", N,
-                    lat_us[trials / 2], lat_us[(trials * 99) / 100], lat_us.back(), N * 50);
-        for (auto& p : pts) { p->stop(); }
+        std::printf("%-8d %14.1f %14.1f %14.1f %17dms\n", N, lat_us[trials / 2], lat_us[(trials * 99) / 100],
+                    lat_us.back(), N * 50);
+        for (auto& p : pts) {
+            p->stop();
+        }
         sink->stop();
     }
 }
@@ -275,7 +313,9 @@ void bench_throughput_hops() {
     std::printf("%-8s %14s %14s %10s\n", "hops(N)", "Mpkt/s(recv)", "ns/pkt(recv)", "drop%");
     for (int N : {1, 2, 4}) {
         std::vector<std::shared_ptr<bench_passthrough>> pts;
-        for (int i = 0; i < N - 1; ++i) { pts.push_back(std::make_shared<bench_passthrough>("pt" + std::to_string(i))); }
+        for (int i = 0; i < N - 1; ++i) {
+            pts.push_back(std::make_shared<bench_passthrough>("pt" + std::to_string(i)));
+        }
         auto sink = std::make_shared<bench_sink>("sink");
         output_port<immutable_buffer<float>> inject{"inject"};
         input_port<immutable_buffer<float>>* head = pts.empty() ? &sink->in : &pts.front()->in;
@@ -283,10 +323,14 @@ void bench_throughput_hops() {
             inject.connect(&sink->in);
         } else {
             inject.connect(&pts.front()->in);
-            for (std::size_t i = 0; i + 1 < pts.size(); ++i) { pts[i]->connect("out", pts[i + 1], "in"); }
+            for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+                pts[i]->connect("out", pts[i + 1], "in");
+            }
             pts.back()->connect("out", sink, "in");
         }
-        for (auto& p : pts) { p->start(); }
+        for (auto& p : pts) {
+            p->start();
+        }
         sink->start();
 
         auto t0 = clk::now();
@@ -294,17 +338,21 @@ void bench_throughput_hops() {
         const auto deadline = t0 + std::chrono::duration<double>(g_seconds);
         while (clk::now() < deadline) {
             for (int b = 0; b < 256; ++b) {
-                while (head->is_full()) { std::this_thread::yield(); }  // first ring: single producer, no drops here
+                while (head->is_full()) {
+                    std::this_thread::yield();
+                } // first ring: single producer, no drops here
                 inject.send_data(make_immutable<float>({static_cast<float>(sent)}), timestamp{});
                 ++sent;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // brief settle for in-flight packets
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // brief settle for in-flight packets
         auto dt = std::chrono::duration<double>(clk::now() - t0).count();
         const double recv = static_cast<double>(sink->received.load(std::memory_order_acquire));
         const double drop_pct = sent > 0 ? 100.0 * (static_cast<double>(sent) - recv) / static_cast<double>(sent) : 0.0;
         std::printf("%-8d %14.2f %14.1f %9.1f%%\n", N, recv / dt / 1e6, recv > 0 ? dt / recv * 1e9 : 0.0, drop_pct);
-        for (auto& p : pts) { p->stop(); }
+        for (auto& p : pts) {
+            p->stop();
+        }
         sink->stop();
     }
 }
@@ -312,10 +360,11 @@ void bench_throughput_hops() {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffer so progress streams
-    if (argc > 1) { g_seconds = std::atof(argv[1]); }
-    std::printf("composite data-path baseline  (sizeof mutable_buffer<float>=%zu)\n",
-                sizeof(mutable_buffer<float>));
+    std::setvbuf(stdout, nullptr, _IOLBF, 0); // line-buffer so progress streams
+    if (argc > 1) {
+        g_seconds = std::atof(argv[1]);
+    }
+    std::printf("composite data-path baseline  (sizeof mutable_buffer<float>=%zu)\n", sizeof(mutable_buffer<float>));
     bench_alloc();
     bench_pool();
     bench_handoff_1to1();

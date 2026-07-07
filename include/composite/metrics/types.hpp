@@ -37,22 +37,21 @@ using labels_t = std::vector<label_pair>;
 /**
  * @brief Metric type enumeration
  */
-enum class metric_type {
-    counter,
-    updown_counter,
-    gauge,
-    histogram
-};
+enum class metric_type { counter, updown_counter, gauge, histogram };
 
 /**
  * @brief Convert metric type to string
  */
 inline auto to_string(metric_type type) -> std::string_view {
     switch (type) {
-        case metric_type::counter: return "counter";
-        case metric_type::updown_counter: return "updown_counter";
-        case metric_type::gauge: return "gauge";
-        case metric_type::histogram: return "histogram";
+    case metric_type::counter:
+        return "counter";
+    case metric_type::updown_counter:
+        return "updown_counter";
+    case metric_type::gauge:
+        return "gauge";
+    case metric_type::histogram:
+        return "histogram";
     }
     return "unknown";
 }
@@ -125,9 +124,7 @@ public:
     /**
      * @brief Reset counter to zero
      */
-    void reset() noexcept {
-        m_storage.value.store(0, std::memory_order_relaxed);
-    }
+    void reset() noexcept { m_storage.value.store(0, std::memory_order_relaxed); }
 
     // ---- Arithmetic operators ----
 
@@ -219,9 +216,7 @@ public:
     /**
      * @brief Reset counter to zero
      */
-    void reset() noexcept {
-        m_storage.value.store(0, std::memory_order_relaxed);
-    }
+    void reset() noexcept { m_storage.value.store(0, std::memory_order_relaxed); }
 
     // ---- Arithmetic operators ----
 
@@ -394,8 +389,7 @@ public:
      *        [0,10), [10,50), [50,100), [100,500), [500,1000), [1000,+inf)
      */
     explicit histogram(std::vector<double> boundaries)
-        : m_boundaries(std::move(boundaries))
-        , m_buckets(m_boundaries.size() + 1)  // +1 for overflow bucket
+        : m_boundaries(std::move(boundaries)), m_buckets(m_boundaries.size() + 1) // +1 for overflow bucket
     {}
 
     /**
@@ -429,9 +423,7 @@ public:
      * Call this after constructing with power_of_2_boundaries() to enable
      * O(1) bucket lookup via bit manipulation.
      */
-    void enable_power_of_2_lookup() noexcept {
-        m_power_of_2 = true;
-    }
+    void enable_power_of_2_lookup() noexcept { m_power_of_2 = true; }
 
     /**
      * @brief Record a value in the histogram
@@ -541,7 +533,7 @@ private:
     std::vector<double> m_boundaries;
     std::vector<aligned_atomic<uint64_t>> m_buckets;
     aligned_atomic<uint64_t> m_count{};
-    aligned_atomic<uint64_t> m_sum{};  // Stored as bits of double
+    aligned_atomic<uint64_t> m_sum{}; // Stored as bits of double
     bool m_power_of_2{false};
 };
 

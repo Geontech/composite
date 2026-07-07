@@ -36,12 +36,10 @@ namespace composite {
  * - Must have size() method returning std::size_t or convertible to std::size_t
  * - Must be copyable (required for mutable_buffer::copy())
  */
-template<typename Container, typename T>
+template <typename Container, typename T>
 concept ValidBufferContainer =
-    std::ranges::contiguous_range<Container> &&
-    std::same_as<typename Container::value_type, T> &&
-    std::copyable<Container> &&
-    requires(Container c) {
+    std::ranges::contiguous_range<Container> && std::same_as<typename Container::value_type, T> &&
+    std::copyable<Container> && requires(Container c) {
         { c.data() } -> std::convertible_to<T*>;
         { c.size() } -> std::convertible_to<std::size_t>;
     };
@@ -61,17 +59,17 @@ concept ValidBufferContainer =
  * - shrink_to_fit(): Reduce capacity to size
  * - clear(): Remove all elements
  */
-template<typename Container>
-concept DynamicBufferContainer =
-    requires(Container c) {
-        { c.resize(std::size_t{}) } -> std::same_as<void>;
-        { c.reserve(std::size_t{}) } -> std::same_as<void>;
-        { c.capacity() } -> std::convertible_to<std::size_t>;
-        { c.shrink_to_fit() } -> std::same_as<void>;
-        { c.clear() } -> std::same_as<void>;
-    };
+template <typename Container>
+concept DynamicBufferContainer = requires(Container c) {
+    { c.resize(std::size_t{}) } -> std::same_as<void>;
+    { c.reserve(std::size_t{}) } -> std::same_as<void>;
+    { c.capacity() } -> std::convertible_to<std::size_t>;
+    { c.shrink_to_fit() } -> std::same_as<void>;
+    { c.clear() } -> std::same_as<void>;
+};
 
-template <typename T> class mutable_buffer;
+template <typename T>
+class mutable_buffer;
 
 // ============================================================================
 // Buffer Ownership Wrappers
@@ -108,11 +106,10 @@ public:
      * Takes shared ownership of the container. Multiple immutable_buffers can
      * reference the same underlying container safely.
      */
-    template<ValidBufferContainer<T> Container>
-    explicit immutable_buffer(std::shared_ptr<Container> data) :
-      m_data(std::static_pointer_cast<const void>(data)),
-      m_span(make_byte_span(data->data(), data->size())),
-      m_size(data->size()) {}
+    template <ValidBufferContainer<T> Container>
+    explicit immutable_buffer(std::shared_ptr<Container> data)
+        : m_data(std::static_pointer_cast<const void>(data)), m_span(make_byte_span(data->data(), data->size())),
+          m_size(data->size()) {}
 
     /**
      * @brief Construct from unique_ptr (promotes to shared ownership)
@@ -122,9 +119,9 @@ public:
      * Takes ownership and promotes to shared ownership. This enables creating
      * an immutable buffer from exclusively-owned data.
      */
-    template<ValidBufferContainer<T> Container>
-    explicit immutable_buffer(std::unique_ptr<Container> data) :
-      immutable_buffer(std::shared_ptr<Container>(std::move(data))) {}
+    template <ValidBufferContainer<T> Container>
+    explicit immutable_buffer(std::unique_ptr<Container> data)
+        : immutable_buffer(std::shared_ptr<Container>(std::move(data))) {}
 
     /**
      * @brief Construct from external_buffer without additional allocation.
@@ -136,10 +133,8 @@ public:
      *
      * The external_buffer can be passed by value (moved) for optimal performance.
      */
-    explicit immutable_buffer(external_buffer<T> buf) :
-      m_data(buf.ownership_handle()),
-      m_span(make_byte_span(buf.data(), buf.size())),
-      m_size(buf.size()) {}
+    explicit immutable_buffer(external_buffer<T> buf)
+        : m_data(buf.ownership_handle()), m_span(make_byte_span(buf.data(), buf.size())), m_size(buf.size()) {}
 
     /**
      * @brief Copy constructor - shares ownership (cheap, only increments refcount)
@@ -171,26 +166,20 @@ public:
      * @brief Get const pointer to underlying data
      * @return Const pointer to first element
      */
-    auto data() const -> const T* {
-        return reinterpret_cast<const T*>(m_span.data());
-    }
+    auto data() const -> const T* { return reinterpret_cast<const T*>(m_span.data()); }
 
     /**
      * @brief Get a std::span view of the buffer
      * @return Read-only span over all elements
      */
-    auto as_span() const -> std::span<const T> {
-        return std::span<const T>{data(), size()};
-    }
+    auto as_span() const -> std::span<const T> { return std::span<const T>{data(), size()}; }
 
     /**
      * @brief Unchecked element access
      * @param idx Element index
      * @return Const reference to element at index
      */
-    auto operator[](std::size_t idx) const -> const T& {
-        return data()[idx];
-    }
+    auto operator[](std::size_t idx) const -> const T& { return data()[idx]; }
 
     /**
      * @brief Bounds-checked element access
@@ -200,9 +189,7 @@ public:
      */
     auto at(std::size_t idx) const -> const T& {
         if (idx >= m_size) {
-            throw std::out_of_range(
-              std::format("buffer index out of range: {} >= {}", idx, m_size)
-            );
+            throw std::out_of_range(std::format("buffer index out of range: {} >= {}", idx, m_size));
         }
         return data()[idx];
     }
@@ -267,9 +254,7 @@ public:
 
         // Validate offset
         if (offset > m_size) {
-            throw std::out_of_range(
-                std::format("slice offset {} exceeds buffer size {}", offset, m_size)
-            );
+            throw std::out_of_range(std::format("slice offset {} exceeds buffer size {}", offset, m_size));
         }
 
         // Calculate actual count (handle npos = "to end")
@@ -283,16 +268,14 @@ public:
         // the message — that sum can itself overflow.)
         if (actual_count > m_size - offset) {
             throw std::out_of_range(
-                std::format("slice range offset {} + count {} exceeds buffer size {}",
-                           offset, actual_count, m_size)
-            );
+                std::format("slice range offset {} + count {} exceeds buffer size {}", offset, actual_count, m_size));
         }
         // With actual_count <= m_size - offset, the byte multiplications below are
         // bounded by m_size * sizeof(T) (the allocated extent) and cannot overflow.
 
         // Create slice sharing same data
         immutable_buffer result;
-        result.m_data = m_data;  // Share ownership
+        result.m_data = m_data; // Share ownership
         result.m_size = actual_count;
 
         // Create subspan of the byte span
@@ -312,9 +295,7 @@ public:
      * @return New immutable_buffer viewing from offset to end
      * @throws std::out_of_range if offset exceeds buffer size
      */
-    auto slice_from(std::size_t offset) const -> immutable_buffer {
-        return slice(offset, npos);
-    }
+    auto slice_from(std::size_t offset) const -> immutable_buffer { return slice(offset, npos); }
 
     /**
      * @brief Sentinel value for slice() meaning "to end of buffer"
@@ -364,9 +345,9 @@ private:
         return std::as_bytes(std::span{ptr, n});
     }
 
-    std::shared_ptr<const void> m_data;     ///< Type-erased immutable container
-    std::span<const std::byte> m_span;      ///< View into raw bytes for type-safe access
-    std::size_t m_size{0};                  ///< Number of elements (not bytes)
+    std::shared_ptr<const void> m_data; ///< Type-erased immutable container
+    std::span<const std::byte> m_span;  ///< View into raw bytes for type-safe access
+    std::size_t m_size{0};              ///< Number of elements (not bytes)
 };
 
 /**
@@ -385,7 +366,7 @@ private:
  */
 template <typename T>
 class mutable_buffer {
-    using deleter_type = void(*)(void*);
+    using deleter_type = void (*)(void*);
 
     /**
      * @brief Per-Container operation table (a manual "vtable").
@@ -398,17 +379,17 @@ class mutable_buffer {
      * operations are nullptr for containers that are not DynamicBufferContainer.
      */
     struct buffer_ops {
-        std::unique_ptr<void, deleter_type> (*copy)(const void*);  ///< deep-copy the container
-        T* (*data_accessor)(void*);                                ///< container -> element pointer
-        void (*resize)(void*, std::size_t);                        ///< nullptr unless dynamic
-        void (*reserve)(void*, std::size_t);                       ///< nullptr unless dynamic
-        std::size_t (*capacity)(const void*);                      ///< nullptr unless dynamic
-        void (*shrink)(void*);                                     ///< nullptr unless dynamic
-        void (*clear)(void*);                                      ///< nullptr unless dynamic
+        std::unique_ptr<void, deleter_type> (*copy)(const void*); ///< deep-copy the container
+        T* (*data_accessor)(void*);                               ///< container -> element pointer
+        void (*resize)(void*, std::size_t);                       ///< nullptr unless dynamic
+        void (*reserve)(void*, std::size_t);                      ///< nullptr unless dynamic
+        std::size_t (*capacity)(const void*);                     ///< nullptr unless dynamic
+        void (*shrink)(void*);                                    ///< nullptr unless dynamic
+        void (*clear)(void*);                                     ///< nullptr unless dynamic
     };
 
     /// Return the single static ops table for a given Container type.
-    template<ValidBufferContainer<T> Container>
+    template <ValidBufferContainer<T> Container>
     static auto ops_for() -> const buffer_ops* {
         static const buffer_ops ops = [] {
             buffer_ops o{};
@@ -417,20 +398,19 @@ class mutable_buffer {
                 auto nc = std::make_unique<Container>(*s);
                 return {nc.release(), [](void* p) { delete static_cast<Container*>(p); }};
             };
-            o.data_accessor = [](void* p) -> T* {
-                return static_cast<Container*>(p)->data();
-            };
+            o.data_accessor = [](void* p) -> T* { return static_cast<Container*>(p)->data(); };
             if constexpr (DynamicBufferContainer<Container>) {
-                o.resize   = [](void* p, std::size_t n) { static_cast<Container*>(p)->resize(n); };
-                o.reserve  = [](void* p, std::size_t n) { static_cast<Container*>(p)->reserve(n); };
+                o.resize = [](void* p, std::size_t n) { static_cast<Container*>(p)->resize(n); };
+                o.reserve = [](void* p, std::size_t n) { static_cast<Container*>(p)->reserve(n); };
                 o.capacity = [](const void* p) -> std::size_t { return static_cast<const Container*>(p)->capacity(); };
-                o.shrink   = [](void* p) { static_cast<Container*>(p)->shrink_to_fit(); };
-                o.clear    = [](void* p) { static_cast<Container*>(p)->clear(); };
+                o.shrink = [](void* p) { static_cast<Container*>(p)->shrink_to_fit(); };
+                o.clear = [](void* p) { static_cast<Container*>(p)->clear(); };
             }
             return o;
         }();
         return &ops;
     }
+
 public:
     using value_type = T;
 
@@ -448,18 +428,12 @@ public:
      * deleter, copier, and data accessor functions. If Container satisfies
      * DynamicBufferContainer, also enables resize/reserve/capacity operations.
      */
-    template<ValidBufferContainer<T> Container>
-    explicit mutable_buffer(std::unique_ptr<Container> data) :
-        m_data(data.release(), [](void* p) {
-            delete static_cast<Container*>(p);
-        }),
-        m_size(static_cast<Container*>(m_data.get())->size()),
-        m_span_mut(std::as_writable_bytes(std::span{
-            static_cast<Container*>(m_data.get())->data(),
-            m_size
-        })),
-        m_ops(ops_for<Container>())
-    {}
+    template <ValidBufferContainer<T> Container>
+    explicit mutable_buffer(std::unique_ptr<Container> data)
+        : m_data(data.release(), [](void* p) { delete static_cast<Container*>(p); }),
+          m_size(static_cast<Container*>(m_data.get())->size()),
+          m_span_mut(std::as_writable_bytes(std::span{static_cast<Container*>(m_data.get())->data(), m_size})),
+          m_ops(ops_for<Container>()) {}
 
     /**
      * @brief Copy constructor - deleted (move-only, use copy() for deep copy)
@@ -476,10 +450,7 @@ public:
      * @param other Buffer to move from (will be left in empty state)
      */
     mutable_buffer(mutable_buffer&& other) noexcept
-        : m_data(std::move(other.m_data)),
-          m_size(other.m_size),
-          m_span_mut(other.m_span_mut),
-          m_ops(other.m_ops) {
+        : m_data(std::move(other.m_data)), m_size(other.m_size), m_span_mut(other.m_span_mut), m_ops(other.m_ops) {
         // Reset moved-from object to empty state
         other.m_size = 0;
         other.m_span_mut = {};
@@ -514,33 +485,25 @@ public:
      * @brief Get mutable pointer to underlying data
      * @return Pointer to first element, or nullptr if buffer is empty
      */
-    auto data() -> T* {
-        return m_data ? reinterpret_cast<T*>(m_span_mut.data()) : nullptr;
-    }
+    auto data() -> T* { return m_data ? reinterpret_cast<T*>(m_span_mut.data()) : nullptr; }
 
     /**
      * @brief Get const pointer to underlying data
      * @return Const pointer to first element, or nullptr if buffer is empty
      */
-    auto data() const -> const T* {
-        return m_data ? reinterpret_cast<const T*>(m_span_mut.data()) : nullptr;
-    }
+    auto data() const -> const T* { return m_data ? reinterpret_cast<const T*>(m_span_mut.data()) : nullptr; }
 
     /**
      * @brief Get a std::span view of the buffer (mutable)
      * @return Mutable span over all elements
      */
-    auto as_span() -> std::span<T> {
-        return std::span<T>{data(), size()};
-    }
+    auto as_span() -> std::span<T> { return std::span<T>{data(), size()}; }
 
     /**
      * @brief Get a std::span view of the buffer (const)
      * @return Read-only span over all elements
      */
-    auto as_span() const -> std::span<const T> {
-        return std::span<const T>{data(), size()};
-    }
+    auto as_span() const -> std::span<const T> { return std::span<const T>{data(), size()}; }
 
     /**
      * @brief Unchecked mutable element access
@@ -564,9 +527,7 @@ public:
      */
     auto at(std::size_t idx) -> T& {
         if (idx >= m_size) {
-            throw std::out_of_range(
-              std::format("buffer index out of range: {} >= {}", idx, m_size)
-            );
+            throw std::out_of_range(std::format("buffer index out of range: {} >= {}", idx, m_size));
         }
         return data()[idx];
     }
@@ -579,9 +540,7 @@ public:
      */
     auto at(std::size_t idx) const -> const T& {
         if (idx >= m_size) {
-            throw std::out_of_range(
-              std::format("buffer index out of range: {} >= {}", idx, m_size)
-            );
+            throw std::out_of_range(std::format("buffer index out of range: {} >= {}", idx, m_size));
         }
         return data()[idx];
     }
@@ -620,7 +579,9 @@ public:
      */
     auto copy() const -> mutable_buffer {
         mutable_buffer result;
-        if (empty()) { return result; }
+        if (empty()) {
+            return result;
+        }
 
         // Use the per-Container ops table to deep-copy the container
         result.m_data = m_ops->copy(m_data.get());
@@ -628,10 +589,7 @@ public:
         result.m_ops = m_ops;
 
         // Use the data accessor to get the actual data pointer from the container
-        result.m_span_mut = std::as_writable_bytes(std::span{
-            m_ops->data_accessor(result.m_data.get()),
-            m_size
-        });
+        result.m_span_mut = std::as_writable_bytes(std::span{m_ops->data_accessor(result.m_data.get()), m_size});
         return result;
     }
 
@@ -706,9 +664,7 @@ public:
         constexpr auto max_size = std::numeric_limits<std::size_t>::max() / sizeof(T);
         if (size > max_size) {
             throw std::overflow_error(
-                std::format("mutable_buffer::to_immutable: size {} exceeds maximum {} for type",
-                           size, max_size)
-            );
+                std::format("mutable_buffer::to_immutable: size {} exceeds maximum {} for type", size, max_size));
         }
 
         auto byte_size = size * sizeof(T);
@@ -726,10 +682,7 @@ public:
         immutable_buffer<T> result;
         result.m_data = shared;
         result.m_size = size;
-        result.m_span = std::span<const std::byte>{
-            reinterpret_cast<const std::byte*>(data_ptr),
-            byte_size
-        };
+        result.m_span = std::span<const std::byte>{reinterpret_cast<const std::byte*>(data_ptr), byte_size};
 
         // Reset this buffer to empty state (we've consumed it)
         m_size = 0;
@@ -779,10 +732,7 @@ public:
         m_size = new_size;
 
         // Update span to reflect new size
-        m_span_mut = std::as_writable_bytes(std::span{
-            m_ops->data_accessor(m_data.get()),
-            m_size
-        });
+        m_span_mut = std::as_writable_bytes(std::span{m_ops->data_accessor(m_data.get()), m_size});
     }
 
     /**
@@ -801,10 +751,7 @@ public:
         m_ops->reserve(m_data.get(), new_capacity);
 
         // Update span in case reallocation occurred
-        m_span_mut = std::as_writable_bytes(std::span{
-            m_ops->data_accessor(m_data.get()),
-            m_size
-        });
+        m_span_mut = std::as_writable_bytes(std::span{m_ops->data_accessor(m_data.get()), m_size});
     }
 
     /**
@@ -827,16 +774,13 @@ public:
      */
     auto shrink_to_fit() -> void {
         if (!m_data || !m_ops || !m_ops->shrink) {
-            return;  // No-op for empty buffers
+            return; // No-op for empty buffers
         }
 
         m_ops->shrink(m_data.get());
 
         // Update span in case reallocation occurred
-        m_span_mut = std::as_writable_bytes(std::span{
-            m_ops->data_accessor(m_data.get()),
-            m_size
-        });
+        m_span_mut = std::as_writable_bytes(std::span{m_ops->data_accessor(m_data.get()), m_size});
     }
 
     /**
@@ -847,7 +791,7 @@ public:
      */
     auto clear() -> void {
         if (!m_data || !m_ops || !m_ops->clear) {
-            return;  // No-op for empty buffers
+            return; // No-op for empty buffers
         }
 
         m_ops->clear(m_data.get());
@@ -869,9 +813,7 @@ public:
      */
     auto truncate(std::size_t new_size) -> void {
         if (new_size > m_size) {
-            throw std::out_of_range(
-              std::format("truncate size {} exceeds current size {}", new_size, m_size)
-            );
+            throw std::out_of_range(std::format("truncate size {} exceeds current size {}", new_size, m_size));
         }
         m_size = new_size;
         m_span_mut = m_span_mut.subspan(0, new_size * sizeof(T));
@@ -880,10 +822,10 @@ public:
 private:
     friend class immutable_buffer<T>;
 
-    std::unique_ptr<void, deleter_type> m_data{nullptr, [](void*){}};   ///< Type-erased container with custom deleter
-    std::size_t m_size{};                                               ///< Number of elements (not bytes)
-    std::span<std::byte> m_span_mut;                                    ///< Mutable view into raw bytes
-    const buffer_ops* m_ops{nullptr};                                   ///< Per-Container static vtable (copy/data/resize/reserve/capacity/shrink/clear)
+    std::unique_ptr<void, deleter_type> m_data{nullptr, [](void*) {}}; ///< Type-erased container with custom deleter
+    std::size_t m_size{};                                              ///< Number of elements (not bytes)
+    std::span<std::byte> m_span_mut;                                   ///< Mutable view into raw bytes
+    const buffer_ops* m_ops{nullptr}; ///< Per-Container static vtable (copy/data/resize/reserve/capacity/shrink/clear)
 };
 
 // ============================================================================
@@ -899,7 +841,7 @@ private:
  * This is the most common way to create a mutable buffer. The underlying
  * std::vector is heap-allocated and supports dynamic resizing.
  */
-template<typename T>
+template <typename T>
 auto make_mutable(std::size_t size) -> mutable_buffer<T> {
     return mutable_buffer<T>(std::make_unique<std::vector<T>>(size));
 }
@@ -913,7 +855,7 @@ auto make_mutable(std::size_t size) -> mutable_buffer<T> {
  * Convenient for creating buffers from literal values:
  * auto buf = make_mutable<float>({1.0f, 2.0f, 3.0f});
  */
-template<typename T>
+template <typename T>
 auto make_mutable(std::initializer_list<T> init) -> mutable_buffer<T> {
     return mutable_buffer<T>(std::make_unique<std::vector<T>>(init));
 }
@@ -927,7 +869,7 @@ auto make_mutable(std::initializer_list<T> init) -> mutable_buffer<T> {
  * Creates an immutable buffer directly. Useful when you know the data
  * won't be modified and want to enable zero-copy sharing from the start.
  */
-template<typename T>
+template <typename T>
 auto make_immutable(std::size_t size) -> immutable_buffer<T> {
     return immutable_buffer<T>(std::make_shared<std::vector<T>>(size));
 }
@@ -941,7 +883,7 @@ auto make_immutable(std::size_t size) -> immutable_buffer<T> {
  * Convenient for creating immutable buffers from literal values:
  * auto buf = make_immutable<int>({10, 20, 30, 40});
  */
-template<typename T>
+template <typename T>
 auto make_immutable(std::initializer_list<T> init) -> immutable_buffer<T> {
     return immutable_buffer<T>(std::make_shared<std::vector<T>>(init));
 }
@@ -956,10 +898,9 @@ auto make_immutable(std::initializer_list<T> init) -> immutable_buffer<T> {
  * Useful when you have a specialized container (like std::array or
  * a custom SIMD-aligned container) and want buffer semantics.
  */
-template<typename Container>
-requires ValidBufferContainer<Container, typename Container::value_type>
-auto wrap_mutable(std::unique_ptr<Container> container)
-  -> mutable_buffer<typename Container::value_type> {
+template <typename Container>
+    requires ValidBufferContainer<Container, typename Container::value_type>
+auto wrap_mutable(std::unique_ptr<Container> container) -> mutable_buffer<typename Container::value_type> {
     return mutable_buffer<typename Container::value_type>(std::move(container));
 }
 
@@ -973,10 +914,9 @@ auto wrap_mutable(std::unique_ptr<Container> container)
  * Since immutable buffers use shared ownership, the container must already
  * be in a shared_ptr.
  */
-template<typename Container>
-requires ValidBufferContainer<Container, typename Container::value_type>
-auto wrap_immutable(std::shared_ptr<Container> container)
-  -> immutable_buffer<typename Container::value_type> {
+template <typename Container>
+    requires ValidBufferContainer<Container, typename Container::value_type>
+auto wrap_immutable(std::shared_ptr<Container> container) -> immutable_buffer<typename Container::value_type> {
     return immutable_buffer<typename Container::value_type>(container);
 }
 
@@ -1006,7 +946,7 @@ auto wrap_immutable(std::shared_ptr<Container> container)
  * buffer.reserve(4096); // Pre-allocate aligned memory
  * @endcode
  */
-template<typename T>
+template <typename T>
 auto make_aligned_buffer(std::size_t alignment, std::size_t count) -> mutable_buffer<T> {
     return mutable_buffer<T>(make_aligned<T>(alignment, count));
 }
@@ -1034,7 +974,7 @@ auto make_aligned_buffer(std::size_t alignment, std::size_t count) -> mutable_bu
  * auto copy2 = buffer.share();
  * @endcode
  */
-template<typename T>
+template <typename T>
 auto make_aligned_immutable_buffer(std::size_t alignment, std::size_t count) -> immutable_buffer<T> {
     // Create mutable first, then convert to immutable
     return make_aligned_buffer<T>(alignment, count).to_immutable();

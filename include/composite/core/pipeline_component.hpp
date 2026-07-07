@@ -83,9 +83,7 @@ public:
     using in_t = InBuf;
     using out_t = OutBuf;
 
-    explicit pipeline_component(std::string_view id,
-                                std::string in_name = "in",
-                                std::string out_name = "out",
+    explicit pipeline_component(std::string_view id, std::string in_name = "in", std::string out_name = "out",
                                 int default_workers = 2)
         : component(id), m_in(in_name), m_out(out_name), m_num_workers(default_workers) {
         add_port(m_in);
@@ -105,10 +103,10 @@ public:
     // call the private start_locked()/stop_locked(), which the virtual start()/stop() would bypass).
     // Overriding start()/stop() instead would leave the pool un-started when launched via the app.
     auto on_worker_start() -> void override {
-        start_pool();  // workers ready before the main (ingest/retire) worker begins
+        start_pool(); // workers ready before the main (ingest/retire) worker begins
     }
     auto on_worker_stop() -> void override {
-        stop_pool();   // main worker already joined by the base; now stop + join the pool
+        stop_pool(); // main worker already joined by the base; now stop + join the pool
     }
 
 protected:
@@ -134,9 +132,7 @@ protected:
     /// changed the config it reads): the cached prepared metadata is rebuilt for the next
     /// ingested packet even if the incoming metadata instance is unchanged. Callable from
     /// any thread (property on_change hooks included).
-    auto invalidate_prepared_metadata() -> void {
-        m_prepare_dirty.store(true, std::memory_order_release);
-    }
+    auto invalidate_prepared_metadata() -> void { m_prepare_dirty.store(true, std::memory_order_release); }
 
     /// Called once on the main thread after the pool is (re)sized, to (re)build
     /// per-worker state. Default: no-op.
@@ -151,10 +147,15 @@ protected:
     // ---- the ingest / retire loop (runs on the component's single worker) ----
     auto process() -> retval final {
         using enum retval;
-        { std::scoped_lock lk{m_mtx}; m_park_pending = false; }
+        {
+            std::scoped_lock lk{m_mtx};
+            m_park_pending = false;
+        }
 
         // 0) Apply a pending num_workers change (drains in-flight, rebuilds the pool).
-        if (m_resize_pending.exchange(false, std::memory_order_acq_rel)) { do_resize(); }
+        if (m_resize_pending.exchange(false, std::memory_order_acq_rel)) {
+            do_resize();
+        }
 
         // 1) Retire DONE slots in submission order (finalize + send, main thread). Pace against a full
         //    downstream: if a finalized packet cannot be sent right now, STOP retiring and AWAIT_OUTPUT
@@ -162,7 +163,9 @@ protected:
         //    silently drops-on-full and §2.1's FINISH then reports finish_reason::completed having lost
         //    data — silent truncation on the exact batch/file use case §2.1 exists to enable.
         auto rr = retire_ready();
-        if (rr.blocked_on_output) { return AWAIT_OUTPUT; }
+        if (rr.blocked_on_output) {
+            return AWAIT_OUTPUT;
+        }
         bool progress = rr.retired_any;
 
         // 2) Ingest one packet into a free slot (arrival order), if room + data. try_get() (not
@@ -170,33 +173,41 @@ protected:
         //    than mistaken for an empty ring and silently dropped — §2.1's FINISH would otherwise make
         //    that loss terminal (a lost EOF/flush marker reported as a clean completion).
         bool have_free{};
-        { std::scoped_lock lk{m_mtx}; have_free = (m_submit - m_retire) < m_cap; }
+        {
+            std::scoped_lock lk{m_mtx};
+            have_free = (m_submit - m_retire) < m_cap;
+        }
         if (have_free) {
             if (auto pkt = m_in.try_get()) {
                 auto& [in, ts, md] = *pkt;
-                slot& s = m_ring[m_submit & m_mask];  // FREE; owned by main until READY published
+                slot& s = m_ring[m_submit & m_mask]; // FREE; owned by main until READY published
                 s.in = std::move(in);
                 s.ts = ts;
-                s.md = prepared_metadata(md);  // shared across packets; prepare() runs per CHANGE
+                s.md = prepared_metadata(md); // shared across packets; prepare() runs per CHANGE
                 s.err = nullptr;
                 s.state.store(slot::READY, std::memory_order_release);
-                { std::scoped_lock lk{m_mtx}; ++m_submit; }
+                {
+                    std::scoped_lock lk{m_mtx};
+                    ++m_submit;
+                }
                 m_work_cv.notify_one();
                 progress = true;
             }
         }
 
-        if (progress) { return NORMAL; }
+        if (progress) {
+            return NORMAL;
+        }
 
         // 3) Nothing to do right now. If work is in flight, wait event-driven for
         //    the head slot to complete (interrupted by a park request / stop).
         std::unique_lock lk{m_mtx};
         if (m_submit > m_retire) {
             m_done_cv.wait_for(lk, std::chrono::milliseconds(20), [this] {
-                return m_ring[m_retire & m_mask].state.load(std::memory_order_acquire) == slot::DONE
-                       || m_park_pending || m_pool_stop.load(std::memory_order_acquire);
+                return m_ring[m_retire & m_mask].state.load(std::memory_order_acquire) == slot::DONE ||
+                       m_park_pending || m_pool_stop.load(std::memory_order_acquire);
             });
-            return NORMAL;  // re-enter to retire whatever completed
+            return NORMAL; // re-enter to retire whatever completed
         }
         lk.unlock();
         // Truly idle: no input available AND nothing in flight (m_submit == m_retire, so no packet is
@@ -207,14 +218,19 @@ protected:
         // flagship adopters) could NEVER self-terminate, so a batch/file graph built on it would hang
         // application::wait_until_finished() and burn the full drain_stop() timeout even after the
         // source finished.
-        if (inputs_at_end()) { return FINISH; }
-        return NOOP;  // idle but the stream is still open — wait for more input
+        if (inputs_at_end()) {
+            return FINISH;
+        }
+        return NOOP; // idle but the stream is still open — wait for more input
     }
 
     /// Wake the main worker (and pool) so a property write / stop quiesces promptly
     /// even while the main worker is waiting on the done-CV.
     auto on_park_requested() -> void override {
-        { std::scoped_lock lk{m_mtx}; m_park_pending = true; }
+        {
+            std::scoped_lock lk{m_mtx};
+            m_park_pending = true;
+        }
         m_done_cv.notify_all();
         m_work_cv.notify_all();
     }
@@ -226,7 +242,7 @@ private:
         in_t in{};
         out_t out{};
         timestamp ts{};
-        composite::metadata_ptr md{};  ///< shared prepared metadata; always non-null once submitted
+        composite::metadata_ptr md{}; ///< shared prepared metadata; always non-null once submitted
         std::exception_ptr err{};
         // Retire-time latches (main-thread only): finalize() runs exactly once per slot even if the
         // send is deferred across an AWAIT_OUTPUT round-trip; `keep` records its decision so a DROPPED
@@ -237,7 +253,9 @@ private:
 
     static auto round_up_pow2(std::size_t n) -> std::size_t {
         std::size_t p = 1;
-        while (p < n) { p <<= 1; }
+        while (p < n) {
+            p <<= 1;
+        }
         return p;
     }
 
@@ -257,7 +275,7 @@ private:
         try {
             prepare(working);
         } catch (...) {
-            m_prepare_dirty.store(true, std::memory_order_release);  // retry on the next packet
+            m_prepare_dirty.store(true, std::memory_order_release); // retry on the next packet
             throw;
         }
         m_last_in_md = in_md;
@@ -266,8 +284,8 @@ private:
     }
 
     struct retire_result {
-        bool retired_any{false};     ///< at least one slot was finalized+sent (or an errored slot logged)
-        bool blocked_on_output{false};///< head slot is DONE but the output is full — caller should AWAIT_OUTPUT
+        bool retired_any{false};       ///< at least one slot was finalized+sent (or an errored slot logged)
+        bool blocked_on_output{false}; ///< head slot is DONE but the output is full — caller should AWAIT_OUTPUT
     };
 
     /// Retire currently-DONE slots in submission order (finalize + send). Stops early — WITHOUT
@@ -279,15 +297,23 @@ private:
             std::size_t r{};
             {
                 std::scoped_lock lk{m_mtx};
-                if (m_retire >= m_submit) { break; }
+                if (m_retire >= m_submit) {
+                    break;
+                }
                 r = m_retire;
             }
             slot& s = m_ring[r & m_mask];
-            if (s.state.load(std::memory_order_acquire) != slot::DONE) { break; }  // head not finished
+            if (s.state.load(std::memory_order_acquire) != slot::DONE) {
+                break;
+            } // head not finished
             if (s.err) {
-                try { std::rethrow_exception(s.err); }
-                catch (const std::exception& e) { logger()->error("pipeline work() threw: {} (packet dropped)", e.what()); }
-                catch (...) { logger()->error("pipeline work() threw unknown exception (packet dropped)"); }
+                try {
+                    std::rethrow_exception(s.err);
+                } catch (const std::exception& e) {
+                    logger()->error("pipeline work() threw: {} (packet dropped)", e.what());
+                } catch (...) {
+                    logger()->error("pipeline work() threw unknown exception (packet dropped)");
+                }
                 s.err = nullptr;
             } else {
                 // Decide keep/drop FIRST (exactly once — latched), THEN pace only a KEEP packet
@@ -319,7 +345,8 @@ private:
                     if (m_out.producer_is_connected() && !m_out.producer_can_send()) {
                         return {any, /*blocked_on_output=*/true};
                     }
-                    m_out.send_data(std::move(s.out), s.ts, s.md);  // refcount bump; slot keeps its ref until reset below
+                    m_out.send_data(std::move(s.out), s.ts,
+                                    s.md); // refcount bump; slot keeps its ref until reset below
                 }
             }
             s.in = in_t{};
@@ -328,7 +355,10 @@ private:
             s.finalized = false;
             s.keep = false;
             s.state.store(slot::FREE, std::memory_order_release);
-            { std::scoped_lock lk{m_mtx}; ++m_retire; }
+            {
+                std::scoped_lock lk{m_mtx};
+                ++m_retire;
+            }
             any = true;
         }
         return {any, false};
@@ -339,7 +369,9 @@ private:
     /// size. Runs between process() iterations, never mid-packet.
     auto do_resize() -> void {
         const int n = m_num_workers < 1 ? 1 : m_num_workers;
-        if (static_cast<int>(m_pool.size()) == n) { return; }  // no actual change
+        if (static_cast<int>(m_pool.size()) == n) {
+            return;
+        } // no actual change
 
         // Drain: retire everything in flight without ingesting more.
         for (;;) {
@@ -352,25 +384,29 @@ private:
                 return;
             }
             std::unique_lock lk{m_mtx};
-            if (m_submit == m_retire) { break; }  // ring fully drained
+            if (m_submit == m_retire) {
+                break;
+            } // ring fully drained
             m_done_cv.wait_for(lk, std::chrono::milliseconds(20), [this] {
-                return m_ring[m_retire & m_mask].state.load(std::memory_order_acquire) == slot::DONE
-                       || m_park_pending || m_pool_stop.load(std::memory_order_acquire);
+                return m_ring[m_retire & m_mask].state.load(std::memory_order_acquire) == slot::DONE ||
+                       m_park_pending || m_pool_stop.load(std::memory_order_acquire);
             });
-            if (m_pool_stop.load(std::memory_order_acquire)) { return; }  // stopping — abandon
-            if (m_park_pending) {  // another park (e.g. a different write) — retry the resize later
+            if (m_pool_stop.load(std::memory_order_acquire)) {
+                return;
+            } // stopping — abandon
+            if (m_park_pending) { // another park (e.g. a different write) — retry the resize later
                 m_resize_pending.store(true, std::memory_order_release);
                 return;
             }
         }
         stop_pool();
-        start_pool();  // rebuilds the ring + spawns the new worker count + on_workers_resized(n)
+        start_pool(); // rebuilds the ring + spawns the new worker count + on_workers_resized(n)
         logger()->debug("pipeline '{}' resized to {} workers", id(), m_pool.size());
     }
 
     auto start_pool() -> void {
         const int n = m_num_workers < 1 ? 1 : m_num_workers;
-        m_cap = round_up_pow2(static_cast<std::size_t>(n) * 2);  // depth = 2x workers (>= 1 slot/worker + headroom)
+        m_cap = round_up_pow2(static_cast<std::size_t>(n) * 2); // depth = 2x workers (>= 1 slot/worker + headroom)
         m_mask = m_cap - 1;
         m_ring = std::make_unique<slot[]>(m_cap);
         m_submit = m_claim = m_retire = 0;
@@ -389,9 +425,11 @@ private:
                 // (start_locked()'s catch reaps it; a resize cannot proceed). The ring is already sized
                 // for the request (larger than the achieved pool — harmless), worker indices stay in
                 // range, and on_workers_resized() below is told the ACTUAL count.
-                if (m_pool.empty()) { throw; }
-                logger()->warn("pipeline '{}': spawned only {}/{} workers ({}); running degraded",
-                               id(), m_pool.size(), n, e.what());
+                if (m_pool.empty()) {
+                    throw;
+                }
+                logger()->warn("pipeline '{}': spawned only {}/{} workers ({}); running degraded", id(), m_pool.size(),
+                               n, e.what());
                 break;
             }
         }
@@ -403,7 +441,11 @@ private:
     auto stop_pool() -> void {
         m_pool_stop.store(true, std::memory_order_release);
         m_work_cv.notify_all();
-        for (auto& t : m_pool) { if (t.joinable()) { t.join(); } }
+        for (auto& t : m_pool) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
         m_pool.clear();
     }
 
@@ -413,11 +455,12 @@ private:
             std::size_t my{};
             {
                 std::unique_lock lk{m_mtx};
-                m_work_cv.wait(lk, [this] {
-                    return m_claim < m_submit || m_pool_stop.load(std::memory_order_acquire);
-                });
-                if (m_pool_stop.load(std::memory_order_acquire)) { return; }
-                my = m_claim++;  // claim this READY slot (only this worker gets it)
+                m_work_cv.wait(lk,
+                               [this] { return m_claim < m_submit || m_pool_stop.load(std::memory_order_acquire); });
+                if (m_pool_stop.load(std::memory_order_acquire)) {
+                    return;
+                }
+                my = m_claim++; // claim this READY slot (only this worker gets it)
             }
             slot& s = m_ring[my & m_mask];
             // s.state == READY here; run the parallel stage outside the lock. The slot holds
@@ -429,7 +472,7 @@ private:
                 s.err = std::current_exception();
             }
             s.state.store(slot::DONE, std::memory_order_release);
-            m_done_cv.notify_one();  // wake the main (retire) thread
+            m_done_cv.notify_one(); // wake the main (retire) thread
         }
     }
 
@@ -441,20 +484,20 @@ private:
     std::size_t m_cap{0};
     std::size_t m_mask{0};
 
-    std::mutex m_mtx;                  ///< guards the submit/claim/retire counters + park_pending
-    std::condition_variable m_work_cv; ///< pool workers wait for READY slots
-    std::condition_variable m_done_cv; ///< main thread waits for the head slot to be DONE
-    std::size_t m_submit{0};           ///< packets submitted (main writes)
-    std::size_t m_claim{0};            ///< packets claimed by workers (workers write)
-    std::size_t m_retire{0};           ///< packets retired (main writes)
-    bool m_park_pending{false};        ///< set by on_park_requested to break the done-wait
-    std::atomic_bool m_resize_pending{false};  ///< set by num_workers on_change; applied by the main worker
+    std::mutex m_mtx;                         ///< guards the submit/claim/retire counters + park_pending
+    std::condition_variable m_work_cv;        ///< pool workers wait for READY slots
+    std::condition_variable m_done_cv;        ///< main thread waits for the head slot to be DONE
+    std::size_t m_submit{0};                  ///< packets submitted (main writes)
+    std::size_t m_claim{0};                   ///< packets claimed by workers (workers write)
+    std::size_t m_retire{0};                  ///< packets retired (main writes)
+    bool m_park_pending{false};               ///< set by on_park_requested to break the done-wait
+    std::atomic_bool m_resize_pending{false}; ///< set by num_workers on_change; applied by the main worker
     std::atomic_bool m_pool_stop{false};
 
     // Prepared-metadata cache (main-thread ingest state; the dirty flag alone is cross-thread).
-    composite::metadata_ptr m_last_in_md{};   ///< incoming instance the cache was built from
-    composite::metadata_ptr m_prepared{};     ///< prepare()'s result, shared by packets until it changes
-    std::atomic_bool m_prepare_dirty{true};   ///< set by invalidate_prepared_metadata()
+    composite::metadata_ptr m_last_in_md{}; ///< incoming instance the cache was built from
+    composite::metadata_ptr m_prepared{};   ///< prepare()'s result, shared by packets until it changes
+    std::atomic_bool m_prepare_dirty{true}; ///< set by invalidate_prepared_metadata()
     std::vector<std::thread> m_pool;
 
     static inline thread_local int t_worker_index{-1};

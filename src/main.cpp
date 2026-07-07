@@ -37,12 +37,8 @@
 namespace composite {
 
 #ifdef COMPOSITE_USE_OPENSSL
-auto make_server(
-  application&,
-  const std::string&,
-  const std::string&,
-  const std::string&
-) -> std::unique_ptr<httplib::Server>;
+auto make_server(application&, const std::string&, const std::string&, const std::string&)
+    -> std::unique_ptr<httplib::Server>;
 #else
 auto make_server(application&) -> std::unique_ptr<httplib::Server>;
 #endif
@@ -54,33 +50,21 @@ auto main(int argc, char** argv) -> int {
     // Argument Parsing
     // ========================================
     auto program = argparse::ArgumentParser{"composite-cli", COMPOSITE_VERSION};
-    program.add_argument("config-file")
-      .help("application configuration file");
-    program.add_argument("-s", "--server")
-      .help("REST server address")
-      .default_value(std::string{"localhost"});
-    program.add_argument("-p", "--port")
-      .help("REST server port")
-      .scan<'i', int>()
-      .default_value(5000);
+    program.add_argument("config-file").help("application configuration file");
+    program.add_argument("-s", "--server").help("REST server address").default_value(std::string{"localhost"});
+    program.add_argument("-p", "--port").help("REST server port").scan<'i', int>().default_value(5000);
 #ifdef COMPOSITE_USE_OPENSSL
     program.add_argument("-a", "--certificate-authority")
-      .help("Path to a cert file for the certificate authority")
-      .default_value(std::string{});
-    program.add_argument("-c", "--client-certificate")
-      .help("Path to a client certificate file for TLS")
-      .required();
-    program.add_argument("-k", "--client-key")
-      .help("Path to a client key file for TLS")
-      .required();
+        .help("Path to a cert file for the certificate authority")
+        .default_value(std::string{});
+    program.add_argument("-c", "--client-certificate").help("Path to a client certificate file for TLS").required();
+    program.add_argument("-k", "--client-key").help("Path to a client key file for TLS").required();
 #endif
     program.add_argument("-l", "--log-level")
-      .help("log level [trace, debug, info, warning, error, critical, off]")
-      .default_value(std::string{"info"});
+        .help("log level [trace, debug, info, warning, error, critical, off]")
+        .default_value(std::string{"info"});
 #ifdef COMPOSITE_USE_DPDK
-    program.add_argument("--list-dpdk-ports")
-      .help("list available DPDK ports and exit")
-      .flag();
+    program.add_argument("--list-dpdk-ports").help("list available DPDK ports and exit").flag();
 #endif
 
     try {
@@ -122,15 +106,14 @@ auto main(int argc, char** argv) -> int {
             }
         }
         spdlog::info("Captured {} available CPU cores for component affinity", available_cores.size());
-        spdlog::debug("Available physical CPU cores: [{}]",
-            [&available_cores]() {
-                std::string result;
-                for (size_t i = 0; i < available_cores.size(); i++) {
-                    if (i > 0) result += ", ";
-                    result += std::to_string(available_cores[i]);
-                }
-                return result;
-            }());
+        spdlog::debug("Available physical CPU cores: [{}]", [&available_cores]() {
+            std::string result;
+            for (size_t i = 0; i < available_cores.size(); i++) {
+                if (i > 0) result += ", ";
+                result += std::to_string(available_cores[i]);
+            }
+            return result;
+        }());
     } else {
         spdlog::warn("Failed to capture available CPUs, component cpu_affinity will not be available");
     }
@@ -178,7 +161,7 @@ auto main(int argc, char** argv) -> int {
         if (app_json.contains("dpdk")) {
             try {
                 dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
-            } catch (const std::exception& e) {  // malformed dpdk block -> clean exit, not terminate
+            } catch (const std::exception& e) { // malformed dpdk block -> clean exit, not terminate
                 spdlog::error("invalid dpdk configuration: {}", e.what());
                 return EXIT_FAILURE;
             }
@@ -201,15 +184,9 @@ auto main(int argc, char** argv) -> int {
             spdlog::info("No ports detected");
         } else {
             for (const auto& port : ports) {
-                spdlog::info(
-                    std::format("Port {}: driver={}, max_rx_queues={}, max_tx_queues={}, socket={}",
-                        port.port_id,
-                        port.driver_name,
-                        port.max_rx_queues,
-                        port.max_tx_queues,
-                        port.socket_id
-                    )
-                );
+                spdlog::info(std::format("Port {}: driver={}, max_rx_queues={}, max_tx_queues={}, socket={}",
+                                         port.port_id, port.driver_name, port.max_rx_queues, port.max_tx_queues,
+                                         port.socket_id));
             }
         }
 
@@ -218,7 +195,7 @@ auto main(int argc, char** argv) -> int {
         return EXIT_SUCCESS;
     }
 #else
-    auto shutdown_dpdk = [](){};
+    auto shutdown_dpdk = []() {};
 #endif
 
 #ifdef COMPOSITE_USE_OPENSSL
@@ -284,8 +261,7 @@ auto main(int argc, char** argv) -> int {
                     dpdk_cores_str += std::to_string(logical);
                     physical_cores_str += std::to_string(available_cores[logical]);
                 }
-                spdlog::info("DPDK cores: logical [{}] -> physical [{}]",
-                    dpdk_cores_str, physical_cores_str);
+                spdlog::info("DPDK cores: logical [{}] -> physical [{}]", dpdk_cores_str, physical_cores_str);
             }
         }
 
@@ -321,8 +297,8 @@ auto main(int argc, char** argv) -> int {
                         dpdk_cores_str += std::to_string(logical);
                         physical_cores_str += std::to_string(available_cores[logical]);
                     }
-                    spdlog::info("DPDK auto-detected cores: logical [{}] -> physical [{}]",
-                        dpdk_cores_str, physical_cores_str);
+                    spdlog::info("DPDK auto-detected cores: logical [{}] -> physical [{}]", dpdk_cores_str,
+                                 physical_cores_str);
                 }
             }
         }
@@ -334,8 +310,8 @@ auto main(int argc, char** argv) -> int {
 
             // Build set of non-DPDK physical cores
             for (size_t i = 0; i < available_cores.size(); i++) {
-                bool is_dpdk = std::find(dpdk_logical_cores.begin(),
-                    dpdk_logical_cores.end(), static_cast<int>(i)) != dpdk_logical_cores.end();
+                bool is_dpdk = std::find(dpdk_logical_cores.begin(), dpdk_logical_cores.end(), static_cast<int>(i)) !=
+                               dpdk_logical_cores.end();
                 if (!is_dpdk) {
                     CPU_SET(available_cores[i], &non_dpdk_cpuset);
                 }
@@ -355,7 +331,7 @@ auto main(int argc, char** argv) -> int {
         spdlog::info("DPDK initialized with {} port(s)", dpdk_cfg.ports.size());
     }
 #else
-    std::vector<int> dpdk_logical_cores;  // Empty when DPDK not enabled
+    std::vector<int> dpdk_logical_cores; // Empty when DPDK not enabled
 #endif
 
 #ifdef COMPOSITE_USE_OPENTELEMETRY
@@ -383,7 +359,7 @@ auto main(int argc, char** argv) -> int {
         telemetry_initialized = true;
     }
 #else
-    auto shutdown_telemetry = [](){};
+    auto shutdown_telemetry = []() {};
 #endif
 
     // ========================================
@@ -452,24 +428,22 @@ auto main(int argc, char** argv) -> int {
     // errors and component-supplied exceptions; route every one through
     // cleanup_and_exit instead of letting it escape main to std::terminate.
     try {
-    for (const auto& comp : app_json["components"]) {
-        // Load component from library (self-owning: dlopen handle rides in its deleter)
-        auto comp_ptr = composite::make_component(comp);
-        if (comp_ptr == nullptr) {
-            return cleanup_and_exit("failed to load component");
-        }
-        // Set log level
-        comp_ptr->log_level(level);
+        for (const auto& comp : app_json["components"]) {
+            // Load component from library (self-owning: dlopen handle rides in its deleter)
+            auto comp_ptr = composite::make_component(comp);
+            if (comp_ptr == nullptr) {
+                return cleanup_and_exit("failed to load component");
+            }
+            // Set log level
+            comp_ptr->log_level(level);
 
-        // Configure CPU affinity if specified
-        if (!available_cores.empty() && comp.contains("cpu_affinity")) {
-            auto affinity_str = comp["cpu_affinity"].get<std::string>();
-            auto cpuset_opt = composite::parse_affinity_config(affinity_str, available_cores);
-            if (cpuset_opt.has_value()) {
-                comp_ptr->set_cpu_affinity(*cpuset_opt);
-                spdlog::debug("Component '{}' cpu_affinity resolved cores: [{}]",
-                    comp_ptr->id(),
-                    [&cpuset_opt]() {
+            // Configure CPU affinity if specified
+            if (!available_cores.empty() && comp.contains("cpu_affinity")) {
+                auto affinity_str = comp["cpu_affinity"].get<std::string>();
+                auto cpuset_opt = composite::parse_affinity_config(affinity_str, available_cores);
+                if (cpuset_opt.has_value()) {
+                    comp_ptr->set_cpu_affinity(*cpuset_opt);
+                    spdlog::debug("Component '{}' cpu_affinity resolved cores: [{}]", comp_ptr->id(), [&cpuset_opt]() {
                         std::string result;
                         for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
                             if (CPU_ISSET(cpu, &(*cpuset_opt))) {
@@ -481,95 +455,94 @@ auto main(int argc, char** argv) -> int {
                         }
                         return result;
                     }());
-                spdlog::debug("Component '{}' cpu_affinity configured: '{}'", comp_ptr->id(), affinity_str);
-            } else if (affinity_str != "none" && !affinity_str.empty()) {
+                    spdlog::debug("Component '{}' cpu_affinity configured: '{}'", comp_ptr->id(), affinity_str);
+                } else if (affinity_str != "none" && !affinity_str.empty()) {
+                    return cleanup_and_exit(std::format("Failed to parse cpu_affinity '{}' for component '{}'",
+                                                        affinity_str, comp_ptr->id()));
+                }
+            }
+
+            // Set properties
+            try {
+                // Merge application-level properties with component-level properties
+                auto props_json = nlohmann::json{};
+                if (app_json.contains("properties")) {
+                    spdlog::trace("adding app-level properties to changeset for {}", comp_ptr->id());
+                    props_json.merge_patch(app_json["properties"]);
+                }
+                if (comp.contains("properties")) {
+                    spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
+                    props_json.merge_patch(comp["properties"]);
+                }
+
+                // Apply the merged (app-level + component-level) properties as one batch.
+                if (!props_json.empty()) {
+                    spdlog::trace("setting properties on component {}", comp_ptr->id());
+                    comp_ptr->set_properties(props_json, composite::properties::config_type::INITIALIZE, true);
+                }
+            } catch (const std::runtime_error& err) {
                 return cleanup_and_exit(
-                    std::format(
-                        "Failed to parse cpu_affinity '{}' for component '{}'", affinity_str, comp_ptr->id()
-                    )
-                );
+                    std::format("property error for component '{}': {}", comp_ptr->id(), err.what()));
+            }
+            // Add to application (check the return: a duplicate effective id — e.g. a
+            // library that hardcodes its id — would otherwise be silently dropped).
+            spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
+            if (!app.add_component(comp_ptr)) {
+                return cleanup_and_exit(std::format("component id '{}' already exists in application", comp_ptr->id()));
             }
         }
 
-        // Set properties
-        try {
-            // Merge application-level properties with component-level properties
-            auto props_json = nlohmann::json{};
-            if (app_json.contains("properties")) {
-                spdlog::trace("adding app-level properties to changeset for {}", comp_ptr->id());
-                props_json.merge_patch(app_json["properties"]);
-            }
-            if (comp.contains("properties")) {
-                spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
-                props_json.merge_patch(comp["properties"]);
+        // ========================================
+        // Component Connections
+        // ========================================
+        if (app_json.contains("connections")) {
+            if (!app_json["connections"].is_array()) {
+                return cleanup_and_exit("'connections' field must be an array");
             }
 
-            // Apply the merged (app-level + component-level) properties as one batch.
-            if (!props_json.empty()) {
-                spdlog::trace("setting properties on component {}", comp_ptr->id());
-                comp_ptr->set_properties(props_json, composite::properties::config_type::INITIALIZE, true);
-            }
-        } catch (const std::runtime_error& err) {
-            return cleanup_and_exit(std::format("property error for component '{}': {}", comp_ptr->id(), err.what()));
-        }
-        // Add to application (check the return: a duplicate effective id — e.g. a
-        // library that hardcodes its id — would otherwise be silently dropped).
-        spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
-        if (!app.add_component(comp_ptr)) {
-            return cleanup_and_exit(std::format("component id '{}' already exists in application", comp_ptr->id()));
-        }
-    }
+            for (const auto& conn : app_json["connections"]) {
+                if (!conn.contains("output")) {
+                    return cleanup_and_exit(std::format("missing output for connection: {}", conn.dump()));
+                }
+                if (!conn.contains("input")) {
+                    return cleanup_and_exit(std::format("missing input for connection: {}", conn.dump()));
+                }
 
-    // ========================================
-    // Component Connections
-    // ========================================
-    if (app_json.contains("connections")) {
-        if (!app_json["connections"].is_array()) {
-            return cleanup_and_exit("'connections' field must be an array");
-        }
+                // Validate output section
+                auto output = conn["output"];
+                auto [output_comp, output_port, oerror] = composite::validate_connection(output);
+                if (!oerror.empty()) {
+                    return cleanup_and_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
+                }
 
-        for (const auto& conn : app_json["connections"]) {
-            if (!conn.contains("output")) {
-                return cleanup_and_exit(std::format("missing output for connection: {}", conn.dump()));
-            }
-            if (!conn.contains("input")) {
-                return cleanup_and_exit(std::format("missing input for connection: {}", conn.dump()));
-            }
+                // Validate input section
+                auto input = conn["input"];
+                auto [input_comp, input_port, ierror] = composite::validate_connection(input);
+                if (!ierror.empty()) {
+                    return cleanup_and_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
+                }
 
-            // Validate output section
-            auto output = conn["output"];
-            auto [output_comp, output_port, oerror] = composite::validate_connection(output);
-            if (!oerror.empty()) {
-                return cleanup_and_exit(std::format("invalid connection output: {}: {}", conn.dump(), oerror));
-            }
+                spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
 
-            // Validate input section
-            auto input = conn["input"];
-            auto [input_comp, input_port, ierror] = composite::validate_connection(input);
-            if (!ierror.empty()) {
-                return cleanup_and_exit(std::format("invalid connection input: {}: {}", conn.dump(), ierror));
-            }
+                // Get the output component
+                auto output_comp_ptr = app.get_component(output_comp);
+                if (output_comp_ptr == nullptr) {
+                    return cleanup_and_exit(std::format("output component '{}' not found", output_comp));
+                }
 
-            spdlog::trace("connecting {}:{} to {}:{}", output_comp, output_port, input_comp, input_port);
+                // Get the input component
+                auto input_comp_ptr = app.get_component(input_comp);
+                if (input_comp_ptr == nullptr) {
+                    return cleanup_and_exit(std::format("input component '{}' not found", input_comp));
+                }
 
-            // Get the output component
-            auto output_comp_ptr = app.get_component(output_comp);
-            if (output_comp_ptr == nullptr) {
-                return cleanup_and_exit(std::format("output component '{}' not found", output_comp));
-            }
-
-            // Get the input component
-            auto input_comp_ptr = app.get_component(input_comp);
-            if (input_comp_ptr == nullptr) {
-                return cleanup_and_exit(std::format("input component '{}' not found", input_comp));
-            }
-
-            // Connect the ports
-            if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
-                return cleanup_and_exit(std::format("failed to connect {}:{} to {}:{}", output_comp, output_port, input_comp, input_port));
+                // Connect the ports
+                if (!output_comp_ptr->connect(output_port, input_comp_ptr, input_port)) {
+                    return cleanup_and_exit(std::format("failed to connect {}:{} to {}:{}", output_comp, output_port,
+                                                        input_comp, input_port));
+                }
             }
         }
-    }
 
     } catch (const std::exception& e) {
         return cleanup_and_exit(std::format("configuration error: {}", e.what()));
@@ -607,7 +580,7 @@ auto main(int argc, char** argv) -> int {
     auto sig_future = sig_promise.get_future();
     std::jthread sig_thread([sigset, &sig_promise](std::stop_token stoken) mutable {
         while (!stoken.stop_requested()) {
-            timespec timeout{.tv_sec = 0, .tv_nsec = 200'000'000};  // 200 ms poll
+            timespec timeout{.tv_sec = 0, .tv_nsec = 200'000'000}; // 200 ms poll
             int signum = sigtimedwait(&sigset, nullptr, &timeout);
             if (signum > 0) {
                 spdlog::trace("signal {} received, initiating shutdown...", signum);
@@ -646,7 +619,11 @@ auto main(int argc, char** argv) -> int {
         struct stop_guard_t {
             httplib::Server* srv;
             std::atomic<bool>* stopped;
-            ~stop_guard_t() { if (!stopped->exchange(true)) { srv->stop(); } }
+            ~stop_guard_t() {
+                if (!stopped->exchange(true)) {
+                    srv->stop();
+                }
+            }
         } stop_guard{server.get(), &server_stopped};
 
         spdlog::trace("starting application '{}'", app.name());
@@ -658,7 +635,9 @@ auto main(int argc, char** argv) -> int {
         // Stop accepting requests BEFORE tearing down the app (on the normal path;
         // the guard handles the exception path). Exactly-once via the flag.
         spdlog::trace("stopping server...");
-        if (!server_stopped.exchange(true)) { server->stop(); }
+        if (!server_stopped.exchange(true)) {
+            server->stop();
+        }
         spdlog::trace("stopping application '{}'", app.name());
         app.stop();
         spdlog::trace("clearing application '{}'", app.name());

@@ -1,10 +1,10 @@
-#include <catch2/catch_test_macros.hpp>
-#include <catch2/catch_approx.hpp>
+#include "composite/buffers/buffer.hpp"
 #include "composite/core/component.hpp"
 #include "composite/metrics/metrics.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
-#include "composite/buffers/buffer.hpp"
+#include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <set>
 #include <thread>
 
@@ -17,7 +17,9 @@ template <typename Pred>
 static auto wait_until(Pred pred, std::chrono::milliseconds timeout = std::chrono::seconds(2)) -> bool {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) { return true; }
+        if (pred()) {
+            return true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return pred();
@@ -30,13 +32,9 @@ public:
         m_input.depth(100);
     }
 
-    auto process() -> retval override {
-        return retval::NOOP;
-    }
+    auto process() -> retval override { return retval::NOOP; }
 
-    auto get_input_depth() const -> std::size_t {
-        return m_input.depth();
-    }
+    auto get_input_depth() const -> std::size_t { return m_input.depth(); }
 
 private:
     input_port<immutable_buffer<float>> m_input{"data_in"};
@@ -44,11 +42,11 @@ private:
 
 TEST_CASE("Component enabled property pauses input ports", "[lifecycle]") {
     auto sink = std::make_shared<SimpleTestSink>();
-    
+
     // Verify initial state
     REQUIRE(sink->get_property<bool>("enabled") == true);
     REQUIRE(sink->get_input_depth() == 100);
-    
+
     // Start component
     sink->start();
     REQUIRE(wait_until([&] { return sink->is_running(); }));
@@ -60,8 +58,8 @@ TEST_CASE("Component enabled property pauses input ports", "[lifecycle]") {
 
     // Verify component stopped and input port paused
     REQUIRE(sink->get_property<bool>("enabled") == false);
-    REQUIRE(sink->get_input_depth() == 0);  // Should be paused
-    
+    REQUIRE(sink->get_input_depth() == 0); // Should be paused
+
     // Cleanup
     sink->stop();
 }
@@ -81,7 +79,9 @@ public:
         }
         // Do a tiny bit of work
         volatile int x = 0;
-        for (int i = 0; i < 100; ++i) { x += i; }
+        for (int i = 0; i < 100; ++i) {
+            x += i;
+        }
         return retval::NORMAL;
     }
 
@@ -191,17 +191,16 @@ TEST_CASE("Component process metrics are recorded", "[lifecycle][metrics]") {
 
     auto process_calls = get_counter("composite.component.process_calls");
     REQUIRE(process_calls > 0);
-    REQUIRE(get_histogram_count() == 0);                          // timing off -> no samples
-    REQUIRE(get_counter("composite.component.noop_count") == 0);  // process() returned NORMAL
+    REQUIRE(get_histogram_count() == 0);                         // timing off -> no samples
+    REQUIRE(get_counter("composite.component.noop_count") == 0); // process() returned NORMAL
 
     // Enabling measure_process_time makes the hot path sample into the histogram.
-    comp->set_properties(properties::json{{"measure_process_time", true}},
-                         properties::config_type::RUNTIME);
+    comp->set_properties(properties::json{{"measure_process_time", true}}, properties::config_type::RUNTIME);
     comp->start();
     REQUIRE(wait_until([&] { return get_histogram_count() > 0; }));
     comp->stop();
 
-    REQUIRE(get_histogram_count() > 0);                          // timing on -> samples recorded
+    REQUIRE(get_histogram_count() > 0); // timing on -> samples recorded
     REQUIRE(get_counter("composite.component.process_calls") > process_calls);
 
     // Destroy component before cleaning up metrics (component destructor accesses metrics)
@@ -211,7 +210,7 @@ TEST_CASE("Component process metrics are recorded", "[lifecycle][metrics]") {
 
 TEST_CASE("Component NOOP count is tracked", "[lifecycle][metrics]") {
     auto comp = std::make_shared<MetricsTestComponent>("noop_test_comp");
-    comp->set_noop(true);  // Make process() return NOOP
+    comp->set_noop(true); // Make process() return NOOP
 
     auto get_noop_count = [&]() -> uint64_t {
         auto snapshots = metrics::registry::instance().snapshot_by_label("component_id", "noop_test_comp");

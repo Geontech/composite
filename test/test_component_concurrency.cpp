@@ -1,13 +1,13 @@
 // Component-level integration on the NEW property core: worker reads properties
 // lock-free while JSON set_properties() mutates them (parked) + a REST reader
 // reads them + lifecycle churn. Under TSan.
-#include <composite/core/component.hpp>
-#include <composite/ports/input_port.hpp>
 #include <atomic>
 #include <cassert>
+#include <composite/core/component.hpp>
+#include <composite/ports/input_port.hpp>
 #include <cstdio>
-#include <thread>
 #include <spdlog/spdlog.h>
+#include <thread>
 
 using namespace composite;
 using json = composite::properties::json;
@@ -32,7 +32,7 @@ public:
     input_port<mutable_buffer<float>> m_in{"in"};
     int32_t m_a{0};
     int32_t m_b{0};
-    component::auto_stop m_auto_stop{*this};   // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 
 int main() {
@@ -42,14 +42,14 @@ int main() {
     auto comp = std::make_shared<probe>("probe");
     comp->start();
 
-    std::thread writer([&]{
+    std::thread writer([&] {
         for (int k = 1; k <= 20000 && !stop.load(); ++k) {
             comp->set_properties(json{{"a", k}, {"b", k}}, config_type::RUNTIME);
         }
     });
-    std::thread reader([&]{
+    std::thread reader([&] {
         while (!stop.load(std::memory_order_acquire)) {
-            comp->with_property_read_lock([&]{
+            comp->with_property_read_lock([&] {
                 // read both under the SAME held read-lock: use the no-lock accessor,
                 // since the locking get_property() would recursively acquire the
                 // (non-recursive) shared_mutex we already hold.
@@ -59,7 +59,7 @@ int main() {
             });
         }
     });
-    std::thread churn([&]{
+    std::thread churn([&] {
         for (int i = 0; i < 400 && !stop.load(); ++i) {
             comp->set_properties(json{{"enabled", (i & 1) == 0}}, config_type::RUNTIME);
             comp->apply_lifecycle_changes();
@@ -76,8 +76,7 @@ int main() {
     comp->stop();
 
     std::printf("component TSan: reads=%llu worker_mismatch=%llu reader_mismatch=%llu\n",
-                (unsigned long long)comp->m_reads.load(),
-                (unsigned long long)comp->m_mismatch.load(),
+                (unsigned long long)comp->m_reads.load(), (unsigned long long)comp->m_mismatch.load(),
                 (unsigned long long)bad_reader.load());
     assert(comp->m_mismatch.load() == 0 && bad_reader.load() == 0);
     std::printf("COMPONENT INTEGRATION TSAN PASSED\n");

@@ -19,10 +19,8 @@ struct filter_cfg {
     double gain{1.0};
     std::uint32_t taps{8};
     window win{window::hann};
-    COMPOSITE_FIELDS(filter_cfg,
-        (gain, runtime, range(0.0, 10.0), unit("dB")),
-        (taps, runtime, range(1u, 1024u), power_of_two),
-        (win,  runtime));
+    COMPOSITE_FIELDS(filter_cfg, (gain, runtime, range(0.0, 10.0), unit("dB")),
+                     (taps, runtime, range(1u, 1024u), power_of_two), (win, runtime));
 };
 } // namespace acme
 COMPOSITE_ENUM(acme::window, hann, hamming, blackman_harris);
@@ -31,14 +29,19 @@ COMPOSITE_ENUM(acme::window, hann, hamming, blackman_harris);
 class biquad_old : public component {
 public:
     explicit biquad_old(std::string_view id) : component(id) {
-        add_property("gain", m_gain, config_type::RUNTIME).units("dB")
+        add_property("gain", m_gain, config_type::RUNTIME)
+            .units("dB")
             .validate([](const double& g) { return g >= 0.0 && g <= 10.0; }, "gain out of range [0, 10]");
         add_property("taps", m_taps, config_type::RUNTIME)
-            .validate([](const std::uint32_t& t) { return t != 0 && (t & (t - 1)) == 0; }, "taps must be a power of two");
+            .validate([](const std::uint32_t& t) { return t != 0 && (t & (t - 1)) == 0; },
+                      "taps must be a power of two");
         add_property("win", m_win, config_type::RUNTIME);
     }
     auto process() -> retval override { return retval::FINISH; }
-    auto property_change_handler(const json& diff) -> void override { ++reacts; last = diff; }
+    auto property_change_handler(const json& diff) -> void override {
+        ++reacts;
+        last = diff;
+    }
 
     double m_gain{1.0};
     std::uint32_t m_taps{8};
@@ -71,7 +74,10 @@ public:
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 
 int main() {
@@ -108,19 +114,31 @@ int main() {
     // validation parity: out-of-range gain rejected by both; state intact
     bool to = false;
     bool tn = false;
-    try { o.set_properties(json::parse(R"({"gain": 99.0})"), config_type::RUNTIME); }
-    catch (const std::exception&) { to = true; }
-    try { n.set_properties(json::parse(R"({"gain": 99.0})"), config_type::RUNTIME); }
-    catch (const std::exception&) { tn = true; }
+    try {
+        o.set_properties(json::parse(R"({"gain": 99.0})"), config_type::RUNTIME);
+    } catch (const std::exception&) {
+        to = true;
+    }
+    try {
+        n.set_properties(json::parse(R"({"gain": 99.0})"), config_type::RUNTIME);
+    } catch (const std::exception&) {
+        tn = true;
+    }
     check(to && tn, "both reject out-of-range gain");
     check(o.property_state() == n.property_state(), "state identical after a rejected PATCH");
 
     // power_of_two parity
     to = tn = false;
-    try { o.set_properties(json::parse(R"({"taps": 7})"), config_type::RUNTIME); }
-    catch (const std::exception&) { to = true; }
-    try { n.set_properties(json::parse(R"({"taps": 7})"), config_type::RUNTIME); }
-    catch (const std::exception&) { tn = true; }
+    try {
+        o.set_properties(json::parse(R"({"taps": 7})"), config_type::RUNTIME);
+    } catch (const std::exception&) {
+        to = true;
+    }
+    try {
+        n.set_properties(json::parse(R"({"taps": 7})"), config_type::RUNTIME);
+    } catch (const std::exception&) {
+        tn = true;
+    }
     check(to && tn, "both reject non-power-of-two taps");
 
     // both schemas expose the same property names (the new form is richer: it also
@@ -129,13 +147,20 @@ int main() {
     const json sn = n.property_schema();
     check(so.size() == sn.size(), "both describe the same number of properties");
     auto has_named = [](const json& sch, const char* nm) {
-        for (const auto& e : sch) { if (e["name"] == nm) { return true; } }
+        for (const auto& e : sch) {
+            if (e["name"] == nm) {
+                return true;
+            }
+        }
         return false;
     };
     check(has_named(sn, "gain") && has_named(sn, "taps") && has_named(sn, "win"),
           "new schema exposes gain/taps/win at top level");
 
-    if (g_fails != 0) { std::fprintf(stderr, "%d round-trip check(s) FAILED\n", g_fails); return 1; }
+    if (g_fails != 0) {
+        std::fprintf(stderr, "%d round-trip check(s) FAILED\n", g_fails);
+        return 1;
+    }
     std::puts("CONFIG<T> ROUND-TRIP PARITY TESTS PASSED");
     return 0;
 }

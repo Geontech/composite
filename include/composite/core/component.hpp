@@ -13,6 +13,7 @@
 #include "lifecycle.hpp"
 #include "park.hpp"
 
+#include "composite/core/logger.hpp"
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -21,7 +22,6 @@
 #include <mutex>
 #include <optional>
 #include <span>
-#include "composite/core/logger.hpp"
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -45,17 +45,20 @@ enum class retval : int {
 
 /// Why a component's worker loop terminated on its own (as opposed to an external stop()).
 enum class finish_reason {
-    none,        ///< not finished — still running, or stopped externally (never self-terminated)
-    completed,   ///< process() returned FINISH — orderly, successful completion (e.g. source hit EOF)
-    error        ///< process() threw — the worker aborted on an exception
+    none,      ///< not finished — still running, or stopped externally (never self-terminated)
+    completed, ///< process() returned FINISH — orderly, successful completion (e.g. source hit EOF)
+    error      ///< process() threw — the worker aborted on an exception
 }; // enum class finish_reason
 
 /// Human-readable name for a finish_reason (used in status/introspection).
 inline auto to_string(finish_reason r) -> std::string_view {
     switch (r) {
-        case finish_reason::completed: return "completed";
-        case finish_reason::error:     return "error";
-        case finish_reason::none:      break;
+    case finish_reason::completed:
+        return "completed";
+    case finish_reason::error:
+        return "error";
+    case finish_reason::none:
+        break;
     }
     return "none";
 }
@@ -97,7 +100,7 @@ public:
         explicit auto_stop(component& owner) noexcept : m_owner(&owner) {}
         auto_stop(const auto_stop&) = delete;
         auto_stop& operator=(const auto_stop&) = delete;
-        ~auto_stop() { m_owner->stop(); }  // stop() is idempotent
+        ~auto_stop() { m_owner->stop(); } // stop() is idempotent
     private:
         component* m_owner;
     };
@@ -108,12 +111,12 @@ public:
         // its identity label, so a reload doesn't leak series toward the registry
         // cap and OTel drops the instruments. The registry outlives components.
         metrics::registry::instance().remove_by_label("component_id", m_id);
-        if (m_logger) { m_logger->flush(); }
+        if (m_logger) {
+            m_logger->flush();
+        }
     }
 
-    auto id() const noexcept -> const std::string& {
-        return m_id;
-    }
+    auto id() const noexcept -> const std::string& { return m_id; }
 
     auto initialize() -> void override {
         // To be implemented by subclasses
@@ -135,7 +138,9 @@ public:
         // (so an on_apply that touches the lifecycle cannot self-deadlock). Only when we
         // actually stopped a worker — guards against running a stale reaction during
         // ~component (auto_stop already stopped + drained while the derived was alive).
-        if (had_worker) { run_reactions_parked(); }
+        if (had_worker) {
+            run_reactions_parked();
+        }
     }
 
     virtual auto process() -> retval = 0;
@@ -187,7 +192,9 @@ public:
     /// drained. Out-of-band (a flag, not a ring packet), so the drop-on-full ring cannot lose it.
     auto send_eos() -> void {
         for (const auto& [name, port] : m_port_set.ports()) {
-            if (auto* out = dynamic_cast<output_port_base*>(port)) { out->send_eos(); }
+            if (auto* out = dynamic_cast<output_port_base*>(port)) {
+                out->send_eos();
+            }
         }
     }
 
@@ -202,7 +209,9 @@ public:
         for (const auto& [name, port] : m_port_set.ports()) {
             if (const auto* in = dynamic_cast<const input_port_base*>(port)) {
                 any_input = true;
-                if (!in->at_end()) { return false; }
+                if (!in->at_end()) {
+                    return false;
+                }
             }
         }
         return any_input;
@@ -216,18 +225,24 @@ public:
 
         // doorbell: an input fed by an upstream producer wakes our worker on the
         // empty->non-empty edge, so it does not wait out its NOOP backoff.
-        if (auto* in = dynamic_cast<input_port_base*>(&port)) { in->set_doorbell(&m_park); }
+        if (auto* in = dynamic_cast<input_port_base*>(&port)) {
+            in->set_doorbell(&m_park);
+        }
     }
 
     auto add_port(port_base* port) -> void {
-        if (port == nullptr) { return; }
+        if (port == nullptr) {
+            return;
+        }
         m_port_set.add_port(port);
 
         // Register port metrics with component context
         port->register_port_metrics(m_id);
 
         // doorbell (see the reference overload).
-        if (auto* in = dynamic_cast<input_port_base*>(port)) { in->set_doorbell(&m_park); }
+        if (auto* in = dynamic_cast<input_port_base*>(port)) {
+            in->set_doorbell(&m_park);
+        }
     }
 
     template <typename T>
@@ -235,9 +250,7 @@ public:
         return m_port_set.get_port<T>(name);
     }
 
-    auto ports() const -> const port_set::port_map_type& {
-        return m_port_set.ports();
-    }
+    auto ports() const -> const port_set::port_map_type& { return m_port_set.ports(); }
 
     /**
      * @brief Connect this component's output port to another's input port
@@ -247,11 +260,8 @@ public:
      * @param input_port_name Name of input port on target component
      * @return true if connection successful, false otherwise
      */
-    auto connect(
-      std::string_view output_port_name,
-      std::shared_ptr<component> other,
-      std::string_view input_port_name
-    ) -> bool {
+    auto connect(std::string_view output_port_name, std::shared_ptr<component> other, std::string_view input_port_name)
+        -> bool {
         // Get output port from this component
         auto* out_port = get_port<output_port_base>(output_port_name);
         if (out_port == nullptr) {
@@ -272,27 +282,22 @@ public:
 
         // Check element type compatibility
         if (out_port->element_type_id() != in_port->element_type_id()) {
-            m_logger->error(
-                "type mismatch connecting {}:{} ({}) to {}:{} ({})",
-                id(), output_port_name, out_port->element_type().name(),
-                other->id(), input_port_name, in_port->element_type().name()
-            );
+            m_logger->error("type mismatch connecting {}:{} ({}) to {}:{} ({})", id(), output_port_name,
+                            out_port->element_type().name(), other->id(), input_port_name,
+                            in_port->element_type().name());
             return false;
         }
 
         // Log mutability information for transfer optimization transparency
-        m_logger->trace(
-            "connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})",
-            id(), output_port_name, out_port->is_mutable() ? "mutable" : "immutable",
-            other->id(), input_port_name, in_port->is_mutable() ? "mutable" : "immutable"
-        );
+        m_logger->trace("connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})", id(), output_port_name,
+                        out_port->is_mutable() ? "mutable" : "immutable", other->id(), input_port_name,
+                        in_port->is_mutable() ? "mutable" : "immutable");
 
         // Make the connection. Rejects fan-in: an input may have at most one
         // producer (keeps its lock-free SPSC ring sound by construction).
         if (!out_port->connect(in_port)) {
-            m_logger->error(
-                "cannot connect {}:{} -> {}:{}: input already has a producer (fan-in is unsupported)",
-                id(), output_port_name, other->id(), input_port_name);
+            m_logger->error("cannot connect {}:{} -> {}:{}: input already has a producer (fan-in is unsupported)", id(),
+                            output_port_name, other->id(), input_port_name);
             return false;
         }
 
@@ -300,23 +305,16 @@ public:
         // consumer's pop wakes us on the full->not-full edge when process() returned AWAIT_OUTPUT.
         in_port->set_producer_doorbell(&m_park);
 
-
         // Record connection for tracking. Guarded: REST POST /app/connections can
         // run connect() on an httplib pool thread concurrently with GET /app
         // reading connections() on another — an unsynchronized vector push_back vs
         // iteration is UB (reallocation invalidates the reader).
         {
             std::scoped_lock lk{m_connections_mtx};
-            m_connections.push_back({
-              .output = std::make_pair(id(), std::string{output_port_name}),
-              .input = std::make_pair(other->id(), std::string{input_port_name})
-            });
+            m_connections.push_back({.output = std::make_pair(id(), std::string{output_port_name}),
+                                     .input = std::make_pair(other->id(), std::string{input_port_name})});
         }
-        m_logger->debug(
-          "connected {}:{} -> {}:{}",
-          id(), output_port_name,
-          other->id(), input_port_name
-        );
+        m_logger->debug("connected {}:{} -> {}:{}", id(), output_port_name, other->id(), input_port_name);
 
         return true;
     }
@@ -331,23 +329,24 @@ public:
      * Also removes the matching record from m_connections.
      * @return true if the connection existed and was removed.
      */
-    auto disconnect(
-      std::string_view output_port_name,
-      const std::shared_ptr<component>& other,
-      std::string_view input_port_name
-    ) -> bool {
+    auto disconnect(std::string_view output_port_name, const std::shared_ptr<component>& other,
+                    std::string_view input_port_name) -> bool {
         auto* out_port = get_port<output_port_base>(output_port_name);
-        if (out_port == nullptr || other == nullptr) { return false; }
+        if (out_port == nullptr || other == nullptr) {
+            return false;
+        }
         auto* in_port = other->get_port<input_port_base>(input_port_name);
-        if (in_port == nullptr) { return false; }
+        if (in_port == nullptr) {
+            return false;
+        }
 
         bool ok = false;
         m_park.with_worker_parked([&] { ok = out_port->disconnect(in_port); });
         if (ok) {
             std::scoped_lock lk{m_connections_mtx};
             std::erase_if(m_connections, [&](const connection& c) {
-                return c.output.first == m_id && c.output.second == output_port_name
-                    && c.input.first == other->id() && c.input.second == input_port_name;
+                return c.output.first == m_id && c.output.second == output_port_name && c.input.first == other->id() &&
+                       c.input.second == input_port_name;
             });
         }
         return ok;
@@ -357,7 +356,9 @@ public:
     /// @return number of connections removed.
     auto disconnect_all(std::string_view output_port_name) -> std::size_t {
         auto* out_port = get_port<output_port_base>(output_port_name);
-        if (out_port == nullptr) { return 0; }
+        if (out_port == nullptr) {
+            return 0;
+        }
         std::size_t count = 0;
         m_park.with_worker_parked([&] { count = out_port->disconnect(); });
         if (count > 0) {
@@ -387,21 +388,17 @@ public:
     /// Register a scalar/enum/optional/vector/reflected-struct property bound to
     /// a member. Returns the typed_property for fluent .validate()/.on_change()/.units().
     template <typename T>
-    auto add_property(
-      std::string_view name,
-      T& ref,
-      properties::config_type config = properties::config_type::INITIALIZE)
-      -> properties::typed_property<T>& {
+    auto add_property(std::string_view name, T& ref,
+                      properties::config_type config = properties::config_type::INITIALIZE)
+        -> properties::typed_property<T>& {
         return m_prop_set.add(name, ref, config);
     }
 
     /// Register a keyed collection (std::map<std::string, E>, E reflected via COMPOSITE_STRUCT).
     template <typename E>
-    auto add_keyed(
-      std::string_view name,
-      std::map<std::string, E>& ref,
-      properties::config_type config = properties::config_type::INITIALIZE)
-      -> properties::keyed_collection<E>& {
+    auto add_keyed(std::string_view name, std::map<std::string, E>& ref,
+                   properties::config_type config = properties::config_type::INITIALIZE)
+        -> properties::keyed_collection<E>& {
         return m_prop_set.add_keyed(name, ref, config);
     }
 
@@ -410,10 +407,8 @@ public:
     /// unit and reactions arrive via cfg.on_apply(prev, changes<T>). Fields opt into
     /// runtime configurability with the `runtime` attribute; @p config is the baseline.
     template <reflect::reflected T>
-    auto add_config(
-      composite::config<T>& cfg,
-      properties::config_type config = properties::config_type::INITIALIZE)
-      -> composite::config<T>& {
+    auto add_config(composite::config<T>& cfg, properties::config_type config = properties::config_type::INITIALIZE)
+        -> composite::config<T>& {
         return m_prop_set.add_config(cfg, config);
     }
 
@@ -431,7 +426,9 @@ public:
         // desired state (keeps get_property<bool>("enabled") working for application start
         // and existing call sites).
         if constexpr (std::is_same_v<T, bool>) {
-            if (name == "enabled") { return is_enabled(); }
+            if (name == "enabled") {
+                return is_enabled();
+            }
         }
         return m_park.with_reader_lock([&] { return m_prop_set.template get<T>(name); });
     }
@@ -444,7 +441,9 @@ public:
     template <typename T>
     auto get_property_locked(std::string_view name) const -> T {
         if constexpr (std::is_same_v<T, bool>) {
-            if (name == "enabled") { return is_enabled(); }
+            if (name == "enabled") {
+                return is_enabled();
+            }
         }
         return m_prop_set.template get<T>(name);
     }
@@ -463,7 +462,9 @@ public:
         // Completion status: whether the worker self-terminated, and why (completed vs error).
         const auto fr = m_finish_reason.load(std::memory_order_acquire);
         state["finished"] = (fr != finish_reason::none);
-        if (fr != finish_reason::none) { state["finish_reason"] = to_string(fr); }
+        if (fr != finish_reason::none) {
+            state["finish_reason"] = to_string(fr);
+        }
         return state;
     }
 
@@ -494,10 +495,9 @@ public:
      * nothing), then runs property_change_handler() — all while the worker is
      * quiesced, so process() reads the new values lock-free and consistently.
      */
-    auto set_properties(
-      const properties::json& values,
-      properties::config_type config = properties::config_type::INITIALIZE,
-      bool allow_unknown = false) -> void {
+    auto set_properties(const properties::json& values,
+                        properties::config_type config = properties::config_type::INITIALIZE,
+                        bool allow_unknown = false) -> void {
         // `enabled` is a framework spec/status virtual, not a value property: extract it
         // (it would otherwise be rejected as unknown) and apply it as a lifecycle directive
         // AFTER the value batch commits. Only copies `values` when `enabled` is present.
@@ -532,11 +532,12 @@ public:
                         try {
                             property_change_handler(diff);
                         } catch (const std::exception& ex) {
-                            logger()->warn("{}: property_change_handler failed (values already applied): {}",
-                                           m_id, ex.what());
+                            logger()->warn("{}: property_change_handler failed (values already applied): {}", m_id,
+                                           ex.what());
                         } catch (...) {
                             logger()->warn("{}: property_change_handler failed (values already applied): "
-                                           "unknown exception", m_id);
+                                           "unknown exception",
+                                           m_id);
                         }
                     }
                 });
@@ -571,12 +572,17 @@ public:
         if (enable_req.has_value()) {
             m_desired_enabled.store(*enable_req, std::memory_order_release);
             if (config == properties::config_type::RUNTIME) {
-                { std::scoped_lock life{m_lifecycle_mtx}; reconcile_enabled_locked(); }
+                {
+                    std::scoped_lock life{m_lifecycle_mtx};
+                    reconcile_enabled_locked();
+                }
                 // If the reconcile STOPPED the worker, a reaction staged by the value batch
                 // above is now undrained — drain it here (the loop-top drain is gone with the
                 // worker). Lock released, so a lifecycle-touching on_apply is safe. If the
                 // reconcile STARTED a worker, it drains at its own loop-top.
-                if (!m_park.has_worker()) { run_reactions_parked(); }
+                if (!m_park.has_worker()) {
+                    run_reactions_parked();
+                }
             }
         }
     }
@@ -591,7 +597,7 @@ public:
      */
     virtual auto property_change_handler(const properties::json& diff) -> void {
         (void)diff;
-        property_change_handler();  // default: forward to the legacy no-arg hook
+        property_change_handler(); // default: forward to the legacy no-arg hook
     }
 
     /**
@@ -615,9 +621,7 @@ public:
         return m_park.with_reader_lock(std::forward<Fn>(fn));
     }
 
-    auto log_level(composite::log_level level) const -> void {
-        m_logger->set_level(level);
-    }
+    auto log_level(composite::log_level level) const -> void { m_logger->set_level(level); }
 
     /**
      * @brief Set the CPU affinity for this component's thread
@@ -626,9 +630,7 @@ public:
      * This must be called before start(). The affinity will be applied
      * when the component thread is created.
      */
-    auto set_cpu_affinity(const cpu_set_t& cpuset) -> void {
-        m_cpu_affinity = cpuset;
-    }
+    auto set_cpu_affinity(const cpu_set_t& cpuset) -> void { m_cpu_affinity = cpuset; }
 
     /**
      * @brief Reconcile the worker to the desired `enabled` state.
@@ -641,11 +643,16 @@ public:
      * miss a no-op re-enable after a direct stop (the P1.5/6 trap).
      */
     auto apply_lifecycle_changes() -> void {
-        { std::scoped_lock life{m_lifecycle_mtx}; reconcile_enabled_locked(); }
+        {
+            std::scoped_lock life{m_lifecycle_mtx};
+            reconcile_enabled_locked();
+        }
         // If the reconcile STOPPED the worker, drain any staged reaction (no worker to do
         // it; lock released so a lifecycle-touching on_apply is safe). If it started one,
         // the new worker drains it at loop-top.
-        if (!m_park.has_worker()) { run_reactions_parked(); }
+        if (!m_park.has_worker()) {
+            run_reactions_parked();
+        }
     }
 
     /// Drain staged config<T> reactions with on_apply serialized under the park's data
@@ -661,9 +668,7 @@ public:
     }
 
     /// Desired (spec) enabled state — what the operator/config asked for.
-    [[nodiscard]] auto is_enabled() const -> bool {
-        return m_desired_enabled.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] auto is_enabled() const -> bool { return m_desired_enabled.load(std::memory_order_acquire); }
     /// Observed (status) running state — whether a worker is currently live.
     [[nodiscard]] auto is_running() const -> bool { return m_park.has_worker(); }
 
@@ -678,10 +683,8 @@ public:
     }
 
 protected:
-    explicit component(std::string_view id) :
-      m_id(id),
-      m_logger(std::make_shared<composite::logger>(std::string{id})),
-      m_park(std::string{id}) {
+    explicit component(std::string_view id)
+        : m_id(id), m_logger(std::make_shared<composite::logger>(std::string{id})), m_park(std::string{id}) {
         if (m_id.empty()) {
             throw std::invalid_argument("component id cannot be empty");
         }
@@ -697,8 +700,7 @@ protected:
         // already committed and live, so log it as a warning rather than turning a
         // successful PATCH into a 400 (success-with-warnings).
         m_prop_set.set_listener_error_handler([this](const std::string& name, const char* what) {
-            logger()->warn("{}: property '{}' change listener failed (value already applied): {}",
-                           m_id, name, what);
+            logger()->warn("{}: property '{}' change listener failed (value already applied): {}", m_id, name, what);
         });
 
         add_property("noop_thread_delay", m_delay).units("ns");
@@ -726,16 +728,13 @@ protected:
         // value N > 0 means the worker retries process() after an exponential backoff, up to N
         // consecutive failures, before giving up (FINISH/error). A successful iteration resets the
         // counter. The worker reads these on the (cold) error path only; swapped under park.
-        add_property("error_restart_max", m_error_restart_max, properties::config_type::RUNTIME)
-            .units("1");
+        add_property("error_restart_max", m_error_restart_max, properties::config_type::RUNTIME).units("1");
         add_property("error_restart_backoff_ms", m_error_restart_backoff_ms, properties::config_type::RUNTIME)
             .validate([](const uint32_t& v) { return v >= 1; }, "error_restart_backoff_ms must be >= 1")
             .units("ms");
     }
 
-    auto logger() const -> std::shared_ptr<composite::logger> {
-        return m_logger;
-    }
+    auto logger() const -> std::shared_ptr<composite::logger> { return m_logger; }
 
     /// Worker lifecycle extension points, invoked by start_locked()/stop_locked() so that EVERY
     /// start/stop path runs them — the direct virtual start()/stop() AND the enabled-reconcile path
@@ -781,19 +780,11 @@ protected:
      * @param labels Additional labels (component_id is auto-added)
      * @return Reference to the created counter
      */
-    auto create_counter(
-        std::string_view name,
-        std::string_view description = "",
-        std::string_view unit = "1",
-        metrics::labels_t labels = {}
-    ) -> metrics::counter<uint64_t>& {
+    auto create_counter(std::string_view name, std::string_view description = "", std::string_view unit = "1",
+                        metrics::labels_t labels = {}) -> metrics::counter<uint64_t>& {
         labels.emplace_back("component_id", m_id);
-        return metrics::registry::instance().create_counter(
-            std::string{name},
-            std::string{description},
-            std::string{unit},
-            std::move(labels)
-        );
+        return metrics::registry::instance().create_counter(std::string{name}, std::string{description},
+                                                            std::string{unit}, std::move(labels));
     }
 
     /**
@@ -806,19 +797,11 @@ protected:
      * @param labels Additional labels (component_id is auto-added)
      * @return Reference to the created updown_counter
      */
-    auto create_updown_counter(
-        std::string_view name,
-        std::string_view description = "",
-        std::string_view unit = "1",
-        metrics::labels_t labels = {}
-    ) -> metrics::updown_counter<int64_t>& {
+    auto create_updown_counter(std::string_view name, std::string_view description = "", std::string_view unit = "1",
+                               metrics::labels_t labels = {}) -> metrics::updown_counter<int64_t>& {
         labels.emplace_back("component_id", m_id);
-        return metrics::registry::instance().create_updown_counter(
-            std::string{name},
-            std::string{description},
-            std::string{unit},
-            std::move(labels)
-        );
+        return metrics::registry::instance().create_updown_counter(std::string{name}, std::string{description},
+                                                                   std::string{unit}, std::move(labels));
     }
 
     /**
@@ -831,19 +814,11 @@ protected:
      * @param labels Additional labels (component_id is auto-added)
      * @return Reference to the created gauge
      */
-    auto create_gauge(
-        std::string_view name,
-        std::string_view description = "",
-        std::string_view unit = "1",
-        metrics::labels_t labels = {}
-    ) -> metrics::gauge<double>& {
+    auto create_gauge(std::string_view name, std::string_view description = "", std::string_view unit = "1",
+                      metrics::labels_t labels = {}) -> metrics::gauge<double>& {
         labels.emplace_back("component_id", m_id);
-        return metrics::registry::instance().create_gauge(
-            std::string{name},
-            std::string{description},
-            std::string{unit},
-            std::move(labels)
-        );
+        return metrics::registry::instance().create_gauge(std::string{name}, std::string{description},
+                                                          std::string{unit}, std::move(labels));
     }
 
     /**
@@ -857,21 +832,11 @@ protected:
      * @param labels Additional labels (component_id is auto-added)
      * @return Reference to the created histogram
      */
-    auto create_histogram(
-        std::string_view name,
-        std::string_view description,
-        std::string_view unit,
-        std::vector<double> boundaries,
-        metrics::labels_t labels = {}
-    ) -> metrics::histogram& {
+    auto create_histogram(std::string_view name, std::string_view description, std::string_view unit,
+                          std::vector<double> boundaries, metrics::labels_t labels = {}) -> metrics::histogram& {
         labels.emplace_back("component_id", m_id);
         return metrics::registry::instance().create_histogram(
-            std::string{name},
-            std::string{description},
-            std::string{unit},
-            std::move(boundaries),
-            std::move(labels)
-        );
+            std::string{name}, std::string{description}, std::string{unit}, std::move(boundaries), std::move(labels));
     }
 
     /**
@@ -889,30 +854,21 @@ protected:
      * @param labels Additional labels (component_id is auto-added)
      * @return Reference to the created histogram
      */
-    auto create_histogram_pow2(
-        std::string_view name,
-        std::string_view description = "",
-        std::string_view unit = "1",
-        std::size_t num_buckets = 20,
-        metrics::labels_t labels = {}
-    ) -> metrics::histogram& {
+    auto create_histogram_pow2(std::string_view name, std::string_view description = "", std::string_view unit = "1",
+                               std::size_t num_buckets = 20, metrics::labels_t labels = {}) -> metrics::histogram& {
         labels.emplace_back("component_id", m_id);
-        return metrics::registry::instance().create_histogram_pow2(
-            std::string{name},
-            std::string{description},
-            std::string{unit},
-            num_buckets,
-            std::move(labels)
-        );
+        return metrics::registry::instance().create_histogram_pow2(std::string{name}, std::string{description},
+                                                                   std::string{unit}, num_buckets, std::move(labels));
     }
 
 private:
     std::string m_id;
     std::shared_ptr<composite::logger> m_logger;
-    park_coordinator m_park;                 ///< park handshake: lock-free process(), parked property writes
+    park_coordinator m_park; ///< park handshake: lock-free process(), parked property writes
     std::optional<std::jthread> m_thread;
     uint32_t m_delay{DEFAULT_DELAY};
-    uint32_t m_yield_interval{DEFAULT_YIELD_INTERVAL};  ///< sched_yield once per N consecutive NORMALs (worker reads lock-free; swapped under park)
+    uint32_t m_yield_interval{DEFAULT_YIELD_INTERVAL}; ///< sched_yield once per N consecutive NORMALs (worker reads
+                                                       ///< lock-free; swapped under park)
     // `enabled` is NOT a value property: it is the framework-owned DESIRED lifecycle
     // state (the "spec"). The observed state is computed from the worker (m_park /
     // m_thread), so there is no bound mirror to desync. A RUNTIME write reconciles
@@ -930,18 +886,24 @@ private:
     // tail in thread_func() — never both, and never zero. Exchange-guarded; see
     // worker_resources_down().
     std::atomic<bool> m_worker_resources_up{false};
-    bool m_measure_process_time{false};      ///< "measure_process_time" property: gates the hot-path clock reads (default off → zero clocks; principle 4). Worker reads lock-free; swapped only while parked.
-    bool m_finish_at_end{true};              ///< "finish_at_end" property: NOOP + inputs_at_end() → synthesized FINISH so the component self-completes on upstream EOS. Worker reads lock-free; swapped only while parked.
+    bool m_measure_process_time{
+        false}; ///< "measure_process_time" property: gates the hot-path clock reads (default off → zero clocks;
+                ///< principle 4). Worker reads lock-free; swapped only while parked.
+    bool m_finish_at_end{
+        true}; ///< "finish_at_end" property: NOOP + inputs_at_end() → synthesized FINISH so the component
+               ///< self-completes on upstream EOS. Worker reads lock-free; swapped only while parked.
     // Resilience: error_policy = restart-with-backoff (read on the cold error path only).
-    uint32_t m_error_restart_max{0};         ///< "error_restart_max": max consecutive process() throws to retry (0 = stop on first error, the default)
-    uint32_t m_error_restart_backoff_ms{100};///< "error_restart_backoff_ms": initial backoff; doubles each retry, capped
-    std::uint32_t m_error_restarts{0};       ///< worker-local consecutive-error counter (reset on a successful iteration)
+    uint32_t m_error_restart_max{
+        0}; ///< "error_restart_max": max consecutive process() throws to retry (0 = stop on first error, the default)
+    uint32_t m_error_restart_backoff_ms{
+        100};                          ///< "error_restart_backoff_ms": initial backoff; doubles each retry, capped
+    std::uint32_t m_error_restarts{0}; ///< worker-local consecutive-error counter (reset on a successful iteration)
     std::optional<cpu_set_t> m_cpu_affinity;
     port_set m_port_set;
     properties::property_set m_prop_set;
-    std::mutex m_lifecycle_mtx;              ///< serializes start/stop/enabled reconcile
+    std::mutex m_lifecycle_mtx; ///< serializes start/stop/enabled reconcile
     std::vector<connection> m_connections;
-    mutable std::mutex m_connections_mtx;    ///< guards m_connections (connect/disconnect vs REST readers)
+    mutable std::mutex m_connections_mtx; ///< guards m_connections (connect/disconnect vs REST readers)
     std::map<std::string, std::size_t> m_saved_input_depths;
 
     // Lifecycle metrics (registered in constructor)
@@ -964,36 +926,19 @@ private:
 
         metrics::labels_t labels = {{"component_id", m_id}};
 
-        m_process_calls = &registry.get_or_create_counter(
-            "composite.component.process_calls",
-            "Number of times process() was called",
-            "1",
-            labels
-        );
+        m_process_calls = &registry.get_or_create_counter("composite.component.process_calls",
+                                                          "Number of times process() was called", "1", labels);
 
-        m_noop_count = &registry.get_or_create_counter(
-            "composite.component.noop_count",
-            "Number of times process() returned NOOP",
-            "1",
-            labels
-        );
+        m_noop_count = &registry.get_or_create_counter("composite.component.noop_count",
+                                                       "Number of times process() returned NOOP", "1", labels);
 
         // Power-of-2 histogram for process time in microseconds
         // 20 buckets covers 1µs to ~1s which handles most signal processing scenarios
-        m_process_time = &registry.get_or_create_histogram_pow2(
-            "composite.component.process_time",
-            "Time spent in process() call",
-            "us",
-            20,
-            labels
-        );
+        m_process_time = &registry.get_or_create_histogram_pow2("composite.component.process_time",
+                                                                "Time spent in process() call", "us", 20, labels);
 
-        m_state = &registry.get_or_create_gauge(
-            "composite.component.state",
-            "Component state (0=stopped, 1=running)",
-            "1",
-            labels
-        );
+        m_state = &registry.get_or_create_gauge("composite.component.state", "Component state (0=stopped, 1=running)",
+                                                "1", labels);
 
         // Initialize state to stopped
         m_state->set(0.0);
@@ -1060,8 +1005,7 @@ private:
         const bool want = m_desired_enabled.load(std::memory_order_acquire);
         const bool has_handle = m_thread.has_value();
         // "live" = a handle that has not exited the park (running or still starting up).
-        const bool live = has_handle &&
-            m_park.current_state() != park_coordinator::state::EXITING;
+        const bool live = has_handle && m_park.current_state() != park_coordinator::state::EXITING;
         if (want && !live) {
             logger()->debug("Enabling component '{}'", m_id);
             resume_input_ports();
@@ -1087,7 +1031,7 @@ private:
 
     auto start_locked() -> void {
         if (m_thread.has_value()) {
-            stop_locked();  // clean stop before a restart
+            stop_locked(); // clean stop before a restart
         }
         // Clear completion status for the new run: not finished, error counter reset (else a
         // restarted component gives up early on the STALE consecutive-error count from the prior run).
@@ -1097,11 +1041,16 @@ private:
         // stale end-of-stream latch from a prior completed run must not leave downstream reporting
         // at_end() forever (nor mis-fire a premature EOS on the next completion).
         for (const auto& [name, port] : m_port_set.ports()) {
-            if (auto* out = dynamic_cast<output_port_base*>(port)) { out->reopen(); }
+            if (auto* out = dynamic_cast<output_port_base*>(port)) {
+                out->reopen();
+            }
         }
         // m_worker_done=false BEFORE we spawn, so the worker's exit (which sets it true) is always
         // ordered after this reset even if the worker exits immediately.
-        { std::scoped_lock lk{m_finished_mtx}; m_worker_done = false; }
+        {
+            std::scoped_lock lk{m_finished_mtx};
+            m_worker_done = false;
+        }
         // Bring up subclass worker resources (e.g. pipeline_component's pool), THEN spawn the main
         // worker — both under ONE try. A throw from on_worker_start() is realistic, not exotic:
         // start_pool() spawns N std::threads in a loop and a mid-loop std::thread ctor can throw
@@ -1124,7 +1073,10 @@ private:
             // the done-flag so wait_until_finished() doesn't block, report the failed run as errored
             // (distinct from "never started"), then tear down any partial worker resources HERE —
             // safe because nothing is running to reap them, so this cannot race a worker's own reap.
-            { std::scoped_lock lk{m_finished_mtx}; m_worker_done = true; }
+            {
+                std::scoped_lock lk{m_finished_mtx};
+                m_worker_done = true;
+            }
             m_finish_reason.store(finish_reason::error, std::memory_order_release);
             m_worker_resources_up.store(false, std::memory_order_release);
             on_worker_stop();
@@ -1139,19 +1091,23 @@ private:
             }
         }
 
-        if (m_state) { m_state->set(1.0); }
+        if (m_state) {
+            m_state->set(1.0);
+        }
     }
 
     auto stop_locked() -> void {
-        if (!m_thread.has_value()) { return; }  // idempotent
+        if (!m_thread.has_value()) {
+            return;
+        } // idempotent
 
         if (m_thread->get_stop_source().stop_possible()) {
             m_thread->request_stop();
         }
-        m_park.cancel_waiters();   // release a writer blocked waiting to park
-        on_park_requested();       // wake a worker blocked in get_data()
-        m_thread.reset();          // the single join site
-        m_park.settle_stopped();   // park state -> NO_WORKER
+        m_park.cancel_waiters(); // release a writer blocked waiting to park
+        on_park_requested();     // wake a worker blocked in get_data()
+        m_thread.reset();        // the single join site
+        m_park.settle_stopped(); // park state -> NO_WORKER
         // Ensure no EXTERNAL park call is still touching us before teardown. Skip the
         // wait when this stop() is REENTRANT from inside our own with_worker_parked (m_park_owner ==
         // this thread — e.g. a lifecycle-touching config on_apply calling stop() during the inline
@@ -1175,7 +1131,9 @@ private:
         // set_properties, apply_lifecycle_changes), so the staged reaction still runs on
         // the stopping thread but lock-free.
 
-        if (m_state) { m_state->set(0.0); }
+        if (m_state) {
+            m_state->set(0.0);
+        }
     }
 
     /// doorbell re-check: does any input port currently hold data? Called by the worker
@@ -1185,12 +1143,13 @@ private:
     [[nodiscard]] auto any_input_has_data() const -> bool {
         for (const auto& [name, port] : m_port_set.ports()) {
             if (const auto* in = dynamic_cast<const input_port_base*>(port)) {
-                if (in->pending() != 0) { return true; }
+                if (in->pending() != 0) {
+                    return true;
+                }
             }
         }
         return false;
     }
-
 
     /// reverse-doorbell re-check: can any output port accept data (a connected consumer has
     /// a free slot)? The AWAIT_OUTPUT idle path arms then re-reads this (absolute, not a delta —
@@ -1202,7 +1161,9 @@ private:
     [[nodiscard]] auto any_output_can_send() const -> bool {
         for (const auto& [name, port] : m_port_set.ports()) {
             if (const auto* out = dynamic_cast<const output_port_base*>(port)) {
-                if (out->can_send()) { return true; }
+                if (out->can_send()) {
+                    return true;
+                }
             }
         }
         return false;
@@ -1212,12 +1173,14 @@ private:
         using enum retval;
         m_park.worker_started();
         park_coordinator::exit_guard park_exit{m_park};
-        std::uint32_t normal_streak = 0;  // batched yield: consecutive NORMALs since the last sched_yield
-        finish_reason exit_reason = finish_reason::none;  // set iff the loop self-terminates (FINISH/throw)
+        std::uint32_t normal_streak = 0; // batched yield: consecutive NORMALs since the last sched_yield
+        finish_reason exit_reason = finish_reason::none; // set iff the loop self-terminates (FINISH/throw)
 
         while (!token.stop_requested()) {
-            m_park.park_point();  // quiesce here while a property write swaps; lock-free otherwise
-            if (token.stop_requested()) { break; }
+            m_park.park_point(); // quiesce here while a property write swaps; lock-free otherwise
+            if (token.stop_requested()) {
+                break;
+            }
 
             // Run any config<T> on_apply reaction that a property write staged while
             // we were parked — on THIS (worker) thread, at loop-top, BEFORE process(). So
@@ -1226,14 +1189,16 @@ private:
             m_prop_set.run_pending_reactions();
 
             retval res{};
-            bool errored = false;  // set if process() threw this iteration (FINISH-with-reason=error)
+            bool errored = false; // set if process() threw this iteration (FINISH-with-reason=error)
 
             // Per-iteration timing is opt-out to zero: only read the clock when the
             // "measure_process_time" property is set (lock-free read; swapped only
             // while parked). Off by default → the hot path reads no clock at all.
             const bool measure = m_measure_process_time;
             std::chrono::steady_clock::time_point start;
-            if (measure) { start = std::chrono::steady_clock::now(); }
+            if (measure) {
+                start = std::chrono::steady_clock::now();
+            }
             try {
                 res = process();
             } catch (const std::exception& e) {
@@ -1247,10 +1212,13 @@ private:
             }
 
             // Record metrics (process_calls is a clock-free counter, always on)
-            if (m_process_calls) { m_process_calls->inc(); }
+            if (m_process_calls) {
+                m_process_calls->inc();
+            }
             if (measure && m_process_time != nullptr) {
-                const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - start).count();
+                const auto elapsed_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+                        .count();
                 m_process_time->record(static_cast<double>(elapsed_us));
             }
 
@@ -1261,20 +1229,21 @@ private:
                 if (m_error_restart_max > 0 && m_error_restarts < m_error_restart_max) {
                     ++m_error_restarts;
                     const auto backoff = error_backoff_delay();
-                    logger()->warn("component '{}' retrying after error (attempt {}/{}), backoff {} ms",
-                                   m_id, m_error_restarts, m_error_restart_max,
-                                   static_cast<long long>(backoff.count()));
+                    logger()->warn("component '{}' retrying after error (attempt {}/{}), backoff {} ms", m_id,
+                                   m_error_restarts, m_error_restart_max, static_cast<long long>(backoff.count()));
                     // Wait out the backoff on the park CV so a stop OR a property-write park request
                     // wakes us promptly — a raw sleep here would leave a concurrent set_properties
                     // (with_worker_parked) waiting for us to reach a park point until it times out.
                     m_park.wait_for_data(std::chrono::duration_cast<std::chrono::nanoseconds>(backoff), token);
-                    if (token.stop_requested()) { break; }
-                    continue;  // retry (loop-top park_point applies any pending property write first)
+                    if (token.stop_requested()) {
+                        break;
+                    }
+                    continue; // retry (loop-top park_point applies any pending property write first)
                 }
                 // Give up: pause inputs, then fall through to the FINISH dispatch (exit_reason=error).
                 pause_input_ports();
             } else {
-                m_error_restarts = 0;  // a non-throwing iteration clears the consecutive-error count
+                m_error_restarts = 0; // a non-throwing iteration clears the consecutive-error count
             }
 
             // EOS-by-default: a NOOP with every input drained + producer-closed means the
@@ -1295,7 +1264,9 @@ private:
             }
 
             if (res == NOOP) {
-                if (m_noop_count) { m_noop_count->inc(); }
+                if (m_noop_count) {
+                    m_noop_count->inc();
+                }
                 // doorbell: instead of always sleeping out m_delay, arm the doorbell so an
                 // upstream producer's add_data wakes us the instant data arrives. The Dekker
                 // re-check (arm -> seq_cst fence -> re-scan inputs) closes the window where a
@@ -1311,9 +1282,11 @@ private:
                     m_park.wait_for_data(std::chrono::nanoseconds{m_delay}, token);
                 }
                 m_park.disarm_doorbell();
-                normal_streak = 0;  // the idle wait is itself a (much larger) yield
+                normal_streak = 0; // the idle wait is itself a (much larger) yield
             } else if (res == AWAIT_OUTPUT) {
-                if (m_noop_count) { m_noop_count->inc(); }
+                if (m_noop_count) {
+                    m_noop_count->inc();
+                }
                 // reverse doorbell: process() declared it is blocked on a full output. Arm,
                 // then re-check can_send() under a seq_cst fence (closes the window where a
                 // consumer drained between this return and the arm — its pop's fence pairs with
@@ -1365,7 +1338,8 @@ private:
                 send_eos();
             } catch (const std::exception& e) {
                 logger()->error("component '{}' send_eos() at completion threw: {}", m_id, e.what());
-            } catch (...) {}
+            } catch (...) {
+            }
         }
         // Reap subclass worker resources on SELF-termination (FINISH / error). stop_locked() is NOT
         // in the call path of a self-finish, so without this a pipeline_component's pool would linger
@@ -1380,17 +1354,23 @@ private:
                 worker_resources_down();
             } catch (const std::exception& e) {
                 logger()->error("component '{}' on_worker_stop() at completion threw: {}", m_id, e.what());
-            } catch (...) {}
+            } catch (...) {
+            }
             // Flip the exported state gauge to "stopped" — a self-finished worker is no longer running,
             // and stop_locked() (the only OTHER writer) is NOT in this call path, so without this the
             // composite.component.state metric would report 1.0/"running" forever after a batch/source
             // graph completes, contradicting is_running(). Ordered after the reap so the gauge flips to
             // 0 only once the component is fully quiesced, mirroring stop_locked().
-            if (m_state) { m_state->set(0.0); }
+            if (m_state) {
+                m_state->set(0.0);
+            }
         }
         // ALWAYS signal completion last (even if on_finished/send_eos/reap above threw) so a
         // wait_until_finished() waiter can never be stranded.
-        { std::scoped_lock lk{m_finished_mtx}; m_worker_done = true; }
+        {
+            std::scoped_lock lk{m_finished_mtx};
+            m_worker_done = true;
+        }
         m_finished_cv.notify_all();
     }
 

@@ -51,12 +51,10 @@ inline constexpr unsigned long abi_version = 1;
  * create()'s signature (the ABI-version handshake guards real incompatibilities).
  */
 struct create_args {
-    properties::json values{properties::json::object()};  ///< a JSON object of named args
+    properties::json values{properties::json::object()}; ///< a JSON object of named args
 
     /// True if no args were supplied.
-    [[nodiscard]] auto empty() const -> bool {
-        return !values.is_object() || values.empty();
-    }
+    [[nodiscard]] auto empty() const -> bool { return !values.is_object() || values.empty(); }
     /// The "type" discriminator (template variant selector), or "" if absent.
     [[nodiscard]] auto type() const -> std::string {
         return values.is_object() ? values.value("type", std::string{}) : std::string{};
@@ -78,21 +76,20 @@ struct create_args {
  * create(). Variadic so a factory lambda whose body contains commas (template arguments,
  * std::format calls) is accepted as one macro argument.
  */
-#define COMPOSITE_REGISTER_COMPONENT(...)                                                  \
-    extern "C" {                                                                           \
-    unsigned long composite_abi_version() { return ::composite::abi_version; }             \
-    std::shared_ptr<::composite::component> create(                                        \
-        std::string_view id, const ::composite::create_args& args) {                       \
-        return (__VA_ARGS__)(id, args);                                                    \
-    }                                                                                      \
+#define COMPOSITE_REGISTER_COMPONENT(...)                                                                              \
+    extern "C" {                                                                                                       \
+    unsigned long composite_abi_version() {                                                                            \
+        return ::composite::abi_version;                                                                               \
+    }                                                                                                                  \
+    std::shared_ptr<::composite::component> create(std::string_view id, const ::composite::create_args& args) {        \
+        return (__VA_ARGS__)(id, args);                                                                                \
+    }                                                                                                                  \
     }
 
 /**
  * Convenience for a non-templated component with a `Class(std::string_view id)` ctor and
  * no construction args.
  */
-#define COMPOSITE_REGISTER_SIMPLE(CLASS)                                                   \
-    COMPOSITE_REGISTER_COMPONENT(                                                           \
-        [](std::string_view id, const ::composite::create_args&) {                         \
-            return std::make_shared<CLASS>(id);                                            \
-        })
+#define COMPOSITE_REGISTER_SIMPLE(CLASS)                                                                               \
+    COMPOSITE_REGISTER_COMPONENT(                                                                                      \
+        [](std::string_view id, const ::composite::create_args&) { return std::make_shared<CLASS>(id); })

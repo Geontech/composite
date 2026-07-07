@@ -45,9 +45,7 @@ namespace composite {
  */
 class park_coordinator {
 public:
-    enum class state : std::uint8_t {
-        NO_WORKER, RUNNING, PARK_REQUESTED, PARKED, RESUMING, EXITING
-    };
+    enum class state : std::uint8_t { NO_WORKER, RUNNING, PARK_REQUESTED, PARKED, RESUMING, EXITING };
 
     explicit park_coordinator(std::string name = {}) : m_name(std::move(name)) {}
 
@@ -101,15 +99,15 @@ public:
     /// (RESUMING->RUNNING, acquire — the publication edge), then return.
     auto park_point() -> void {
         if (m_park.load(std::memory_order_acquire) != state::PARK_REQUESTED) {
-            return;  // fast path: nothing pending
+            return; // fast path: nothing pending
         }
         std::unique_lock lk{m_run_mtx};
         auto expected = state::PARK_REQUESTED;
-        if (!m_park.compare_exchange_strong(expected, state::PARKED,
-                std::memory_order_release, std::memory_order_acquire)) {
-            return;  // raced to EXITING (or already serviced) — nothing to do
+        if (!m_park.compare_exchange_strong(expected, state::PARKED, std::memory_order_release,
+                                            std::memory_order_acquire)) {
+            return; // raced to EXITING (or already serviced) — nothing to do
         }
-        m_run_cv.notify_all();  // tell the writer we have parked
+        m_run_cv.notify_all(); // tell the writer we have parked
         m_run_cv.wait(lk, [this] {
             auto s = m_park.load(std::memory_order_acquire);
             return s == state::RESUMING || s == state::EXITING;
@@ -117,9 +115,8 @@ public:
         auto resuming = state::RESUMING;
         // Consume RESUMING->RUNNING (acquire): synchronizes-with the writer's
         // release of the mutation. If EXITING, the CAS fails and we fall through.
-        m_park.compare_exchange_strong(resuming, state::RUNNING,
-                std::memory_order_acquire, std::memory_order_relaxed);
-        m_run_cv.notify_all();  // let a second waiting writer observe RUNNING
+        m_park.compare_exchange_strong(resuming, state::RUNNING, std::memory_order_acquire, std::memory_order_relaxed);
+        m_run_cv.notify_all(); // let a second waiting writer observe RUNNING
     }
 
     // ------------------------------------------------------- doorbell wake
@@ -162,7 +159,9 @@ public:
     /// asleep until the timeout — notify_all guarantees the worker re-checks.
     auto signal_data() -> void {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!m_doorbell_armed.load(std::memory_order_seq_cst)) { return; }
+        if (!m_doorbell_armed.load(std::memory_order_seq_cst)) {
+            return;
+        }
         {
             std::scoped_lock lk{m_run_mtx};
             m_data_pending = true;
@@ -180,9 +179,8 @@ public:
     auto wait_for_data(std::chrono::nanoseconds d, std::stop_token token) -> void {
         std::unique_lock lk{m_run_mtx};
         m_run_cv.wait_for(lk, d, [this, &token] {
-            return m_data_pending
-                || token.stop_requested()
-                || m_park.load(std::memory_order_acquire) == state::PARK_REQUESTED;
+            return m_data_pending || token.stop_requested() ||
+                   m_park.load(std::memory_order_acquire) == state::PARK_REQUESTED;
         });
         m_data_pending = false;
     }
@@ -242,11 +240,11 @@ public:
             }
             if (s == state::RUNNING) {
                 auto expected = state::RUNNING;
-                if (m_park.compare_exchange_strong(expected, state::PARK_REQUESTED,
-                        std::memory_order_release, std::memory_order_acquire)) {
+                if (m_park.compare_exchange_strong(expected, state::PARK_REQUESTED, std::memory_order_release,
+                                                   std::memory_order_acquire)) {
                     break;
                 }
-                continue;  // lost the CAS race; re-evaluate
+                continue; // lost the CAS race; re-evaluate
             }
             // PARK_REQUESTED / PARKED / RESUMING from another writer's cycle: wait
             // until it settles back to RUNNING (or the worker exits).
@@ -258,7 +256,9 @@ public:
 
         m_run_cv.notify_all();
         run_lk.unlock();
-        if (m_poke) { m_poke(); }  // poke a blocked/looping worker [outside m_run_mtx]
+        if (m_poke) {
+            m_poke();
+        } // poke a blocked/looping worker [outside m_run_mtx]
         run_lk.lock();
 
         // Wait for the worker to ack the park (PARKED) or to have exited (EXITING/
@@ -271,8 +271,7 @@ public:
         if (!acked) {
             // Bounded timeout: roll the request back so the worker keeps running.
             auto req = state::PARK_REQUESTED;
-            m_park.compare_exchange_strong(req, state::RUNNING,
-                    std::memory_order_release, std::memory_order_relaxed);
+            m_park.compare_exchange_strong(req, state::RUNNING, std::memory_order_release, std::memory_order_relaxed);
             m_run_cv.notify_all();
             run_lk.unlock();
             throw std::runtime_error{m_name + ": worker failed to park within timeout"};
@@ -323,15 +322,13 @@ public:
     auto settle_stopped() -> void {
         std::scoped_lock lk{m_run_mtx};
         m_park.store(state::NO_WORKER, std::memory_order_release);
-        m_data_pending = false;  // clear a stale data-signal so a restarted worker does not spin one NOOP
+        m_data_pending = false; // clear a stale data-signal so a restarted worker does not spin one NOOP
         m_run_cv.notify_all();
     }
 
     /// In-flight with_worker_parked calls; stop() drains this to 0 before tearing
     /// down resources the poke() hook touches.
-    [[nodiscard]] auto in_flight() const -> int {
-        return m_park_calls_in_flight.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] auto in_flight() const -> int { return m_park_calls_in_flight.load(std::memory_order_acquire); }
 
     /// Block until no with_worker_parked call is in flight. stop() calls this after
     /// the worker is joined and settled, so a subsequent teardown (e.g. port
@@ -344,9 +341,7 @@ public:
         }
     }
 
-    [[nodiscard]] auto current_state() const -> state {
-        return m_park.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] auto current_state() const -> state { return m_park.load(std::memory_order_acquire); }
 
     /// True if a worker thread exists that will reach a loop point (i.e. NOT
     /// NO_WORKER / EXITING). Used to decide whether a deferred config reaction will
@@ -372,7 +367,7 @@ private:
     auto run_inline_gated(std::thread::id self, std::unique_lock<std::mutex>& run_lk, Fn&& fn) -> void {
         m_inline_writers.fetch_add(1, std::memory_order_acq_rel);
         run_lk.unlock();
-        run_inline(self, std::forward<Fn>(fn));  // deregisters via RAII
+        run_inline(self, std::forward<Fn>(fn)); // deregisters via RAII
     }
 
     // Caller has incremented m_inline_writers (under m_run_mtx). This runs fn under
@@ -392,7 +387,7 @@ private:
         ~inline_dereg() {
             std::scoped_lock lk{c.m_run_mtx};
             c.m_inline_writers.fetch_sub(1, std::memory_order_acq_rel);
-            c.m_run_cv.notify_all();  // let a waiting worker_started() proceed
+            c.m_run_cv.notify_all(); // let a waiting worker_started() proceed
         }
     };
 
@@ -421,8 +416,8 @@ private:
                     auto parked = state::PARKED;
                     // Publish the mutation: PARKED->RESUMING (release). Only if we
                     // actually parked the worker (else it's gone — don't orphan a token).
-                    c.m_park.compare_exchange_strong(parked, state::RESUMING,
-                            std::memory_order_release, std::memory_order_relaxed);
+                    c.m_park.compare_exchange_strong(parked, state::RESUMING, std::memory_order_release,
+                                                     std::memory_order_relaxed);
                     c.m_run_cv.notify_all();
                 }
             }
@@ -432,15 +427,15 @@ private:
 
     std::string m_name;
     std::atomic<state> m_park{state::NO_WORKER};
-    std::mutex m_run_mtx;                          ///< guards every park transition + CV
+    std::mutex m_run_mtx; ///< guards every park transition + CV
     std::condition_variable m_run_cv;
-    std::atomic<bool> m_doorbell_armed{false};     ///< consumer is sleeping & wants a data-arrival wake
-    bool m_data_pending{false};                    ///< producer signalled data (guarded by m_run_mtx)
-    mutable std::shared_mutex m_data_mtx;          ///< REST reader/writer exclusion
+    std::atomic<bool> m_doorbell_armed{false}; ///< consumer is sleeping & wants a data-arrival wake
+    bool m_data_pending{false};                ///< producer signalled data (guarded by m_run_mtx)
+    mutable std::shared_mutex m_data_mtx;      ///< REST reader/writer exclusion
     std::atomic<std::thread::id> m_worker_id{};
-    std::atomic<std::thread::id> m_park_owner{};   ///< reentrancy key
-    std::atomic<int> m_park_calls_in_flight{0};    ///< park calls in flight; see drain_in_flight()
-    std::atomic<int> m_inline_writers{0};          ///< gates worker_started vs inline writes
+    std::atomic<std::thread::id> m_park_owner{}; ///< reentrancy key
+    std::atomic<int> m_park_calls_in_flight{0};  ///< park calls in flight; see drain_in_flight()
+    std::atomic<int> m_inline_writers{0};        ///< gates worker_started vs inline writes
     std::chrono::milliseconds m_timeout{std::chrono::seconds{5}};
     std::function<void()> m_poke;
 };

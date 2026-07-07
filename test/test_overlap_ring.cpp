@@ -23,7 +23,10 @@ using composite::overlap_ring;
 namespace {
 int g_failures = 0;
 void check(bool ok, const char* what) {
-    if (!ok) { std::printf("FAIL: %s\n", what); ++g_failures; }
+    if (!ok) {
+        std::printf("FAIL: %s\n", what);
+        ++g_failures;
+    }
 }
 
 // Write `count` samples whose value at absolute index a is {a, -a}. `base` is the absolute index of
@@ -40,11 +43,15 @@ auto write_seq(const std::shared_ptr<overlap_ring<cf>>& ring, std::size_t base, 
 
 // A frame starting at `start` must contain absolute samples [start, start+frame_size).
 auto frame_ok(const composite::immutable_buffer<cf>& f, std::size_t start, std::size_t frame_size) -> bool {
-    if (f.size() != frame_size) { return false; }
+    if (f.size() != frame_size) {
+        return false;
+    }
     const auto* p = f.data();
     for (std::size_t i = 0; i < frame_size; ++i) {
         const auto a = static_cast<float>(start + i);
-        if (p[i].real() != a || p[i].imag() != -a) { return false; }
+        if (p[i].real() != a || p[i].imag() != -a) {
+            return false;
+        }
     }
     return true;
 }
@@ -52,16 +59,25 @@ auto frame_ok(const composite::immutable_buffer<cf>& f, std::size_t start, std::
 
 int main() {
     // ---- construction validation ----
-    try { (void)std::make_shared<overlap_ring<cf>>(0, 4, 8); check(false, "frame_size==0 should throw"); }
-    catch (const std::invalid_argument&) {}
-    try { (void)std::make_shared<overlap_ring<cf>>(8, 8, 8); check(false, "overlap>=frame_size should throw"); }
-    catch (const std::invalid_argument&) {}
-    try { (void)std::make_shared<overlap_ring<cf>>(8, 4, 0); check(false, "frame_count==0 should throw"); }
-    catch (const std::invalid_argument&) {}
+    try {
+        (void)std::make_shared<overlap_ring<cf>>(0, 4, 8);
+        check(false, "frame_size==0 should throw");
+    } catch (const std::invalid_argument&) {
+    }
+    try {
+        (void)std::make_shared<overlap_ring<cf>>(8, 8, 8);
+        check(false, "overlap>=frame_size should throw");
+    } catch (const std::invalid_argument&) {
+    }
+    try {
+        (void)std::make_shared<overlap_ring<cf>>(8, 4, 0);
+        check(false, "frame_count==0 should throw");
+    } catch (const std::invalid_argument&) {
+    }
 
     // ---- basic write + emit + contents ----
     {
-        constexpr std::size_t FS = 8, OV = 4, FC = 4, HOP = FS - OV;  // hop=4, ring_size=4*4+4=20
+        constexpr std::size_t FS = 8, OV = 4, FC = 4, HOP = FS - OV; // hop=4, ring_size=4*4+4=20
         auto ring = std::make_shared<overlap_ring<cf>>(FS, OV, FC);
         check(ring->frame_size() == FS && ring->hop_size() == HOP && ring->head() == 0, "geometry");
         check(!ring->try_emit_frame(0).has_value(), "emit before data -> nullopt");
@@ -70,7 +86,11 @@ int main() {
         check(f0.has_value() && frame_ok(*f0, 0, FS), "frame@0 contents");
         // hop alignment is enforced.
         bool threw = false;
-        try { (void)ring->try_emit_frame(1); } catch (const std::logic_error&) { threw = true; }
+        try {
+            (void)ring->try_emit_frame(1);
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
         check(threw, "non-hop-aligned start throws");
         // zero-count write is a successful no-op that does not advance the head.
         const auto h = ring->head();
@@ -86,8 +106,12 @@ int main() {
         constexpr std::size_t FS = 8, OV = 4, FC = 8, HOP = FS - OV;
         auto ring = std::make_shared<overlap_ring<cf>>(FS, OV, FC);
         std::size_t total = 0;
-        for (int k = 0; k < 4; ++k) { check(write_seq(ring, total, HOP), "write hop"); total += HOP; }
-        check(write_seq(ring, total, OV), "write trailing overlap"); total += OV;  // enough for 4 frames
+        for (int k = 0; k < 4; ++k) {
+            check(write_seq(ring, total, HOP), "write hop");
+            total += HOP;
+        }
+        check(write_seq(ring, total, OV), "write trailing overlap");
+        total += OV; // enough for 4 frames
         for (std::size_t s = 0; s + FS <= total; s += HOP) {
             auto f = ring->try_emit_frame(s);
             check(f.has_value() && frame_ok(*f, s, FS), "multiframe contents");
@@ -96,7 +120,7 @@ int main() {
 
     // ---- WRAPAROUND CONTIGUITY (tail mirror) ----
     {
-        constexpr std::size_t FS = 8, OV = 4, FC = 4;  // ring_size = 20
+        constexpr std::size_t FS = 8, OV = 4, FC = 4; // ring_size = 20
         auto ring = std::make_shared<overlap_ring<cf>>(FS, OV, FC);
         // Write 24 samples in two batches (each <= ring_size=20), wrapping the ring at 20.
         check(write_seq(ring, 0, 16), "write 16");
@@ -112,16 +136,16 @@ int main() {
         constexpr std::size_t FS = 8, OV = 4, FC = 4;
         auto ring = std::make_shared<overlap_ring<cf>>(FS, OV, FC);
         check(write_seq(ring, 0, FS), "write FS");
-        auto held = ring->try_emit_frame(0);                 // slot 0 now in use
+        auto held = ring->try_emit_frame(0); // slot 0 now in use
         check(held.has_value(), "emit frame@0");
         check(!ring->try_emit_frame(0).has_value(), "re-emit while slot held -> nullopt");
-        held.reset();                                        // release the frame -> slot freed
+        held.reset(); // release the frame -> slot freed
         check(ring->try_emit_frame(0).has_value(), "re-emit after release -> ok");
     }
 
     // ---- drop-on-backpressure (protected region) + batch-too-large ----
     {
-        constexpr std::size_t FS = 8, OV = 4, FC = 4;  // ring_size = 20
+        constexpr std::size_t FS = 8, OV = 4, FC = 4; // ring_size = 20
         auto ring = std::make_shared<overlap_ring<cf>>(FS, OV, FC);
         // Batch larger than the ring is dropped immediately.
         check(!write_seq(ring, 0, 21), "batch > ring_size dropped");
@@ -129,7 +153,7 @@ int main() {
               "BATCH_TOO_LARGE recorded");
         // Fill the ring, hold frame@0 (protects [0,8)), then a write that would overwrite the
         // protected region is dropped (BACKPRESSURE_TIMEOUT); releasing the frame lets it through.
-        check(write_seq(ring, 0, 20), "fill ring_size");   // head=20, ring full
+        check(write_seq(ring, 0, 20), "fill ring_size"); // head=20, ring full
         auto held = ring->try_emit_frame(0);
         check(held.has_value(), "hold frame@0 (protects [0,8))");
         check(!write_seq(ring, 20, 8), "write into protected region dropped");
@@ -151,7 +175,7 @@ int main() {
         constexpr std::size_t FS = 64, OV = 16, FC = 32, HOP = FS - OV;
         auto ring = std::make_shared<overlap_ring<cf>>(FS, OV, FC);
         std::mutex m;
-        std::vector<composite::immutable_buffer<cf>> handoff;  // frames awaiting release by the consumer
+        std::vector<composite::immutable_buffer<cf>> handoff; // frames awaiting release by the consumer
         std::atomic<bool> done{false};
         std::atomic<bool> bad{false};
 
@@ -160,7 +184,10 @@ int main() {
                 composite::immutable_buffer<cf> f;
                 {
                     std::scoped_lock lk{m};
-                    if (!handoff.empty()) { f = std::move(handoff.back()); handoff.pop_back(); }
+                    if (!handoff.empty()) {
+                        f = std::move(handoff.back());
+                        handoff.pop_back();
+                    }
                 }
                 if (f.has_data()) {
                     // READ the frame's samples on THIS (consumer) thread, then release it (destroyed
@@ -183,14 +210,20 @@ int main() {
             }
         });
 
-        std::size_t total = 0;     // samples successfully written
-        std::size_t next = 0;      // next frame start to emit
+        std::size_t total = 0; // samples successfully written
+        std::size_t next = 0;  // next frame start to emit
         for (int i = 0; i < 20000; ++i) {
-            if (write_seq(ring, total, HOP)) { total += HOP; }      // may drop under backpressure
+            if (write_seq(ring, total, HOP)) {
+                total += HOP;
+            } // may drop under backpressure
             while (ring->head() >= next + FS) {
                 auto f = ring->try_emit_frame(next);
-                if (!f) { break; }                                  // slot still held by consumer
-                if (!frame_ok(*f, next, FS)) { bad.store(true, std::memory_order_relaxed); }  // verified while HELD
+                if (!f) {
+                    break;
+                } // slot still held by consumer
+                if (!frame_ok(*f, next, FS)) {
+                    bad.store(true, std::memory_order_relaxed);
+                } // verified while HELD
                 next += HOP;
                 std::scoped_lock lk{m};
                 handoff.push_back(std::move(*f));
@@ -204,7 +237,10 @@ int main() {
         check(ring->get_diagnostics().slots_in_use == 0, "all frame slots released after run");
     }
 
-    if (g_failures) { std::printf("\n%d FAILURE(S)\n", g_failures); return 1; }
+    if (g_failures) {
+        std::printf("\n%d FAILURE(S)\n", g_failures);
+        return 1;
+    }
     std::puts("OVERLAP_RING OK: construction, emit, overlap, wraparound mirror, slot conflict, "
               "backpressure, and concurrent producer/reader all correct");
     return 0;

@@ -9,7 +9,7 @@
 
 #include "composite/core/application.hpp"
 #include "composite/core/component.hpp"
-#include "helpers.hpp"  // make_server consumes the production helpers
+#include "helpers.hpp" // make_server consumes the production helpers
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
@@ -35,8 +35,15 @@ auto make_server(application&) -> std::unique_ptr<httplib::Server>;
 
 namespace {
 enum class Win { hann, hamming };
-struct Chan { double cf{}; double bw{}; Win win{Win::hann}; };
-struct Net  { std::string host{"localhost"}; std::uint16_t port{8080}; };
+struct Chan {
+    double cf{};
+    double bw{};
+    Win win{Win::hann};
+};
+struct Net {
+    std::string host{"localhost"};
+    std::uint16_t port{8080};
+};
 } // namespace
 
 COMPOSITE_ENUM(Win, hann, hamming);
@@ -53,42 +60,47 @@ public:
         add_property("gain", m_gain, config_type::RUNTIME).validate([](const double& g) { return g > 0.0; });
         add_property("buf_size", m_buf, config_type::INITIALIZE);
         add_property("net", m_net, config_type::RUNTIME);
-        add_keyed("channels", m_channels, config_type::RUNTIME)
-            .validate_element([](const std::string&, const Chan& c) { return c.bw > 0.0; });
+        add_keyed("channels", m_channels, config_type::RUNTIME).validate_element([](const std::string&, const Chan& c) {
+            return c.bw > 0.0;
+        });
     }
     auto process() -> retval override { return retval::NOOP; }
-    input_port<mutable_buffer<float>>  m_in{"data_in"};
+    input_port<mutable_buffer<float>> m_in{"data_in"};
     output_port<mutable_buffer<float>> m_out{"data_out"};
     double m_gain{1.0};
     std::int32_t m_buf{1024};
     Net m_net;
     std::map<std::string, Chan> m_channels;
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 
 class rest_fixture {
 public:
     rest_fixture() {
         m_app.add_component(std::make_shared<rest_component>("c1"));
-        m_app.add_component(std::make_shared<rest_component>("c2"));  // for batch-PATCH tests
+        m_app.add_component(std::make_shared<rest_component>("c2")); // for batch-PATCH tests
         m_server = composite::make_server(m_app);
         // Bind to an ephemeral port (0) so concurrent runs / a busy 18091 can't make
         // listen() silently fail and leave every request returning a null Result
         // (which the assertions would then dereference -> segfault).
         m_port = m_server->bind_to_any_port("localhost");
-        REQUIRE(m_port > 0);  // bind must succeed before any request is issued
+        REQUIRE(m_port > 0); // bind must succeed before any request is issued
         m_thread = std::thread([this] { m_server->listen_after_bind(); });
-        for (int i = 0; i < 400 && !m_server->is_running(); ++i) { std::this_thread::sleep_for(5ms); }
-        REQUIRE(m_server->is_running());  // fail fast instead of deref-ing null responses later
+        for (int i = 0; i < 400 && !m_server->is_running(); ++i) {
+            std::this_thread::sleep_for(5ms);
+        }
+        REQUIRE(m_server->is_running()); // fail fast instead of deref-ing null responses later
     }
     ~rest_fixture() {
         m_server->stop();
-        if (m_thread.joinable()) { m_thread.join(); }
+        if (m_thread.joinable()) {
+            m_thread.join();
+        }
     }
     auto client() -> httplib::Client { return httplib::Client("localhost", m_port); }
 
     application m_app{"testapp"};
-    int m_port{0};  // assigned by bind_to_any_port() in the constructor
+    int m_port{0}; // assigned by bind_to_any_port() in the constructor
     std::unique_ptr<httplib::Server> m_server;
     std::thread m_thread;
 };
@@ -118,27 +130,32 @@ TEST_CASE_METHOD(rest_fixture, "PATCH components (batch) surfaces failures, no m
     auto cli = client();
 
     // All-success batch -> 200.
-    auto ok = cli.Patch("/app/components",
-        R"({"components":[{"id":"c1","properties":{"gain":2.0}}]})", "application/json");
+    auto ok =
+        cli.Patch("/app/components", R"({"components":[{"id":"c1","properties":{"gain":2.0}}]})", "application/json");
     REQUIRE(ok);
     REQUIRE(ok->status == 200);
     REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 2.0);
 
     // A NOT-FOUND component FOLLOWED BY a valid one. Old code returned the trailing 200,
     // masking the 404; now the 404 must surface as 207 and the valid one still applies.
-    auto mixed = cli.Patch("/app/components",
-        R"({"components":[{"id":"ghost","properties":{"gain":2.0}},{"id":"c1","properties":{"gain":3.0}}]})",
-        "application/json");
+    auto mixed =
+        cli.Patch("/app/components",
+                  R"({"components":[{"id":"ghost","properties":{"gain":2.0}},{"id":"c1","properties":{"gain":3.0}}]})",
+                  "application/json");
     REQUIRE(mixed);
-    REQUIRE(mixed->status == 207);                  // NOT 200 — failure is not masked
+    REQUIRE(mixed->status == 207); // NOT 200 — failure is not masked
     auto body = json::parse(mixed->body);
     REQUIRE(body["failed"] == 1);
     REQUIRE(body["applied"] == 1);
     bool ghost_404 = false;
     bool c1_ok = false;
     for (const auto& r : body["results"]) {
-        if (r.value("id", std::string{}) == "ghost") { ghost_404 = (r["status"] == 404); }
-        if (r.value("id", std::string{}) == "c1")    { c1_ok = (r["status"] == 200); }
+        if (r.value("id", std::string{}) == "ghost") {
+            ghost_404 = (r["status"] == 404);
+        }
+        if (r.value("id", std::string{}) == "c1") {
+            c1_ok = (r["status"] == 200);
+        }
     }
     REQUIRE(ghost_404);
     REQUIRE(c1_ok);
@@ -147,8 +164,8 @@ TEST_CASE_METHOD(rest_fixture, "PATCH components (batch) surfaces failures, no m
 
     // A rejected value reports the component as failed (207) and per-component atomicity holds
     // (the bad value did not apply).
-    auto badval = cli.Patch("/app/components",
-        R"({"components":[{"id":"c1","properties":{"gain":-5.0}}]})", "application/json");
+    auto badval =
+        cli.Patch("/app/components", R"({"components":[{"id":"c1","properties":{"gain":-5.0}}]})", "application/json");
     REQUIRE(badval);
     REQUIRE(badval->status == 207);
     REQUIRE(json::parse(badval->body)["failed"] == 1);
@@ -157,16 +174,17 @@ TEST_CASE_METHOD(rest_fixture, "PATCH components (batch) surfaces failures, no m
     // THE masking scenario: a VALIDATION failure (c2) FOLLOWED BY a success (c1). The old
     // handler caught c2's error, then overwrote the response with c1's 200 — reporting overall
     // success and hiding c2's failure. Now it must be 207 with c2 flagged failed and c1 applied.
-    auto mask = cli.Patch("/app/components",
-        R"({"components":[{"id":"c2","properties":{"gain":-1.0}},{"id":"c1","properties":{"gain":5.0}}]})",
-        "application/json");
+    auto mask =
+        cli.Patch("/app/components",
+                  R"({"components":[{"id":"c2","properties":{"gain":-1.0}},{"id":"c1","properties":{"gain":5.0}}]})",
+                  "application/json");
     REQUIRE(mask);
-    REQUIRE(mask->status == 207);                   // old code would have returned 200 here
+    REQUIRE(mask->status == 207); // old code would have returned 200 here
     auto mb = json::parse(mask->body);
     REQUIRE(mb["failed"] == 1);
     REQUIRE(mb["applied"] == 1);
-    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 5.0);   // applied
-    REQUIRE(json::parse(cli.Get("/app/components/c2/properties")->body)["gain"] == 1.0);   // rejected -> default
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 5.0); // applied
+    REQUIRE(json::parse(cli.Get("/app/components/c2/properties")->body)["gain"] == 1.0); // rejected -> default
 }
 
 TEST_CASE_METHOD(rest_fixture, "PATCH component sets a scalar", "[http]") {
@@ -197,26 +215,30 @@ TEST_CASE_METHOD(rest_fixture, "validation -> 400, config -> 403", "[http]") {
 
     auto init = cli.Patch("/app/components/c1", R"({"properties": {"buf_size": 4096}})", "application/json");
     REQUIRE(init);
-    REQUIRE(init->status == 403);  // INITIALIZE-only at runtime
+    REQUIRE(init->status == 403); // INITIALIZE-only at runtime
 }
 
 TEST_CASE_METHOD(rest_fixture, "nested struct + keyed collection via JSON", "[http]") {
     auto cli = client();
     // nested 7396 merge
-    REQUIRE(cli.Patch("/app/components/c1", R"({"properties": {"net": {"port": 9000}}})", "application/json")->status == 200);
+    REQUIRE(cli.Patch("/app/components/c1", R"({"properties": {"net": {"port": 9000}}})", "application/json")->status ==
+            200);
     auto st = json::parse(cli.Get("/app/components/c1/properties")->body);
     REQUIRE(st["net"]["port"] == 9000);
-    REQUIRE(st["net"]["host"] == "localhost");  // preserved
+    REQUIRE(st["net"]["host"] == "localhost"); // preserved
 
     // keyed add
-    REQUIRE(cli.Patch("/app/components/c1",
-                      R"({"properties": {"channels": {"L": {"bw": 10e6, "cf": 1e9}}}})", "application/json")->status == 200);
+    REQUIRE(cli.Patch("/app/components/c1", R"({"properties": {"channels": {"L": {"bw": 10e6, "cf": 1e9}}}})",
+                      "application/json")
+                ->status == 200);
     st = json::parse(cli.Get("/app/components/c1/properties")->body);
     REQUIRE(st["channels"].contains("L"));
     REQUIRE(st["channels"]["L"]["bw"] == 10e6);
 
     // keyed remove via nested null
-    REQUIRE(cli.Patch("/app/components/c1", R"({"properties": {"channels": {"L": null}}})", "application/json")->status == 200);
+    REQUIRE(
+        cli.Patch("/app/components/c1", R"({"properties": {"channels": {"L": null}}})", "application/json")->status ==
+        200);
     st = json::parse(cli.Get("/app/components/c1/properties")->body);
     REQUIRE(st["channels"].empty());
 }
@@ -228,7 +250,7 @@ TEST_CASE_METHOD(rest_fixture, "DELETE resets a property to default", "[http]") 
     auto del = cli.Delete("/app/components/c1/properties/net");
     REQUIRE(del);
     REQUIRE(del->status == 200);
-    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["net"]["port"] == 8080);  // default
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["net"]["port"] == 8080); // default
 }
 
 // GET /app/components/:id/schema returns a property descriptor array incl. the `enabled` virtual.
@@ -240,11 +262,10 @@ TEST_CASE_METHOD(rest_fixture, "GET component schema", "[http]") {
     auto schema = json::parse(r->body);
     REQUIRE(schema.is_array());
     auto has = [&](std::string_view name) {
-        return std::any_of(schema.begin(), schema.end(),
-                           [&](const json& e) { return e.value("name", "") == name; });
+        return std::any_of(schema.begin(), schema.end(), [&](const json& e) { return e.value("name", "") == name; });
     };
-    REQUIRE(has("gain"));        // a registered property
-    REQUIRE(has("enabled"));     // the spec/status virtual is advertised for UIs
+    REQUIRE(has("gain"));    // a registered property
+    REQUIRE(has("enabled")); // the spec/status virtual is advertised for UIs
     // Unknown component -> 404.
     REQUIRE(cli.Get("/app/components/nope/schema")->status == 404);
 }
@@ -252,12 +273,12 @@ TEST_CASE_METHOD(rest_fixture, "GET component schema", "[http]") {
 // DELETE /app/components/:id stops + unloads the component; it then 404s and drops from the list.
 TEST_CASE_METHOD(rest_fixture, "DELETE component removes it", "[http]") {
     auto cli = client();
-    REQUIRE(cli.Get("/app/components/c2")->status == 200);    // present to start
+    REQUIRE(cli.Get("/app/components/c2")->status == 200); // present to start
     auto del = cli.Delete("/app/components/c2");
     REQUIRE(del);
     REQUIRE(del->status == 200);
-    REQUIRE(cli.Get("/app/components/c2")->status == 404);    // gone
-    REQUIRE(cli.Get("/app/components/c1")->status == 200);    // sibling untouched
+    REQUIRE(cli.Get("/app/components/c2")->status == 404); // gone
+    REQUIRE(cli.Get("/app/components/c1")->status == 200); // sibling untouched
     auto comps = json::parse(cli.Get("/app/components")->body);
     REQUIRE(comps.size() == 1);
     // Deleting an unknown component -> 404.
@@ -268,14 +289,15 @@ TEST_CASE_METHOD(rest_fixture, "DELETE component removes it", "[http]") {
 TEST_CASE_METHOD(rest_fixture, "DELETE a connected component is safe", "[http]") {
     auto cli = client();
     // Wire c1:data_out -> c2:data_in via REST, then delete the consumer c2.
-    auto conn = cli.Post("/app/connections",
-        R"({"output":{"component":"c1","port":"data_out"},"input":{"component":"c2","port":"data_in"}})",
-        "application/json");
+    auto conn =
+        cli.Post("/app/connections",
+                 R"({"output":{"component":"c1","port":"data_out"},"input":{"component":"c2","port":"data_in"}})",
+                 "application/json");
     REQUIRE(conn);
-    if (conn->status == 201) {  // only if rest_component actually exposes those ports
+    if (conn->status == 201) { // only if rest_component actually exposes those ports
         REQUIRE(cli.Delete("/app/components/c2")->status == 200);
         REQUIRE(cli.Get("/app/components/c2")->status == 404);
-        REQUIRE(cli.Get("/app/components/c1")->status == 200);  // producer survives, no dangling edge
+        REQUIRE(cli.Get("/app/components/c1")->status == 200); // producer survives, no dangling edge
     }
 }
 
@@ -306,20 +328,35 @@ TEST_CASE_METHOD(rest_fixture, "OpenAPI spec is well-formed and matches the rout
 
     std::vector<std::string> actual;
     for (auto& [path, methods] : spec["paths"].items()) {
-        for (auto& [method, op] : methods.items()) { actual.push_back(method + " " + path); }
+        for (auto& [method, op] : methods.items()) {
+            actual.push_back(method + " " + path);
+        }
     }
     std::vector<std::string> expected = {
-        "get /app/healthz", "get /app/openapi.json", "get /app/metrics", "get /app/metrics/stream",
-        "get /app", "post /app/start", "post /app/stop",
-        "get /app/components", "post /app/components", "patch /app/components",
-        "get /app/components/{id}", "delete /app/components/{id}", "patch /app/components/{id}",
+        "get /app/healthz",
+        "get /app/openapi.json",
+        "get /app/metrics",
+        "get /app/metrics/stream",
+        "get /app",
+        "post /app/start",
+        "post /app/stop",
+        "get /app/components",
+        "post /app/components",
+        "patch /app/components",
+        "get /app/components/{id}",
+        "delete /app/components/{id}",
+        "patch /app/components/{id}",
         "get /app/components/{id}/schema",
-        "get /app/components/{id}/properties", "get /app/components/{id}/properties/{name}",
-        "put /app/components/{id}/properties/{name}", "patch /app/components/{id}/properties/{name}",
+        "get /app/components/{id}/properties",
+        "get /app/components/{id}/properties/{name}",
+        "put /app/components/{id}/properties/{name}",
+        "patch /app/components/{id}/properties/{name}",
         "delete /app/components/{id}/properties/{name}",
-        "get /app/components/{id}/ports", "get /app/components/{id}/ports/{port_name}",
+        "get /app/components/{id}/ports",
+        "get /app/components/{id}/ports/{port_name}",
         "delete /app/components/{id}/ports/{port_name}/connections",
-        "post /app/connections", "delete /app/connections",
+        "post /app/connections",
+        "delete /app/connections",
     };
     std::sort(actual.begin(), actual.end());
     std::sort(expected.begin(), expected.end());
@@ -333,20 +370,32 @@ TEST_CASE_METHOD(rest_fixture, "every advertised GET route is registered", "[htt
     auto cli = client();
     auto spec = json::parse(cli.Get("/app/openapi.json")->body);
     for (auto& [path, methods] : spec["paths"].items()) {
-        if (!methods.contains("get")) { continue; }
-        if (path == "/app/metrics/stream") { continue; }  // SSE stream: body is text/event-stream, not JSON
+        if (!methods.contains("get")) {
+            continue;
+        }
+        if (path == "/app/metrics/stream") {
+            continue;
+        } // SSE stream: body is text/event-stream, not JSON
         std::string probe = path;
         for (auto ph : {"{id}", "{name}", "{port_name}"}) {
             std::size_t pos;
-            while ((pos = probe.find(ph)) != std::string::npos) { probe.replace(pos, std::string(ph).size(), "c1"); }
+            while ((pos = probe.find(ph)) != std::string::npos) {
+                probe.replace(pos, std::string(ph).size(), "c1");
+            }
         }
         auto resp = cli.Get(probe);
         INFO("probing GET " << probe);
         REQUIRE(resp);
         bool is_json = false;
-        try { auto parsed = json::parse(resp->body); (void)parsed; is_json = true; }  // parsed used -> no warn_unused_result
-        catch (...) { is_json = false; }
-        REQUIRE(is_json);  // a non-JSON body would mean the route is not registered
+        try {
+            auto parsed = json::parse(resp->body);
+            (void)parsed;
+            is_json = true;
+        } // parsed used -> no warn_unused_result
+        catch (...) {
+            is_json = false;
+        }
+        REQUIRE(is_json); // a non-JSON body would mean the route is not registered
     }
 }
 
@@ -392,32 +441,35 @@ TEST_CASE("remove_component is race-free vs a live sender + concurrent connect",
         auto topo = app.topology_lock();
         p->connect("data_out", app.get_component("C"), "data_in");
     }
-    p->start();  // producer worker is now actively sending into C's input ring
+    p->start(); // producer worker is now actively sending into C's input ring
 
     // Churn the consumer: remove it (tears down its ring while P sends) then re-add + reconnect.
     std::atomic<bool> go{false};
     std::thread churn([&] {
         go.store(true, std::memory_order_release);
         for (int i = 0; i < 150; ++i) {
-            app.remove_component("C");                              // parks P, disconnects, destroys old C
+            app.remove_component("C"); // parks P, disconnects, destroys old C
             auto c = std::make_shared<stress_consumer>("C");
             app.add_component(c);
-            auto topo = app.topology_lock();                       // serialize the reconnect vs any remove
+            auto topo = app.topology_lock(); // serialize the reconnect vs any remove
             p->connect("data_out", c, "data_in");
         }
     });
     // A second thread races connects against the churn (the exact connect-vs-remove window).
     std::thread racer([&] {
-        while (!go.load(std::memory_order_acquire)) {}
+        while (!go.load(std::memory_order_acquire)) {
+        }
         for (int i = 0; i < 150; ++i) {
             auto topo = app.topology_lock();
-            if (auto c = app.get_component("C")) { (void)p->connect("data_out", c, "data_in"); }
+            if (auto c = app.get_component("C")) {
+                (void)p->connect("data_out", c, "data_in");
+            }
         }
     });
     churn.join();
     racer.join();
     p->stop();
-    SUCCEED();  // no crash and (under TSan/ASan) no data race / use-after-free
+    SUCCEED(); // no crash and (under TSan/ASan) no data race / use-after-free
 }
 
 // The registry rejects a second component with an existing id atomically, so two
@@ -441,7 +493,7 @@ TEST_CASE_METHOD(rest_fixture, "POST duplicate component id -> 409", "[http][har
 TEST_CASE_METHOD(rest_fixture, "malformed JSON body -> 400 (no connection drop)", "[http][hardening]") {
     auto cli = client();
     auto r = cli.Patch("/app/components/c1", "{ this is not json", "application/json");
-    REQUIRE(r);  // connection served, not dropped
+    REQUIRE(r); // connection served, not dropped
     REQUIRE(r->status == 400);
 }
 
@@ -477,9 +529,12 @@ TEST_CASE_METHOD(rest_fixture, "concurrent property GET during PATCH", "[http][h
             while (!stop.load()) {
                 auto g = c.Get("/app/components/c1/properties");
                 if (g && g->status == 200) {
-                    auto st = json::parse(g->body);     // GET must always return well-formed state
-                    if (st.contains("gain")) { reads.fetch_add(1); }
-                    else { bad.fetch_add(1); }
+                    auto st = json::parse(g->body); // GET must always return well-formed state
+                    if (st.contains("gain")) {
+                        reads.fetch_add(1);
+                    } else {
+                        bad.fetch_add(1);
+                    }
                 } else {
                     bad.fetch_add(1);
                 }
@@ -492,8 +547,10 @@ TEST_CASE_METHOD(rest_fixture, "concurrent property GET during PATCH", "[http][h
         REQUIRE(cli.Patch("/app/components/c1", body, "application/json")->status == 200);
     }
     stop = true;
-    for (auto& t : readers) { t.join(); }
-    REQUIRE(bad.load() == 0);     // every concurrent GET returned consistent, well-formed state
+    for (auto& t : readers) {
+        t.join();
+    }
+    REQUIRE(bad.load() == 0); // every concurrent GET returned consistent, well-formed state
     REQUIRE(reads.load() > 0);
     REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 50.0);
 }
@@ -511,12 +568,16 @@ TEST_CASE_METHOD(rest_fixture, "SSE metric stream cap -> 503, then frees", "[htt
             httplib::Client c("localhost", m_port);
             c.set_read_timeout(10, 0);
             bool counted = false;
-            c.Get("/app/metrics/stream?interval=100",
-                  [&](const char* /*data*/, size_t /*len*/) -> bool {
-                      if (!counted) { counted = true; established.fetch_add(1); }
-                      while (!stop.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
-                      return false;  // end this stream
-                  });
+            c.Get("/app/metrics/stream?interval=100", [&](const char* /*data*/, size_t /*len*/) -> bool {
+                if (!counted) {
+                    counted = true;
+                    established.fetch_add(1);
+                }
+                while (!stop.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return false; // end this stream
+            });
         });
     }
 
@@ -539,7 +600,9 @@ TEST_CASE_METHOD(rest_fixture, "SSE metric stream cap -> 503, then frees", "[htt
     // the closed connection (within ~one interval). Poll until a new stream is
     // admitted again, proving the RAII slot release works.
     stop = true;
-    for (auto& t : streams) { t.join(); }
+    for (auto& t : streams) {
+        t.join();
+    }
 
     bool admitted_again = false;
     for (int attempt = 0; attempt < 30 && !admitted_again; ++attempt) {
@@ -547,8 +610,10 @@ TEST_CASE_METHOD(rest_fixture, "SSE metric stream cap -> 503, then frees", "[htt
         httplib::Client c("localhost", m_port);
         c.set_read_timeout(2, 0);
         bool got_chunk = false;
-        c.Get("/app/metrics/stream?interval=100",
-              [&](const char*, size_t) -> bool { got_chunk = true; return false; });
+        c.Get("/app/metrics/stream?interval=100", [&](const char*, size_t) -> bool {
+            got_chunk = true;
+            return false;
+        });
         admitted_again = got_chunk;
     }
     REQUIRE(admitted_again);

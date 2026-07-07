@@ -2,7 +2,7 @@
  * Copyright (C) 2024-2025 Geon Technologies, LLC
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
- 
+
 #pragma once
 
 #include <bit>
@@ -19,29 +19,31 @@
 
 namespace composite {
 
-enum class data_type {
-    signed_integer,
-    unsigned_integer,
-    floating_point
-}; // enum class data_type
+enum class data_type { signed_integer, unsigned_integer, floating_point }; // enum class data_type
 
 [[nodiscard]]
-inline
-auto to_string(data_type type) -> std::string {
+inline auto to_string(data_type type) -> std::string {
     switch (type) {
-        case data_type::signed_integer: return "signed_integer";
-        case data_type::unsigned_integer: return "unsigned_integer";
-        case data_type::floating_point: return "floating_point";
-        default: break;
+    case data_type::signed_integer:
+        return "signed_integer";
+    case data_type::unsigned_integer:
+        return "unsigned_integer";
+    case data_type::floating_point:
+        return "floating_point";
+    default:
+        break;
     }
     return "unknown";
 }
 
 [[nodiscard]]
-inline 
-auto to_string(std::endian e) -> std::string {
-    if (e == std::endian::little) { return "little"; }
-    if (e == std::endian::big) { return "big"; }
+inline auto to_string(std::endian e) -> std::string {
+    if (e == std::endian::little) {
+        return "little";
+    }
+    if (e == std::endian::big) {
+        return "big";
+    }
     return "native";
 }
 
@@ -66,30 +68,22 @@ public:
     }
 
     auto operator==(const data_format& other) const -> bool {
-        return is_complex == other.is_complex &&
-               type == other.type &&
-               bit_width == other.bit_width &&
+        return is_complex == other.is_complex && type == other.type && bit_width == other.bit_width &&
                endianness == other.endianness;
     }
 
     [[nodiscard]]
-    inline
-    auto to_string() const -> std::string {
-        return std::format(
-            "data_format:\n"
-            "  complex   : {}\n"
-            "  type      : {}\n"
-            "  bit_width : {}\n"
-            "  endianness: {}\n",
-            is_complex ? "true" : "false",
-            composite::to_string(type),
-            bit_width,
-            composite::to_string(endianness)
-        );
+    inline auto to_string() const -> std::string {
+        return std::format("data_format:\n"
+                           "  complex   : {}\n"
+                           "  type      : {}\n"
+                           "  bit_width : {}\n"
+                           "  endianness: {}\n",
+                           is_complex ? "true" : "false", composite::to_string(type), bit_width,
+                           composite::to_string(endianness));
     }
 
-    friend 
-    auto operator<<(std::ostream& os, const data_format& df) -> std::ostream& {
+    friend auto operator<<(std::ostream& os, const data_format& df) -> std::ostream& {
         os << df.to_string();
         return os;
     }
@@ -157,28 +151,40 @@ public:
     using variant_type = std::variant<bool, std::int64_t, double, std::string>;
 
     annotation_value() : m_v(std::string{}) {}
-    annotation_value(bool b) : m_v(b) {}                                   // NOLINT(google-explicit-constructor)
-    annotation_value(std::int64_t i) : m_v(i) {}                           // NOLINT
-    annotation_value(int i) : m_v(static_cast<std::int64_t>(i)) {}         // NOLINT
-    annotation_value(std::uint64_t u) : m_v(static_cast<std::int64_t>(u)) {}  // NOLINT
-    annotation_value(double d) : m_v(d) {}                                 // NOLINT
-    annotation_value(const char* s) : m_v(std::string{s}) {}              // NOLINT
-    annotation_value(std::string s) : m_v(std::move(s)) {}                 // NOLINT
+    annotation_value(bool b) : m_v(b) {}                                     // NOLINT(google-explicit-constructor)
+    annotation_value(std::int64_t i) : m_v(i) {}                             // NOLINT
+    annotation_value(int i) : m_v(static_cast<std::int64_t>(i)) {}           // NOLINT
+    annotation_value(std::uint64_t u) : m_v(static_cast<std::int64_t>(u)) {} // NOLINT
+    annotation_value(double d) : m_v(d) {}                                   // NOLINT
+    annotation_value(const char* s) : m_v(std::string{s}) {}                 // NOLINT
+    annotation_value(std::string s) : m_v(std::move(s)) {}                   // NOLINT
 
     auto operator<=>(const annotation_value&) const = default;
     auto operator==(const annotation_value&) const -> bool = default;
 
     [[nodiscard]] auto value() const -> const variant_type& { return m_v; }
-    template <typename T> [[nodiscard]] auto get() const -> T { return std::get<T>(m_v); }
-    template <typename T> [[nodiscard]] auto holds() const -> bool { return std::holds_alternative<T>(m_v); }
+    template <typename T>
+    [[nodiscard]] auto get() const -> T {
+        return std::get<T>(m_v);
+    }
+    template <typename T>
+    [[nodiscard]] auto holds() const -> bool {
+        return std::holds_alternative<T>(m_v);
+    }
 
     [[nodiscard]] auto to_string() const -> std::string {
-        return std::visit([](const auto& v) -> std::string {
-            using V = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<V, bool>) { return v ? "true" : "false"; }
-            else if constexpr (std::is_same_v<V, std::string>) { return v; }
-            else { return std::format("{}", v); }
-        }, m_v);
+        return std::visit(
+            [](const auto& v) -> std::string {
+                using V = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<V, bool>) {
+                    return v ? "true" : "false";
+                } else if constexpr (std::is_same_v<V, std::string>) {
+                    return v;
+                } else {
+                    return std::format("{}", v);
+                }
+            },
+            m_v);
     }
 
 private:
@@ -191,11 +197,17 @@ inline auto to_json(nlohmann::json& j, const annotation_value& v) -> void {
     std::visit([&j](const auto& x) { j = x; }, v.value());
 }
 inline auto from_json(const nlohmann::json& j, annotation_value& v) -> void {
-    if (j.is_boolean()) { v = annotation_value(j.get<bool>()); }
-    else if (j.is_number_integer() || j.is_number_unsigned()) { v = annotation_value(j.get<std::int64_t>()); }
-    else if (j.is_number_float()) { v = annotation_value(j.get<double>()); }
-    else if (j.is_string()) { v = annotation_value(j.get<std::string>()); }
-    else { v = annotation_value{}; }  // null / unsupported -> default (empty string)
+    if (j.is_boolean()) {
+        v = annotation_value(j.get<bool>());
+    } else if (j.is_number_integer() || j.is_number_unsigned()) {
+        v = annotation_value(j.get<std::int64_t>());
+    } else if (j.is_number_float()) {
+        v = annotation_value(j.get<double>());
+    } else if (j.is_string()) {
+        v = annotation_value(j.get<std::string>());
+    } else {
+        v = annotation_value{};
+    } // null / unsupported -> default (empty string)
 }
 
 class metadata {
@@ -211,29 +223,21 @@ public:
     auto operator==(const metadata&) const -> bool = default;
 
     [[nodiscard]]
-    inline
-    auto to_string() const -> std::string {
-        auto s = std::format(
-            "metadata:\n"
-            "  data_format:\n"
-            "    complex   : {}\n"
-            "    type      : {}\n"
-            "    bit_width : {}\n"
-            "    endianness: {}\n"
-            "  center_frequency: {:.3f} Hz\n"
-            "  bandwidth       : {:.3f} Hz\n"
-            "  sample_rate     : {:.3f} samples/sec\n"
-            "  eos             : {}\n"
-            "  annotations:\n",
-            format.is_complex ? "true" : "false",
-            composite::to_string(format.type),
-            format.bit_width,
-            composite::to_string(format.endianness),
-            center_frequency,
-            bandwidth,
-            sample_rate,
-            eos ? "true" : "false"
-        );
+    inline auto to_string() const -> std::string {
+        auto s = std::format("metadata:\n"
+                             "  data_format:\n"
+                             "    complex   : {}\n"
+                             "    type      : {}\n"
+                             "    bit_width : {}\n"
+                             "    endianness: {}\n"
+                             "  center_frequency: {:.3f} Hz\n"
+                             "  bandwidth       : {:.3f} Hz\n"
+                             "  sample_rate     : {:.3f} samples/sec\n"
+                             "  eos             : {}\n"
+                             "  annotations:\n",
+                             format.is_complex ? "true" : "false", composite::to_string(format.type), format.bit_width,
+                             composite::to_string(format.endianness), center_frequency, bandwidth, sample_rate,
+                             eos ? "true" : "false");
 
         if (annotations.empty()) {
             s += "    (none)\n";
@@ -246,8 +250,7 @@ public:
         return s;
     }
 
-    friend 
-    auto operator<<(std::ostream& os, const metadata& md) -> std::ostream& {
+    friend auto operator<<(std::ostream& os, const metadata& md) -> std::ostream& {
         os << md.to_string();
         return os;
     }

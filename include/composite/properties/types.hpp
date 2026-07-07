@@ -5,8 +5,8 @@
 
 #pragma once
 
-#include <cstdint>
 #include <any>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -22,8 +22,8 @@ class property_set;
  * @brief Configurability of a property
  */
 enum class config_type {
-    INITIALIZE,  ///< Can only be set during initialization
-    RUNTIME      ///< Can be modified at runtime
+    INITIALIZE, ///< Can only be set during initialization
+    RUNTIME     ///< Can be modified at runtime
 };
 
 // Convenience aliases
@@ -36,9 +36,9 @@ inline constexpr auto runtime = config_type::RUNTIME;
  * Passed to contextual change listeners to indicate what kind of change happened.
  */
 enum class change_type {
-    SET,      ///< Value was set (for optional: from nullopt to value)
-    MODIFY,   ///< Value was modified (from one value to another)
-    RESET     ///< Value was reset (for optional: to nullopt; for scalars: to default)
+    SET,    ///< Value was set (for optional: from nullopt to value)
+    MODIFY, ///< Value was modified (from one value to another)
+    RESET   ///< Value was reset (for optional: to nullopt; for scalars: to default)
 };
 
 // Convenience aliases
@@ -49,50 +49,24 @@ inline constexpr auto reset_change = change_type::RESET;
 /**
  * @brief Variant holding pointers to scalar types
  */
-using scalar_types = std::variant<
-    bool*,
-    int16_t*,
-    uint16_t*,
-    int32_t*,
-    uint32_t*,
-    int64_t*,
-    uint64_t*,
-    float*,
-    double*,
-    std::string*
->;
+using scalar_types =
+    std::variant<bool*, int16_t*, uint16_t*, int32_t*, uint32_t*, int64_t*, uint64_t*, float*, double*, std::string*>;
 
 /**
  * @brief Variant holding pointers to optional scalar types
  */
-using optional_types = std::variant<
-    std::optional<bool>*,
-    std::optional<int16_t>*,
-    std::optional<uint16_t>*,
-    std::optional<int32_t>*,
-    std::optional<uint32_t>*,
-    std::optional<int64_t>*,
-    std::optional<uint64_t>*,
-    std::optional<float>*,
-    std::optional<double>*,
-    std::optional<std::string>*
->;
+using optional_types =
+    std::variant<std::optional<bool>*, std::optional<int16_t>*, std::optional<uint16_t>*, std::optional<int32_t>*,
+                 std::optional<uint32_t>*, std::optional<int64_t>*, std::optional<uint64_t>*, std::optional<float>*,
+                 std::optional<double>*, std::optional<std::string>*>;
 
 /**
  * @brief Variant holding pointers to vector types (lists of scalars)
  */
-using list_types = std::variant<
-    std::vector<bool>*,
-    std::vector<int16_t>*,
-    std::vector<uint16_t>*,
-    std::vector<int32_t>*,
-    std::vector<uint32_t>*,
-    std::vector<int64_t>*,
-    std::vector<uint64_t>*,
-    std::vector<float>*,
-    std::vector<double>*,
-    std::vector<std::string>*
->;
+using list_types =
+    std::variant<std::vector<bool>*, std::vector<int16_t>*, std::vector<uint16_t>*, std::vector<int32_t>*,
+                 std::vector<uint32_t>*, std::vector<int64_t>*, std::vector<uint64_t>*, std::vector<float>*,
+                 std::vector<double>*, std::vector<std::string>*>;
 
 /**
  * @brief Type-erased accessor for struct and list-of-struct properties
@@ -133,9 +107,7 @@ struct struct_accessor {
     std::function<void(void*, std::size_t)> erase;
 
     /// Check if this is a list-of-struct (vs single struct)
-    [[nodiscard]] auto is_list() const noexcept -> bool {
-        return static_cast<bool>(size);
-    }
+    [[nodiscard]] auto is_list() const noexcept -> bool { return static_cast<bool>(size); }
 };
 
 /**
@@ -147,12 +119,7 @@ struct struct_accessor {
  * - list_types: Pointer to std::vector<scalar>
  * - struct_accessor: Type-erased accessor for struct or list-of-struct
  */
-using property_value = std::variant<
-    scalar_types,
-    optional_types,
-    list_types,
-    struct_accessor
->;
+using property_value = std::variant<scalar_types, optional_types, list_types, struct_accessor>;
 
 /**
  * @brief Sentinel value for null/reset operations

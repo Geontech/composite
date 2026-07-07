@@ -6,7 +6,7 @@
 #pragma once
 
 #include "changes.hpp"
-#include "typed.hpp"   // property_base, typed_property, config_type, the error types
+#include "typed.hpp" // property_base, typed_property, config_type, the error types
 
 #include <atomic>
 #include <functional>
@@ -39,7 +39,8 @@
 namespace composite {
 
 namespace properties {
-template <reflect::reflected T> class config_binding;
+template <reflect::reflected T>
+class config_binding;
 }
 
 /**
@@ -52,7 +53,7 @@ template <reflect::reflected T> class config_binding;
 template <reflect::reflected T>
 class config {
 public:
-    using value_type  = T;
+    using value_type = T;
     using reaction_fn = std::function<void(const T& prev, const changes<T>& ch)>;
 
     config() = default;
@@ -72,7 +73,10 @@ public:
 
     /// Reaction run after a committed change. The signature is FIXED across Phase 1
     /// (writer-under-park) and Phase 2 (worker loop-top) — flipping needs no change here.
-    auto on_apply(reaction_fn fn) -> config& { m_on_apply = std::move(fn); return *this; }
+    auto on_apply(reaction_fn fn) -> config& {
+        m_on_apply = std::move(fn);
+        return *this;
+    }
 
     /// Whole-struct (cross-field) invariant. The two-arg form supplies a reason.
     auto validate(std::function<bool(const T&)> fn, std::string why = {}) -> config& {
@@ -81,10 +85,14 @@ public:
     }
 
 private:
-    template <reflect::reflected> friend class properties::config_binding;
-    struct val_entry { std::function<bool(const T&)> fn; std::string reason; };
+    template <reflect::reflected>
+    friend class properties::config_binding;
+    struct val_entry {
+        std::function<bool(const T&)> fn;
+        std::string reason;
+    };
 
-    T m_value{};                       ///< the live struct; cfg->field reads this
+    T m_value{}; ///< the live struct; cfg->field reads this
     reaction_fn m_on_apply;
     std::vector<val_entry> m_validators;
 };
@@ -96,9 +104,13 @@ namespace detail {
 
 inline auto trim_double(double d) -> std::string {
     std::string s = std::to_string(d);
-    if (s.find('.') == std::string::npos) { return s; }
+    if (s.find('.') == std::string::npos) {
+        return s;
+    }
     auto last = s.find_last_not_of('0');
-    if (s[last] == '.') { ++last; }  // keep one trailing zero: "1." -> "1.0"
+    if (s[last] == '.') {
+        ++last;
+    } // keep one trailing zero: "1." -> "1.0"
     return s.substr(0, last + 1);
 }
 
@@ -132,16 +144,18 @@ template <reflect::reflected T>
 class config_binding final : public config_binding_base {
 public:
     config_binding(composite::config<T>& cfg, config_type default_cfg)
-        : m_cfg(&cfg),
-          m_inner("config", &cfg.m_value, config_type::RUNTIME),  // inner permissive; per-field gated below
+        : m_cfg(&cfg), m_inner("config", &cfg.m_value, config_type::RUNTIME), // inner permissive; per-field gated below
           m_default_cfg(default_cfg) {
         build_field_table();
         install_attr_validators();
-        for (const auto& v : cfg.m_validators) {                  // cross-field invariants
-            if (v.reason.empty()) { m_inner.validate(v.fn); }
-            else { m_inner.validate(v.fn, v.reason); }
+        for (const auto& v : cfg.m_validators) { // cross-field invariants
+            if (v.reason.empty()) {
+                m_inner.validate(v.fn);
+            } else {
+                m_inner.validate(v.fn, v.reason);
+            }
         }
-        build_describe();   // precompute per-field schema entries (cold path, once)
+        build_describe(); // precompute per-field schema entries (cold path, once)
     }
 
     // ---- property_base ----
@@ -153,32 +167,34 @@ public:
         // whole-struct entry list (one per field), for completeness; property_set
         // emits per-field entries via describe_field().
         json arr = json::array();
-        for (const auto& n : m_field_names) { arr.push_back(m_field_describe.at(n)); }
+        for (const auto& n : m_field_names) {
+            arr.push_back(m_field_describe.at(n));
+        }
         return arr;
     }
 
     auto prepare(const json& patch, config_type ctx) -> void override {
         enforce_field_configurability(patch, ctx);
-        m_inner.prepare(patch, config_type::RUNTIME);  // merge whole struct, run ALL validators
+        m_inner.prepare(patch, config_type::RUNTIME); // merge whole struct, run ALL validators
     }
 
     auto commit() -> json override {
-        if (!m_cfg->m_on_apply) {       // no reaction -> skip the prev snapshot entirely
+        if (!m_cfg->m_on_apply) { // no reaction -> skip the prev snapshot entirely
             return m_inner.commit();
         }
-        m_prev = m_cfg->m_value;        // snapshot BEFORE the inner swap (becomes on_apply's `prev`)
-        return m_inner.commit();        // engine swaps m_cfg->m_value, returns the scoped struct diff
+        m_prev = m_cfg->m_value; // snapshot BEFORE the inner swap (becomes on_apply's `prev`)
+        return m_inner.commit(); // engine swaps m_cfg->m_value, returns the scoped struct diff
     }
 
     auto notify(const json& diff) -> void override {
-        m_inner.notify(diff);   // fire any typed_property on_change listeners (none by default)
+        m_inner.notify(diff); // fire any typed_property on_change listeners (none by default)
         // Do NOT run the reaction here (this runs under the park on the writer's
         // thread). Stage it for the worker to run at its next loop-top — same thread as
         // process(), which is what makes a config-driven derived-state rebuild safe.
         stage_reaction(diff);
     }
 
-    auto abort() noexcept -> void override { m_inner.abort(); }  // nothing staged before commit
+    auto abort() noexcept -> void override { m_inner.abort(); } // nothing staged before commit
 
     // ---- config_binding_base ----
     [[nodiscard]] auto field_names() const -> const std::vector<std::string>& override { return m_field_names; }
@@ -194,16 +210,20 @@ public:
         // there is no live worker. HOT PATH: lock-free fast exit when nothing is staged —
         // the worker calls this each loop, so we only take the mailbox lock when a config
         // change has actually landed (a cold event).
-        if (!m_pending_reaction.load(std::memory_order_acquire)) { return; }
+        if (!m_pending_reaction.load(std::memory_order_acquire)) {
+            return;
+        }
         json diff;
         T prev{};
         {
             std::scoped_lock lk{m_mailbox_mtx};
             // Re-check under the lock; the exchange serializes any double-drain (e.g. an
             // inline drain racing a just-started worker) — the loser sees false and no-ops.
-            if (!m_pending_reaction.exchange(false, std::memory_order_acq_rel)) { return; }
+            if (!m_pending_reaction.exchange(false, std::memory_order_acq_rel)) {
+                return;
+            }
             diff = std::move(m_pending_diff);
-            m_pending_diff = json();   // clear BEFORE on_apply so a reentrant stage isn't clobbered
+            m_pending_diff = json(); // clear BEFORE on_apply so a reentrant stage isn't clobbered
             prev = std::move(m_pending_prev);
         }
         // Run on_apply OUTSIDE the lock: it may reentrantly set_properties() (a supported
@@ -220,7 +240,9 @@ private:
     // wins), so on_apply sees "state before I last looked -> state I now read". Runs
     // under the mailbox lock (serialized with a cold-path drain).
     void stage_reaction(const json& diff) {
-        if (!m_cfg->m_on_apply || diff.is_null()) { return; }
+        if (!m_cfg->m_on_apply || diff.is_null()) {
+            return;
+        }
         std::scoped_lock lk{m_mailbox_mtx};
         if (!m_pending_reaction.load(std::memory_order_relaxed)) {
             m_pending_prev = m_prev;
@@ -239,14 +261,18 @@ private:
     }
 
     void build_field_table() {
-        std::apply([&](auto&&... f) {
-            ([&] {
-                const std::string nm{f.name};
-                m_field_names.push_back(nm);
-                const bool is_rt = reflect::has_attr<reflect::runtime_attr>(f.attrs);
-                m_field_cfg.emplace(nm, is_rt ? config_type::RUNTIME : m_default_cfg);
-            }(), ...);
-        }, reflect::descriptor<T>::fields());
+        std::apply(
+            [&](auto&&... f) {
+                (
+                    [&] {
+                        const std::string nm{f.name};
+                        m_field_names.push_back(nm);
+                        const bool is_rt = reflect::has_attr<reflect::runtime_attr>(f.attrs);
+                        m_field_cfg.emplace(nm, is_rt ? config_type::RUNTIME : m_default_cfg);
+                    }(),
+                    ...);
+            },
+            reflect::descriptor<T>::fields());
     }
 
     void install_attr_validators() {
@@ -266,8 +292,7 @@ private:
         static_assert(!reflect::has_attr<reflect::power_of_two_attr>(Attrs{}) ||
                           (std::is_integral_v<M> && !std::is_same_v<M, bool>),
                       "power_of_two requires an integer field");
-        static_assert(!reflect::tuple_has_one_of<Attrs>() ||
-                          (std::is_same_v<M, std::string> || std::is_enum_v<M>),
+        static_assert(!reflect::tuple_has_one_of<Attrs>() || (std::is_same_v<M, std::string> || std::is_enum_v<M>),
                       "one_of() requires a string or enum field");
         const auto ptr = f.ptr;
         const std::string nm{f.name};
@@ -276,14 +301,20 @@ private:
                 const double lo = r->lo;
                 const double hi = r->hi;
                 m_inner.validate(
-                    [ptr, lo, hi](const T& c) { const double v = static_cast<double>(c.*ptr); return v >= lo && v <= hi; },
+                    [ptr, lo, hi](const T& c) {
+                        const double v = static_cast<double>(c.*ptr);
+                        return v >= lo && v <= hi;
+                    },
                     nm + " out of range [" + detail::trim_double(lo) + ", " + detail::trim_double(hi) + "]");
             }
         }
         if constexpr (std::is_integral_v<M> && !std::is_same_v<M, bool>) {
             if (reflect::has_attr<reflect::power_of_two_attr>(f.attrs)) {
                 m_inner.validate(
-                    [ptr](const T& c) { const auto v = c.*ptr; return v > 0 && (v & (v - 1)) == 0; },
+                    [ptr](const T& c) {
+                        const auto v = c.*ptr;
+                        return v > 0 && (v & (v - 1)) == 0;
+                    },
                     nm + " must be a power of two");
             }
         }
@@ -291,11 +322,17 @@ private:
             using A = std::decay_t<decltype(a)>;
             if constexpr (reflect::is_one_of_attr<A>::value) {
                 std::vector<std::string> choices;
-                for (auto sv : a.values) { choices.emplace_back(sv); }
+                for (auto sv : a.values) {
+                    choices.emplace_back(sv);
+                }
                 if constexpr (std::is_same_v<M, std::string>) {
                     m_inner.validate(
                         [ptr, choices](const T& c) {
-                            for (const auto& s : choices) { if (c.*ptr == s) { return true; } }
+                            for (const auto& s : choices) {
+                                if (c.*ptr == s) {
+                                    return true;
+                                }
+                            }
                             return false;
                         },
                         nm + " must be one of the allowed values");
@@ -303,7 +340,11 @@ private:
                     m_inner.validate(
                         [ptr, choices](const T& c) {
                             const json e = reflect::encode(c.*ptr);
-                            for (const auto& s : choices) { if (e == s) { return true; } }
+                            for (const auto& s : choices) {
+                                if (e == s) {
+                                    return true;
+                                }
+                            }
                             return false;
                         },
                         nm + " must be one of the allowed values");
@@ -313,8 +354,12 @@ private:
     }
 
     void enforce_field_configurability(const json& patch, config_type ctx) {
-        if (ctx != config_type::RUNTIME) { return; }  // INITIALIZE may set anything
-        if (!patch.is_object()) { return; }            // type errors handled by the engine
+        if (ctx != config_type::RUNTIME) {
+            return;
+        } // INITIALIZE may set anything
+        if (!patch.is_object()) {
+            return;
+        } // type errors handled by the engine
         for (auto it = patch.begin(); it != patch.end(); ++it) {
             auto cit = m_field_cfg.find(it.key());
             if (cit != m_field_cfg.end() && cit->second == config_type::INITIALIZE) {
@@ -324,31 +369,38 @@ private:
     }
 
     void build_describe() {
-        const json defaults = m_inner.encode();  // initial values == registration defaults
-        std::apply([&](auto&&... f) { (build_field_entry(f, defaults), ...); },
-                   reflect::descriptor<T>::fields());
+        const json defaults = m_inner.encode(); // initial values == registration defaults
+        std::apply([&](auto&&... f) { (build_field_entry(f, defaults), ...); }, reflect::descriptor<T>::fields());
     }
 
     template <typename F>
     void build_field_entry(const F& f, const json& defaults) {
         using M = typename F::member_type;
         const std::string nm{f.name};
-        json e = reflect::type_schema<M>();   // {type, [fields|items|choices|minimum|maximum]}
+        json e = reflect::type_schema<M>(); // {type, [fields|items|choices|minimum|maximum]}
         e["name"] = nm;
         e["configurability"] = (m_field_cfg.at(nm) == config_type::RUNTIME) ? "runtime" : "initialize";
         e["default"] = defaults.at(nm);
-        if (const auto* u = reflect::find_attr<reflect::unit_attr>(f.attrs)) { e["unit"] = std::string(u->text); }
-        if (const auto* d = reflect::find_attr<reflect::doc_attr>(f.attrs)) { e["description"] = std::string(d->text); }
+        if (const auto* u = reflect::find_attr<reflect::unit_attr>(f.attrs)) {
+            e["unit"] = std::string(u->text);
+        }
+        if (const auto* d = reflect::find_attr<reflect::doc_attr>(f.attrs)) {
+            e["description"] = std::string(d->text);
+        }
         if (const auto* r = reflect::find_attr<reflect::range_attr>(f.attrs)) {
             e["minimum"] = r->lo;
             e["maximum"] = r->hi;
         }
-        if (reflect::has_attr<reflect::power_of_two_attr>(f.attrs)) { e["powerOfTwo"] = true; }
+        if (reflect::has_attr<reflect::power_of_two_attr>(f.attrs)) {
+            e["powerOfTwo"] = true;
+        }
         reflect::for_each_attr(f.attrs, [&](const auto& a) {
             using A = std::decay_t<decltype(a)>;
             if constexpr (reflect::is_one_of_attr<A>::value) {
                 json ch = json::array();
-                for (auto sv : a.values) { ch.push_back(std::string(sv)); }
+                for (auto sv : a.values) {
+                    ch.push_back(std::string(sv));
+                }
                 e["choices"] = std::move(ch);
             }
         });
@@ -357,9 +409,9 @@ private:
 
     std::string m_name{"config"};
     composite::config<T>* m_cfg;
-    typed_property<T> m_inner;          ///< the reused engine object (candidate/diff/null-reset)
+    typed_property<T> m_inner; ///< the reused engine object (candidate/diff/null-reset)
     config_type m_default_cfg;
-    T m_prev{};                         ///< value snapshotted in commit(), staged as on_apply's prev
+    T m_prev{}; ///< value snapshotted in commit(), staged as on_apply's prev
     // Reaction mailbox: staged by a writer, drained at the worker loop-top (or inline /
     // on the stop path when there is no worker). The atomic flag is the lock-free hot-path
     // gate; m_mailbox_mtx serializes the cold-path stage vs drain of the json/T payload.
@@ -381,7 +433,9 @@ private:
 /// Map the legacy type_schema vocabulary to JSON Schema 2020-12 (fields->properties,
 /// choices->enum), recursively. Integer minimum/maximum already match.
 inline auto to_2020_12(json node) -> json {
-    if (!node.is_object()) { return node; }
+    if (!node.is_object()) {
+        return node;
+    }
     if (node.contains("fields")) {
         json props = json::object();
         for (auto it = node["fields"].begin(); it != node["fields"].end(); ++it) {
@@ -391,7 +445,9 @@ inline auto to_2020_12(json node) -> json {
         node["properties"] = std::move(props);
         node["additionalProperties"] = false;
     }
-    if (node.contains("items")) { node["items"] = to_2020_12(node["items"]); }
+    if (node.contains("items")) {
+        node["items"] = to_2020_12(node["items"]);
+    }
     if (node.contains("choices")) {
         node["enum"] = node["choices"];
         node.erase("choices");
@@ -405,28 +461,45 @@ auto schema_2020_12(const config<T>& live) -> reflect::json {
     json props = json::object();
     json required = json::array();
     const json defaults = reflect::encode(*live);
-    std::apply([&](auto&&... f) {
-        ([&] {
-            using M = typename std::decay_t<decltype(f)>::member_type;
-            const std::string nm{f.name};
-            json p = to_2020_12(reflect::type_schema<M>());
-            if (const auto* r = reflect::find_attr<reflect::range_attr>(f.attrs)) { p["minimum"] = r->lo; p["maximum"] = r->hi; }
-            if (const auto* u = reflect::find_attr<reflect::unit_attr>(f.attrs)) { p["x-composite-unit"] = std::string(u->text); }
-            if (const auto* d = reflect::find_attr<reflect::doc_attr>(f.attrs)) { p["description"] = std::string(d->text); }
-            if (reflect::has_attr<reflect::power_of_two_attr>(f.attrs)) { p["x-composite-powerOfTwo"] = true; }
-            reflect::for_each_attr(f.attrs, [&](const auto& a) {
-                using A = std::decay_t<decltype(a)>;
-                if constexpr (reflect::is_one_of_attr<A>::value) {
-                    json e = json::array();
-                    for (auto sv : a.values) { e.push_back(std::string(sv)); }
-                    p["enum"] = std::move(e);
-                }
-            });
-            p["default"] = defaults.at(nm);
-            props[nm] = std::move(p);
-            if (!reflect::is_optional<M>::value) { required.push_back(nm); }
-        }(), ...);
-    }, reflect::descriptor<T>::fields());
+    std::apply(
+        [&](auto&&... f) {
+            (
+                [&] {
+                    using M = typename std::decay_t<decltype(f)>::member_type;
+                    const std::string nm{f.name};
+                    json p = to_2020_12(reflect::type_schema<M>());
+                    if (const auto* r = reflect::find_attr<reflect::range_attr>(f.attrs)) {
+                        p["minimum"] = r->lo;
+                        p["maximum"] = r->hi;
+                    }
+                    if (const auto* u = reflect::find_attr<reflect::unit_attr>(f.attrs)) {
+                        p["x-composite-unit"] = std::string(u->text);
+                    }
+                    if (const auto* d = reflect::find_attr<reflect::doc_attr>(f.attrs)) {
+                        p["description"] = std::string(d->text);
+                    }
+                    if (reflect::has_attr<reflect::power_of_two_attr>(f.attrs)) {
+                        p["x-composite-powerOfTwo"] = true;
+                    }
+                    reflect::for_each_attr(f.attrs, [&](const auto& a) {
+                        using A = std::decay_t<decltype(a)>;
+                        if constexpr (reflect::is_one_of_attr<A>::value) {
+                            json e = json::array();
+                            for (auto sv : a.values) {
+                                e.push_back(std::string(sv));
+                            }
+                            p["enum"] = std::move(e);
+                        }
+                    });
+                    p["default"] = defaults.at(nm);
+                    props[nm] = std::move(p);
+                    if (!reflect::is_optional<M>::value) {
+                        required.push_back(nm);
+                    }
+                }(),
+                ...);
+        },
+        reflect::descriptor<T>::fields());
     return json{
         {"$schema", "https://json-schema.org/draft/2020-12/schema"},
         {"type", "object"},

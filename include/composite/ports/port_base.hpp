@@ -6,7 +6,7 @@
 #pragma once
 
 #include "composite/core/metadata.hpp"
-#include "composite/core/park.hpp"  // park_coordinator::signal_data — wake a consumer on EOS/close
+#include "composite/core/park.hpp" // park_coordinator::signal_data — wake a consumer on EOS/close
 #include "port_stats.hpp"
 
 #include <algorithm>
@@ -23,8 +23,8 @@
 
 namespace composite {
 
-class park_coordinator;  // doorbell: an input port wakes its owning component's worker
-class output_port_base;  // an input holds a back-pointer to its producer for deregister-on-destroy
+class park_coordinator; // doorbell: an input port wakes its owning component's worker
+class output_port_base; // an input holds a back-pointer to its producer for deregister-on-destroy
 
 /**
  * @brief Abstract base class for all port types
@@ -89,7 +89,7 @@ public:
     virtual auto register_port_metrics(std::string_view component_id) -> void = 0;
 
 protected:
-    std::string m_name;  ///< Port name for identification
+    std::string m_name; ///< Port name for identification
 };
 
 /**
@@ -135,17 +135,17 @@ public:
     [[nodiscard]] auto claim_producer(output_port_base* producer) -> bool {
         bool expected = false;
         if (!m_has_producer.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            return false;  // fan-in: already claimed
+            return false; // fan-in: already claimed
         }
-        m_producer.store(producer, std::memory_order_release);  // back-pointer for deregister-on-destroy
+        m_producer.store(producer, std::memory_order_release); // back-pointer for deregister-on-destroy
         return true;
     }
     /// Release the producer claim (on disconnect), permitting a later reconnect. Clears the
     /// back-pointer FIRST so once m_has_producer reads false (a reconnect may win), no stale
     /// producer pointer remains.
     auto release_producer() -> void {
-        m_producer_doorbell.store(nullptr, std::memory_order_release);  // no producer worker to wake anymore
-        m_producer_closed.store(false, std::memory_order_release);      // a reconnected input is not born at-end
+        m_producer_doorbell.store(nullptr, std::memory_order_release); // no producer worker to wake anymore
+        m_producer_closed.store(false, std::memory_order_release);     // a reconnected input is not born at-end
         m_producer.store(nullptr, std::memory_order_release);
         m_has_producer.store(false, std::memory_order_release);
     }
@@ -182,16 +182,16 @@ public:
     /// (pending()==0), a consumer never reports end-of-stream before consuming every enqueued packet.
     auto mark_producer_closed() -> void {
         m_producer_closed.store(true, std::memory_order_release);
-        if (m_doorbell != nullptr) { m_doorbell->signal_data(); }  // wake a NOOPing consumer
+        if (m_doorbell != nullptr) {
+            m_doorbell->signal_data();
+        } // wake a NOOPing consumer
     }
     /// Clear the end-of-stream latch: the producer is (re)starting and will send data again. Called
     /// by output_port_base::reopen() from the producer component's start path, so a stale EOS from a
     /// prior completed run doesn't make this input report at_end() forever after a restart.
     auto reopen_producer() -> void { m_producer_closed.store(false, std::memory_order_release); }
     /// Whether the producer has signalled end-of-stream (no more data will be enqueued).
-    [[nodiscard]] auto producer_closed() const -> bool {
-        return m_producer_closed.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] auto producer_closed() const -> bool { return m_producer_closed.load(std::memory_order_acquire); }
     /// End-of-stream reached: producer closed AND the ring is fully drained (occupancy gates it, so
     /// all data-before-EOS has been consumed). A consumer typically returns FINISH once this is true.
     [[nodiscard]] auto at_end() const -> bool { return producer_closed() && pending() == 0; }
@@ -228,16 +228,12 @@ public:
      * @brief Get port statistics
      * @return Reference to port statistics structure
      */
-    auto stats() const -> const port_stats& {
-        return m_stats;
-    }
+    auto stats() const -> const port_stats& { return m_stats; }
 
     /**
      * @brief Reset statistics counters
      */
-    auto reset_stats() -> void {
-        m_stats.reset();
-    }
+    auto reset_stats() -> void { m_stats.reset(); }
 
     /**
      * @brief Check if port queue is full
@@ -270,24 +266,13 @@ public:
         // Register input-port-specific gauges
         auto& registry = metrics::registry::instance();
         metrics::labels_t labels = {
-            {"component_id", std::string{component_id}},
-            {"port_name", std::string{m_name}},
-            {"port_type", "input"}
-        };
+            {"component_id", std::string{component_id}}, {"port_name", std::string{m_name}}, {"port_type", "input"}};
 
-        m_queue_depth_gauge = &registry.get_or_create_gauge(
-            "composite.port.queue_depth",
-            "Current number of packets in the queue",
-            "1",
-            labels
-        );
+        m_queue_depth_gauge = &registry.get_or_create_gauge("composite.port.queue_depth",
+                                                            "Current number of packets in the queue", "1", labels);
 
-        m_queue_capacity_gauge = &registry.get_or_create_gauge(
-            "composite.port.queue_capacity",
-            "Configured queue depth limit",
-            "1",
-            labels
-        );
+        m_queue_capacity_gauge =
+            &registry.get_or_create_gauge("composite.port.queue_capacity", "Configured queue depth limit", "1", labels);
 
         // Set initial capacity value
         m_queue_capacity_gauge->set(static_cast<double>(m_depth.load(std::memory_order_relaxed)));
@@ -308,17 +293,23 @@ protected:
     // own m_mutate_mtx in its destructor); give it access.
     friend class output_port_base;
 
-    mutable std::mutex m_mtx;                                ///< Guards the overflow-callback set/read (not the ring)
-    std::atomic_bool m_has_producer{false};                  ///< single-producer claim (set on connect)
-    std::atomic<output_port_base*> m_producer{nullptr};      ///< back-pointer to the producer (for deregister-on-destroy); cold, never read on the send path
+    mutable std::mutex m_mtx;               ///< Guards the overflow-callback set/read (not the ring)
+    std::atomic_bool m_has_producer{false}; ///< single-producer claim (set on connect)
+    std::atomic<output_port_base*> m_producer{
+        nullptr}; ///< back-pointer to the producer (for deregister-on-destroy); cold, never read on the send path
     std::atomic<std::size_t> m_depth{1024};                  ///< queue depth soft limit (0 = disabled)
     mutable port_stats m_stats;                              ///< Statistics tracking
     overflow_callback m_overflow_callback;                   ///< Callback for dropped packets
     metrics::gauge<double>* m_queue_depth_gauge{nullptr};    ///< Current queue depth gauge
     metrics::gauge<double>* m_queue_capacity_gauge{nullptr}; ///< Queue capacity gauge
-    park_coordinator* m_doorbell{nullptr};                   ///< consumer worker to wake on empty->non-empty edge (read doorbell); set once in add_port before start (no concurrent write)
-    std::atomic<park_coordinator*> m_producer_doorbell{nullptr};  ///< producer worker to wake on full->not-full edge (reverse doorbell); set/cleared on connect/disconnect concurrent with pop -> atomic
-    std::atomic_bool m_producer_closed{false};               ///< EOS: producer signalled end-of-stream (set by send_eos, cleared on release_producer); out-of-band so the drop-on-full ring can't lose it
+    park_coordinator* m_doorbell{nullptr}; ///< consumer worker to wake on empty->non-empty edge (read doorbell); set
+                                           ///< once in add_port before start (no concurrent write)
+    std::atomic<park_coordinator*> m_producer_doorbell{
+        nullptr}; ///< producer worker to wake on full->not-full edge (reverse doorbell); set/cleared on
+                  ///< connect/disconnect concurrent with pop -> atomic
+    std::atomic_bool m_producer_closed{
+        false}; ///< EOS: producer signalled end-of-stream (set by send_eos, cleared on release_producer); out-of-band
+                ///< so the drop-on-full ring can't lose it
 
 }; // class input_port_base
 
@@ -358,7 +349,9 @@ public:
         const auto lock = std::scoped_lock{m_mutate_mtx};
         const auto cur = m_connected.load(std::memory_order_relaxed);
         for (auto* port : *cur) {
-            if (port == nullptr) { continue; }
+            if (port == nullptr) {
+                continue;
+            }
             // Claim the edge from the output end. If we win (the input has not already
             // exchanged it away in its own dtor), clear its claim so a survivor can reconnect.
             output_port_base* expected = this;
@@ -382,12 +375,12 @@ public:
         const auto lock = std::scoped_lock{m_mutate_mtx};
         output_port_base* expected = this;
         if (!in->m_producer.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel)) {
-            return;  // the output's own dtor (or a disconnect) already cleared this edge
+            return; // the output's own dtor (or a disconnect) already cleared this edge
         }
         auto next = std::make_shared<connection_list>(*m_connected.load(std::memory_order_relaxed));
         std::erase(*next, in);
         m_connected.store(std::shared_ptr<const connection_list>(std::move(next)), std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_release);  // invalidate the producer's cached snapshot
+        m_generation.fetch_add(1, std::memory_order_release); // invalidate the producer's cached snapshot
     }
 
     /**
@@ -409,7 +402,9 @@ public:
     using connection_list = std::vector<input_port_base*>;
 
     auto connect(input_port_base* port) -> bool {
-        if (port == nullptr) { return false; }
+        if (port == nullptr) {
+            return false;
+        }
         // Element-type compatibility is checked HERE (before claiming the input),
         // not only in the templated component::connect(): this base method is
         // public and reached directly by tests and by port_set::get_port<...base>
@@ -420,13 +415,13 @@ public:
             return false;
         }
         if (!port->claim_producer(this)) {
-            return false;  // fan-in (input already fed by another output)
+            return false; // fan-in (input already fed by another output)
         }
         const auto lock = std::scoped_lock{m_mutate_mtx};
         auto next = std::make_shared<connection_list>(*m_connected.load(std::memory_order_relaxed));
         next->push_back(port);
         m_connected.store(std::shared_ptr<const connection_list>(std::move(next)), std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_release);  // invalidate the producer's cached snapshot
+        m_generation.fetch_add(1, std::memory_order_release); // invalidate the producer's cached snapshot
         return true;
     }
 
@@ -438,11 +433,15 @@ public:
         const auto lock = std::scoped_lock{m_mutate_mtx};
         auto next = std::make_shared<connection_list>(*m_connected.load(std::memory_order_relaxed));
         auto it = std::find(next->begin(), next->end(), port);
-        if (it == next->end()) { return false; }
+        if (it == next->end()) {
+            return false;
+        }
         next->erase(it);
         m_connected.store(std::shared_ptr<const connection_list>(std::move(next)), std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_release);  // invalidate the producer's cached snapshot
-        if (port != nullptr) { port->release_producer(); }
+        m_generation.fetch_add(1, std::memory_order_release); // invalidate the producer's cached snapshot
+        if (port != nullptr) {
+            port->release_producer();
+        }
         return true;
     }
 
@@ -455,10 +454,12 @@ public:
         auto cur = m_connected.load(std::memory_order_relaxed);
         const auto count = cur->size();
         for (auto* port : *cur) {
-            if (port != nullptr) { port->release_producer(); }
+            if (port != nullptr) {
+                port->release_producer();
+            }
         }
         m_connected.store(std::make_shared<const connection_list>(), std::memory_order_release);
-        m_generation.fetch_add(1, std::memory_order_release);  // invalidate the producer's cached snapshot
+        m_generation.fetch_add(1, std::memory_order_release); // invalidate the producer's cached snapshot
         return count;
     }
 
@@ -470,7 +471,9 @@ public:
     auto send_eos() -> void {
         auto cur = snapshot();
         for (auto* port : *cur) {
-            if (port != nullptr) { port->mark_producer_closed(); }
+            if (port != nullptr) {
+                port->mark_producer_closed();
+            }
         }
     }
 
@@ -480,7 +483,9 @@ public:
     auto reopen() -> void {
         auto cur = snapshot();
         for (auto* port : *cur) {
-            if (port != nullptr) { port->reopen_producer(); }
+            if (port != nullptr) {
+                port->reopen_producer();
+            }
         }
     }
 
@@ -502,7 +507,9 @@ public:
         std::vector<std::string> names;
         names.reserve(cur->size());
         for (const auto* port : *cur) {
-            if (port != nullptr) { names.emplace_back(port->name()); }
+            if (port != nullptr) {
+                names.emplace_back(port->name());
+            }
         }
         return names;
     }
@@ -511,16 +518,12 @@ public:
      * @brief Get port statistics
      * @return Reference to port statistics structure
      */
-    auto stats() const -> const port_stats& {
-        return m_stats;
-    }
+    auto stats() const -> const port_stats& { return m_stats; }
 
     /**
      * @brief Reset statistics counters
      */
-    auto reset_stats() -> void {
-        m_stats.reset();
-    }
+    auto reset_stats() -> void { m_stats.reset(); }
 
     /// @return true if at least one connected input port can ACCEPT a send without the producer
     /// having to block (i.e. the send would enqueue OR would drop-on-a-paused-port, but not stall).
@@ -531,7 +534,9 @@ public:
     auto can_send() const -> bool {
         auto cur = snapshot();
         for (const auto* port : *cur) {
-            if (port != nullptr && (port->depth() == 0 || !port->is_full())) { return true; }
+            if (port != nullptr && (port->depth() == 0 || !port->is_full())) {
+                return true;
+            }
         }
         return false;
     }
@@ -544,7 +549,9 @@ public:
     [[nodiscard]] auto producer_can_send() const -> bool {
         const auto& cur = producer_snapshot();
         for (const auto* port : *cur) {
-            if (port != nullptr && (port->depth() == 0 || !port->is_full())) { return true; }
+            if (port != nullptr && (port->depth() == 0 || !port->is_full())) {
+                return true;
+            }
         }
         return false;
     }
@@ -578,20 +585,21 @@ protected:
     auto producer_snapshot() const -> const std::shared_ptr<const connection_list>& {
         const auto gen = m_generation.load(std::memory_order_acquire);
         if (gen != m_producer_cached_gen) {
-            m_producer_cached = m_connected.load(std::memory_order_acquire);  // cold path: topology changed
+            m_producer_cached = m_connected.load(std::memory_order_acquire); // cold path: topology changed
             m_producer_cached_gen = gen;
         }
         return m_producer_cached;
     }
 
     std::atomic<std::shared_ptr<const connection_list>> m_connected{
-        std::make_shared<const connection_list>()};  ///< COW fan-out list (lock-free read)
-    std::atomic<std::uint64_t> m_generation{0};       ///< bumped on connect/disconnect; gates the producer cache
-    std::mutex m_mutate_mtx;                          ///< serializes connect/disconnect (rare)
-    mutable port_stats m_stats;                       ///< Statistics tracking (bytes, packets, throughput)
+        std::make_shared<const connection_list>()}; ///< COW fan-out list (lock-free read)
+    std::atomic<std::uint64_t> m_generation{0};     ///< bumped on connect/disconnect; gates the producer cache
+    std::mutex m_mutate_mtx;                        ///< serializes connect/disconnect (rare)
+    mutable port_stats m_stats;                     ///< Statistics tracking (bytes, packets, throughput)
     // Producer-side cache (touched only by the single producer thread via producer_snapshot).
     mutable std::shared_ptr<const connection_list> m_producer_cached;
-    mutable std::uint64_t m_producer_cached_gen{static_cast<std::uint64_t>(-1)};  // != initial generation -> first call loads
+    mutable std::uint64_t m_producer_cached_gen{
+        static_cast<std::uint64_t>(-1)}; // != initial generation -> first call loads
 
 }; // class output_port_base
 

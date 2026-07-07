@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
+#include "helpers.hpp"
 #include "composite/core/application.hpp"
 #include "composite/core/register.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
-#include "helpers.hpp"
 
 #include <format>
 #include <iostream>
@@ -18,7 +18,9 @@ namespace composite {
 
 namespace {
 auto close_func(void* p) -> void {
-    if (p != nullptr) { dlclose(p); }
+    if (p != nullptr) {
+        dlclose(p);
+    }
 }
 } // namespace
 
@@ -84,8 +86,8 @@ auto make_component(const nlohmann::json& comp_json) -> std::shared_ptr<composit
         return {};
     }
     if (auto v = (*abi_func)(); v != composite::abi_version) {
-        spdlog::error("{}: component ABI version {} != framework ABI version {} — rebuild the component",
-                      library, v, composite::abi_version);
+        spdlog::error("{}: component ABI version {} != framework ABI version {} — rebuild the component", library, v,
+                      composite::abi_version);
         return {};
     }
 
@@ -107,8 +109,7 @@ auto make_component(const nlohmann::json& comp_json) -> std::shared_ptr<composit
     // type_info/vtable (which can live in the .so) → crash. Consuming it here also
     // turns a config typo into a clean load failure instead of std::terminate.
     try {
-        using function_ptr =
-            std::shared_ptr<composite::component> (*)(std::string_view, const composite::create_args&);
+        using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view, const composite::create_args&);
         auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
         if (auto err = dlerror(); err != nullptr) {
             spdlog::error("failed to find the 'create' symbol from {}: {}", library, err);
@@ -144,9 +145,9 @@ auto make_component(const nlohmann::json& comp_json) -> std::shared_ptr<composit
     // only after ~component (whose code/vtable live in that mapping) has run.
     auto* raw = inner.get();
     spdlog::trace("component {} created", comp_id);
-    return std::shared_ptr<composite::component>(raw,
-        [inner = std::move(inner), h = std::move(comp_handle)](composite::component*) mutable {
-            inner.reset();  // ~component runs here, while h (the mapping) is still alive
+    return std::shared_ptr<composite::component>(
+        raw, [inner = std::move(inner), h = std::move(comp_handle)](composite::component*) mutable {
+            inner.reset(); // ~component runs here, while h (the mapping) is still alive
             // h destructs at the end of this lambda → dlclose() after the component is gone
         });
 }
@@ -209,9 +210,7 @@ auto parse_telemetry_config(const nlohmann::json& telemetry_json) -> telemetry::
 
     // Parse export interval
     if (telemetry_json.contains("export_interval")) {
-        config.export_interval = std::chrono::milliseconds{
-            telemetry_json["export_interval"].get<uint64_t>()
-        };
+        config.export_interval = std::chrono::milliseconds{telemetry_json["export_interval"].get<uint64_t>()};
     }
 
     // Parse exporter configuration
@@ -222,9 +221,7 @@ auto parse_telemetry_config(const nlohmann::json& telemetry_json) -> telemetry::
         config.exporter.protocol = exporter_json.value("protocol", "http/protobuf");
 
         if (exporter_json.contains("timeout")) {
-            config.exporter.timeout = std::chrono::milliseconds{
-                exporter_json["timeout"].get<uint64_t>()
-            };
+            config.exporter.timeout = std::chrono::milliseconds{exporter_json["timeout"].get<uint64_t>()};
         }
 
         config.exporter.headers = exporter_json.value("headers", "");

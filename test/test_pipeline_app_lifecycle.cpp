@@ -23,7 +23,12 @@ using ibuf = immutable_buffer<int>;
 
 namespace {
 int g_failures = 0;
-void check(bool ok, const char* what) { if (!ok) { std::printf("FAIL: %s\n", what); ++g_failures; } }
+void check(bool ok, const char* what) {
+    if (!ok) {
+        std::printf("FAIL: %s\n", what);
+        ++g_failures;
+    }
+}
 
 // A pipeline_component whose pool doubles each element. If the pool never starts (the bug), work()
 // never runs and downstream sees nothing.
@@ -31,9 +36,11 @@ class doubler : public pipeline_component<ibuf, ibuf> {
 public:
     explicit doubler(std::string_view id) : pipeline_component(id, "in", "out", /*workers=*/2) {}
     auto work(ibuf in, timestamp /*ts*/, const metadata& /*md*/) -> ibuf override {
-        m_work_calls.fetch_add(1, std::memory_order_relaxed);  // includes zero-length packets (#5)
+        m_work_calls.fetch_add(1, std::memory_order_relaxed); // includes zero-length packets (#5)
         auto out = make_mutable<int>(in.size());
-        for (std::size_t i = 0; i < in.size(); ++i) { out[i] = in[i] * 2; }
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i] * 2;
+        }
         return std::move(out).to_immutable();
     }
     // Count pool teardowns so a test can prove the pool is reaped on SELF-finish (§2.2), not only on
@@ -54,13 +61,15 @@ public:
     explicit drop_alt_pipeline(std::string_view id) : pipeline_component(id, "in", "out", 2) {}
     auto work(ibuf in, timestamp /*ts*/, const metadata& /*md*/) -> ibuf override {
         auto out = make_mutable<int>(in.size());
-        for (std::size_t i = 0; i < in.size(); ++i) { out[i] = in[i]; }
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i];
+        }
         return std::move(out).to_immutable();
     }
     auto finalize(ibuf& /*out*/, timestamp /*ts*/, const metadata& /*md*/) -> bool override {
-        return (m_fin++ % 2) == 0;  // keep 0th,2nd,4th... drop the rest (finalize runs main-thread, in order)
+        return (m_fin++ % 2) == 0; // keep 0th,2nd,4th... drop the rest (finalize runs main-thread, in order)
     }
-    int m_fin{0};  // main-worker only
+    int m_fin{0}; // main-worker only
 };
 
 // finalize() THROWS on one packet. With error_restart_max>0, a non-latched throwing finalize() would
@@ -71,12 +80,16 @@ public:
     explicit throw_finalize_pipeline(std::string_view id) : pipeline_component(id, "in", "out", 1) {}
     auto work(ibuf in, timestamp /*ts*/, const metadata& /*md*/) -> ibuf override {
         auto out = make_mutable<int>(in.size());
-        for (std::size_t i = 0; i < in.size(); ++i) { out[i] = in[i]; }
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i];
+        }
         return std::move(out).to_immutable();
     }
     auto finalize(ibuf& /*out*/, timestamp /*ts*/, const metadata& /*md*/) -> bool override {
-        const int n = m_fin_calls.fetch_add(1, std::memory_order_relaxed);  // side effect: counts EVERY call
-        if (n == 2) { throw std::runtime_error("finalize boom"); }          // throw once, on the 3rd packet
+        const int n = m_fin_calls.fetch_add(1, std::memory_order_relaxed); // side effect: counts EVERY call
+        if (n == 2) {
+            throw std::runtime_error("finalize boom");
+        } // throw once, on the 3rd packet
         return true;
     }
     std::atomic<int> m_fin_calls{0};
@@ -88,9 +101,13 @@ public:
     explicit slow_summing_sink(std::string_view id) : component(id) { add_port(&m_in); }
     auto process() -> retval override {
         auto [buf, ts, md] = m_in.get_data();
-        if (buf.empty()) { return inputs_at_end() ? retval::FINISH : retval::NOOP; }
-        std::this_thread::sleep_for(1ms);  // slower than the pipeline produces
-        for (std::size_t i = 0; i < buf.size(); ++i) { m_sum.fetch_add(buf[i], std::memory_order_relaxed); }
+        if (buf.empty()) {
+            return inputs_at_end() ? retval::FINISH : retval::NOOP;
+        }
+        std::this_thread::sleep_for(1ms); // slower than the pipeline produces
+        for (std::size_t i = 0; i < buf.size(); ++i) {
+            m_sum.fetch_add(buf[i], std::memory_order_relaxed);
+        }
         m_packets.fetch_add(1, std::memory_order_relaxed);
         return retval::NORMAL;
     }
@@ -106,7 +123,9 @@ public:
     counter_src(std::string_view id, int total) : component(id), m_total(total) { add_port(&m_out); }
     auto process() -> retval override {
         const int n = m_sent.load(std::memory_order_relaxed);
-        if (n >= m_total) { return retval::NOOP; }
+        if (n >= m_total) {
+            return retval::NOOP;
+        }
         auto b = make_mutable<int>(1);
         b[0] = n;
         m_out.send_data(std::move(b).to_immutable(), timestamp{}, std::nullopt);
@@ -115,7 +134,7 @@ public:
     }
     output_port<ibuf> m_out{"out"};
     int m_total;
-    std::atomic<int> m_sent{0};  // read by the worker + reset by the test main thread between runs
+    std::atomic<int> m_sent{0}; // read by the worker + reset by the test main thread between runs
     component::auto_stop m_auto_stop{*this};
 };
 
@@ -126,8 +145,12 @@ public:
     explicit summing_sink(std::string_view id) : component(id) { add_port(&m_in); }
     auto process() -> retval override {
         auto [buf, ts, md] = m_in.get_data();
-        if (buf.empty()) { return inputs_at_end() ? retval::FINISH : retval::NOOP; }
-        for (std::size_t i = 0; i < buf.size(); ++i) { m_sum.fetch_add(buf[i], std::memory_order_relaxed); }
+        if (buf.empty()) {
+            return inputs_at_end() ? retval::FINISH : retval::NOOP;
+        }
+        for (std::size_t i = 0; i < buf.size(); ++i) {
+            m_sum.fetch_add(buf[i], std::memory_order_relaxed);
+        }
         m_packets.fetch_add(1, std::memory_order_relaxed);
         return retval::NORMAL;
     }
@@ -144,7 +167,9 @@ public:
     finishing_src(std::string_view id, int total) : component(id), m_total(total) { add_port(&m_out); }
     auto process() -> retval override {
         const int n = m_sent.load(std::memory_order_relaxed);
-        if (n >= m_total) { return retval::FINISH; }  // -> completed -> auto-EOS on m_out
+        if (n >= m_total) {
+            return retval::FINISH;
+        } // -> completed -> auto-EOS on m_out
         auto b = make_mutable<int>(1);
         b[0] = n;
         m_out.send_data(std::move(b).to_immutable(), timestamp{}, std::nullopt);
@@ -169,7 +194,7 @@ public:
             b[0] = n;
             m_out.send_data(std::move(b).to_immutable(), timestamp{}, std::nullopt);
         } else if (n == m_data) {
-            m_out.send_data(make_immutable<int>(0), timestamp{}, std::nullopt);  // legit zero-length packet
+            m_out.send_data(make_immutable<int>(0), timestamp{}, std::nullopt); // legit zero-length packet
         } else {
             return retval::FINISH;
         }
@@ -214,7 +239,7 @@ int main() {
     app.stop();
 
     // ---- (2) restart via the application: the pool comes back up ----
-    s->m_sent = 0;                 // let the source re-emit
+    s->m_sent = 0; // let the source re-emit
     k->m_sum.store(0);
     k->m_packets.store(0);
     app.start();
@@ -224,7 +249,9 @@ int main() {
     // ---- (3) RUNTIME disable then enable (reconcile stop_locked/start_locked -> pool stop/start) ----
     d->set_properties(properties::json{{"enabled", false}}, properties::config_type::RUNTIME);
     check(!d->is_running(), "runtime disable: pipeline not running");
-    s->m_sent = 0; k->m_sum.store(0); k->m_packets.store(0);
+    s->m_sent = 0;
+    k->m_sum.store(0);
+    k->m_packets.store(0);
     d->set_properties(properties::json{{"enabled", true}}, properties::config_type::RUNTIME);
     check(wait_for_packets(k, N, 3s), "runtime re-enable: pool restarted and processed");
     check(k->m_sum.load() == EXPECTED_SUM, "runtime re-enable: values doubled");
@@ -253,7 +280,7 @@ int main() {
         // §2.2: the pool was reaped ON SELF-FINISH, before any explicit stop().
         check(d2->m_stops.load() >= 1, "§2.2: pool reaped (on_worker_stop) on self-finish, no explicit stop");
         const int stops_at_finish = d2->m_stops.load();
-        app2.stop();  // idempotent: guard must prevent a SECOND pool teardown
+        app2.stop(); // idempotent: guard must prevent a SECOND pool teardown
         check(d2->m_stops.load() == stops_at_finish, "§2.2: explicit stop after self-finish does NOT double-reap");
     }
 
@@ -266,7 +293,7 @@ int main() {
         app3.add_component(fs);
         app3.add_component(d3);
         app3.add_component(k3);
-        k3->m_in.depth(8);  // tiny ring downstream of the pipeline: a non-pacing retire would drop
+        k3->m_in.depth(8); // tiny ring downstream of the pipeline: a non-pacing retire would drop
         check(fs->connect("out", d3, "in"), "backpressure: connect fs->d3");
         check(d3->connect("out", k3, "in"), "backpressure: connect d3->k3");
         app3.start();
@@ -274,9 +301,11 @@ int main() {
         // The pipeline paces its OUTPUT (retire_ready -> AWAIT_OUTPUT on a full ring), so EVERY doubled
         // packet reaches the slow sink. Before the fix, retire_ready() sent unconditionally, dropped on
         // the full ring, and §2.1 FINISH still reported completed having swallowed most of the stream.
-        check(k3->m_packets.load() == N, "§2 (round3): slow sink received ALL packets — pipeline paced, nothing dropped");
+        check(k3->m_packets.load() == N,
+              "§2 (round3): slow sink received ALL packets — pipeline paced, nothing dropped");
         check(k3->m_sum.load() == EXPECTED_SUM, "§2 (round3): all values doubled + delivered under backpressure");
-        check(d3->finished_reason() == finish_reason::completed, "§2 (round3): pipeline completed (only after output flushed)");
+        check(d3->finished_reason() == finish_reason::completed,
+              "§2 (round3): pipeline completed (only after output flushed)");
     }
 
     // ---- (6) a genuine zero-length packet is submitted to work(), not dropped at ingest (round 3 #5) ----
@@ -307,7 +336,7 @@ int main() {
         app5.add_component(fs);
         app5.add_component(dp);
         app5.add_component(k5);
-        k5->m_in.depth(8);  // slow + tiny ring: kept packets fill it; the DROPPED heads must not block
+        k5->m_in.depth(8); // slow + tiny ring: kept packets fill it; the DROPPED heads must not block
         check(fs->connect("out", dp, "in"), "drop-bp: connect fs->dp");
         check(dp->connect("out", k5, "in"), "drop-bp: connect dp->k5");
         app5.start();
@@ -328,14 +357,15 @@ int main() {
         app6.add_component(fs);
         app6.add_component(d6);
         app6.add_component(k6);
-        k6->m_in.depth(0);  // paused/disabled sink: discards on send, must NOT backpressure the pipeline
+        k6->m_in.depth(0); // paused/disabled sink: discards on send, must NOT backpressure the pipeline
         check(fs->connect("out", d6, "in"), "paused-dn: connect fs->d6");
         check(d6->connect("out", k6, "in"), "paused-dn: connect d6->k6");
         app6.start();
         // producer_can_send() treats a depth-0 port as sendable (drops), so the pipeline sends-and-drops
         // to the paused sink, drains its input, and self-finishes. Before the fix it blocked forever.
         check(d6->wait_until_finished(30s), "§2 (round4): pipeline with a paused (depth-0) sink still self-finishes");
-        check(d6->finished_reason() == finish_reason::completed, "§2 (round4): pipeline completed (paused sink didn't wedge it)");
+        check(d6->finished_reason() == finish_reason::completed,
+              "§2 (round4): pipeline completed (paused sink didn't wedge it)");
     }
 
     // ---- (9) a throwing finalize() is caught+dropped, NOT replayed under error-restart (fix round 5) ----
@@ -355,12 +385,17 @@ int main() {
         check(tp->connect("out", k7, "in"), "finalize-throw: connect tp->k7");
         app7.start();
         check(app7.wait_until_finished(30s), "§round5: finalize-throw pipeline finished");
-        check(tp->finished_reason() == finish_reason::completed, "§round5: completed (finalize-throw caught+dropped, not an error exit)");
-        check(tp->m_fin_calls.load() == M, "§round5: finalize() ran EXACTLY once per packet (throwing packet not replayed)");
+        check(tp->finished_reason() == finish_reason::completed,
+              "§round5: completed (finalize-throw caught+dropped, not an error exit)");
+        check(tp->m_fin_calls.load() == M,
+              "§round5: finalize() ran EXACTLY once per packet (throwing packet not replayed)");
         check(k7->m_packets.load() == M - 1, "§round5: the throwing packet was dropped; the other M-1 delivered");
     }
 
-    if (g_failures) { std::printf("\n%d FAILURE(S)\n", g_failures); return 1; }
+    if (g_failures) {
+        std::printf("\n%d FAILURE(S)\n", g_failures);
+        return 1;
+    }
     std::puts("PIPELINE APP LIFECYCLE OK: pool starts via application::start() and RUNTIME enable "
               "(P0 fix: reconcile drives the virtual start/stop hooks), across restart + disable/enable");
     return 0;

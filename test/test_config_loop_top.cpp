@@ -18,10 +18,17 @@ using namespace composite;
 using composite::properties::config_type;
 using json = composite::properties::json;
 
-struct cfg_t { int gen{0}; COMPOSITE_FIELDS(cfg_t, (gen, runtime)); };
+struct cfg_t {
+    int gen{0};
+    COMPOSITE_FIELDS(cfg_t, (gen, runtime));
+};
 
 // for the reentrant-write test: on_apply for `trigger` reentrantly sets `derived`.
-struct re_cfg { int trigger{0}; int derived{0}; COMPOSITE_FIELDS(re_cfg, (trigger, runtime), (derived, runtime)); };
+struct re_cfg {
+    int trigger{0};
+    int derived{0};
+    COMPOSITE_FIELDS(re_cfg, (trigger, runtime), (derived, runtime));
+};
 
 class plan_comp : public component {
 public:
@@ -31,17 +38,22 @@ public:
         // this runs on the worker at loop-top, so process() below always sees them equal.
         m_cfg.on_apply([this](const cfg_t&, const changes<cfg_t>& ch) {
             if (ch.changed(&cfg_t::gen)) {
-                m_reaction_tid = std::this_thread::get_id();   // worker-thread-only write
+                m_reaction_tid = std::this_thread::get_id(); // worker-thread-only write
                 m_plan_gen.store(m_cfg->gen, std::memory_order_relaxed);
             }
         });
     }
 
     auto process() -> retval override {
-        if (!m_process_tid_set) { m_process_tid = std::this_thread::get_id(); m_process_tid_set = true; }
-        const int g = m_cfg->gen;                                   // config value (park-protected)
-        const int p = m_plan_gen.load(std::memory_order_relaxed);   // derived state
-        if (g != p) { m_violations.fetch_add(1, std::memory_order_relaxed); }
+        if (!m_process_tid_set) {
+            m_process_tid = std::this_thread::get_id();
+            m_process_tid_set = true;
+        }
+        const int g = m_cfg->gen;                                 // config value (park-protected)
+        const int p = m_plan_gen.load(std::memory_order_relaxed); // derived state
+        if (g != p) {
+            m_violations.fetch_add(1, std::memory_order_relaxed);
+        }
         m_iters.fetch_add(1, std::memory_order_release);
         return m_noop ? retval::NOOP : retval::NORMAL;
     }
@@ -54,7 +66,7 @@ public:
     bool m_process_tid_set{false};
     std::thread::id m_process_tid{};
     std::thread::id m_reaction_tid{};
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 
 // on_apply reentrantly set_properties()es another field (a supported worker-self-write);
@@ -73,7 +85,10 @@ public:
             }
         });
     }
-    auto process() -> retval override { m_iters.fetch_add(1, std::memory_order_release); return retval::NOOP; }
+    auto process() -> retval override {
+        m_iters.fetch_add(1, std::memory_order_release);
+        return retval::NOOP;
+    }
     config<re_cfg> m_cfg{};
     std::atomic<bool> m_derived_reaction_saw_change{false};
     std::atomic<long> m_iters{0};
@@ -82,7 +97,10 @@ public:
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 
 // Spin until pred() or the deadline; returns pred()'s final value.
@@ -90,7 +108,9 @@ template <typename Pred>
 static bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) { return true; }
+        if (pred()) {
+            return true;
+        }
         std::this_thread::yield();
     }
     return pred();
@@ -105,8 +125,7 @@ int main() {
         c.start();
         // wait until the worker is actually running (so set_properties defers to it,
         // rather than inline-draining on this thread during the start window).
-        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; },
-                         std::chrono::seconds(2)),
+        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; }, std::chrono::seconds(2)),
               "worker started and ran process()");
 
         constexpr int N = 2000;
@@ -114,13 +133,11 @@ int main() {
             c.set_properties(json{{"gen", i}}, config_type::RUNTIME);
         }
         // the last (coalesced) reaction drains at a worker loop-top within a wake
-        check(wait_until([&] { return c.m_plan_gen.load(std::memory_order_acquire) == N; },
-                         std::chrono::seconds(2)),
+        check(wait_until([&] { return c.m_plan_gen.load(std::memory_order_acquire) == N; }, std::chrono::seconds(2)),
               "final reaction applied (plan_gen == last gen)");
 
         c.stop();
-        check(c.m_violations.load() == 0,
-              "process() NEVER saw a new config value with stale derived state");
+        check(c.m_violations.load() == 0, "process() NEVER saw a new config value with stale derived state");
         check(c.m_reaction_tid == c.m_process_tid,
               "reaction ran on the WORKER thread (same as process()), not the writer thread");
         check(c.m_cfg->gen == N, "config value reached the last write (synchronous swap)");
@@ -132,15 +149,14 @@ int main() {
         c.m_noop = true;
         // a deliberately long NOOP backoff: if the worker were NOT woken on a property
         // write, the reaction would lag by ~this long.
-        c.set_properties(json{{"noop_thread_delay", 3'000'000'000LL}}, config_type::INITIALIZE);  // 3 s
+        c.set_properties(json{{"noop_thread_delay", 3'000'000'000LL}}, config_type::INITIALIZE); // 3 s
         c.start();
-        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; },
-                         std::chrono::seconds(2)),
+        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; }, std::chrono::seconds(2)),
               "idle worker ran at least one (NOOP) iteration");
 
         c.set_properties(json{{"gen", 42}}, config_type::RUNTIME);
         const bool reacted = wait_until([&] { return c.m_plan_gen.load(std::memory_order_acquire) == 42; },
-                                        std::chrono::milliseconds(500));   // << 3 s NOOP delay
+                                        std::chrono::milliseconds(500)); // << 3 s NOOP delay
         check(reacted, "idle component reacted within one wake (NOOP backoff was interrupted)");
         c.stop();
     }
@@ -149,8 +165,8 @@ int main() {
     {
         plan_comp c{"stopdrain"};
         c.start();
-        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; },
-                         std::chrono::seconds(2)), "worker running");
+        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; }, std::chrono::seconds(2)),
+              "worker running");
         // PATCH then IMMEDIATELY stop, without waiting for the worker to drain at loop-top.
         c.set_properties(json{{"gen", 7}}, config_type::RUNTIME);
         c.stop();
@@ -163,19 +179,21 @@ int main() {
     {
         reentrant_comp c{"reentrant"};
         c.start();
-        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; },
-                         std::chrono::seconds(2)), "reentrant worker running");
+        check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; }, std::chrono::seconds(2)),
+              "reentrant worker running");
         c.set_properties(json{{"trigger", 5}}, config_type::RUNTIME);
         // cascade: trigger reaction -> set derived=10 -> derived reaction sees changed(derived)
         const bool ok = wait_until(
-            [&] { return c.m_derived_reaction_saw_change.load(std::memory_order_acquire)
-                         && c.m_cfg->derived == 10; },
+            [&] { return c.m_derived_reaction_saw_change.load(std::memory_order_acquire) && c.m_cfg->derived == 10; },
             std::chrono::seconds(2));
         c.stop();
         check(ok, "reentrant write's reaction observed changed(derived) (diff not clobbered by the outer drain)");
     }
 
-    if (g_fails != 0) { std::fprintf(stderr, "%d loop-top check(s) FAILED\n", g_fails); return 1; }
+    if (g_fails != 0) {
+        std::fprintf(stderr, "%d loop-top check(s) FAILED\n", g_fails);
+        return 1;
+    }
     std::puts("CONFIG<T> B2 LOOP-TOP TESTS PASSED");
     return 0;
 }

@@ -20,22 +20,31 @@ using ibuf = immutable_buffer<int>;
 
 namespace {
 int g_failures = 0;
-void check(bool ok, const char* what) { if (!ok) { std::printf("FAIL: %s\n", what); ++g_failures; } }
+void check(bool ok, const char* what) {
+    if (!ok) {
+        std::printf("FAIL: %s\n", what);
+        ++g_failures;
+    }
+}
 
 // Emits `total` single-element packets (value = index), then done() -> EOS.
 class range_source : public source_component<ibuf> {
 public:
     range_source(std::string_view id, int total) : source_component(id), m_total(total) {}
+
 protected:
     auto produce() -> produce_result override {
-        if (m_produced >= m_total) { return produce_result::done(); }
+        if (m_produced >= m_total) {
+            return produce_result::done();
+        }
         auto b = make_mutable<int>(1);
         b[0] = m_produced++;
         return produce_result::emit(std::move(b).to_immutable(), timestamp{});
     }
+
 private:
     int m_total;
-    int m_produced{0};  // worker-thread only
+    int m_produced{0}; // worker-thread only
     component::auto_stop m_auto_stop{*this};
 };
 
@@ -43,12 +52,14 @@ private:
 class forever_source : public source_component<ibuf> {
 public:
     explicit forever_source(std::string_view id) : source_component(id) {}
+
 protected:
     auto produce() -> produce_result override {
         auto b = make_mutable<int>(1);
         b[0] = 1;
         return produce_result::emit(std::move(b).to_immutable(), timestamp{});
     }
+
 private:
     component::auto_stop m_auto_stop{*this};
 };
@@ -59,7 +70,9 @@ public:
     explicit counting_sink(std::string_view id) : component(id) { add_port(&m_in); }
     auto process() -> retval override {
         auto [buf, ts, md] = m_in.get_data();
-        if (buf.empty()) { return inputs_at_end() ? retval::FINISH : retval::NOOP; }
+        if (buf.empty()) {
+            return inputs_at_end() ? retval::FINISH : retval::NOOP;
+        }
         m_count.fetch_add(static_cast<int>(buf.size()), std::memory_order_relaxed);
         return retval::NORMAL;
     }
@@ -74,8 +87,10 @@ public:
     explicit slow_sink(std::string_view id) : component(id) { add_port(&m_in); }
     auto process() -> retval override {
         auto [buf, ts, md] = m_in.get_data();
-        if (buf.empty()) { return inputs_at_end() ? retval::FINISH : retval::NOOP; }
-        std::this_thread::sleep_for(1ms);  // deliberately slower than the source produces
+        if (buf.empty()) {
+            return inputs_at_end() ? retval::FINISH : retval::NOOP;
+        }
+        std::this_thread::sleep_for(1ms); // deliberately slower than the source produces
         m_count.fetch_add(static_cast<int>(buf.size()), std::memory_order_relaxed);
         return retval::NORMAL;
     }
@@ -92,14 +107,16 @@ public:
 class dtor_safe_source : public source_component<ibuf> {
 public:
     explicit dtor_safe_source(std::string_view id) : source_component(id) {}
+
 protected:
     auto produce() -> produce_result override {
         auto b = make_mutable<int>(1);
         b[0] = 7;
         return produce_result::emit(std::move(b).to_immutable(), timestamp{});
     }
+
 private:
-    component::auto_stop m_auto_stop{*this};  // MUST be last — stops the worker while THIS vtable is live
+    component::auto_stop m_auto_stop{*this}; // MUST be last — stops the worker while THIS vtable is live
 };
 } // namespace
 
@@ -129,7 +146,9 @@ int main() {
         s->connect("out", k, "in");
         app.start();
         // Let it run so data is flowing.
-        for (int i = 0; i < 200 && k->m_count.load() == 0; ++i) { std::this_thread::sleep_for(1ms); }
+        for (int i = 0; i < 200 && k->m_count.load() == 0; ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
         check(s->is_running(), "drain: source running before drain_stop");
         check(k->m_count.load() > 0, "drain: data was flowing");
 
@@ -148,7 +167,7 @@ int main() {
         auto k = std::make_shared<slow_sink>("k");
         app.add_component(s);
         app.add_component(k);
-        k->m_in.depth(8);  // tiny ring: a non-pacing source (send+NORMAL) would overrun it and drop
+        k->m_in.depth(8); // tiny ring: a non-pacing source (send+NORMAL) would overrun it and drop
         check(s->connect("out", k, "in"), "backpressure: connect s->k");
         app.start();
         check(app.wait_until_finished(10s), "backpressure: graph finished");
@@ -161,9 +180,11 @@ int main() {
 
     // ---- §2.3: a correctly-written source (leaf auto_stop) is safe to DESTROY while running ----
     {
-        auto s = std::make_shared<dtor_safe_source>("dtor");  // unconnected -> produces (drops) + runs
+        auto s = std::make_shared<dtor_safe_source>("dtor"); // unconnected -> produces (drops) + runs
         s->start();
-        for (int i = 0; i < 200 && !s->is_running(); ++i) { std::this_thread::sleep_for(1ms); }
+        for (int i = 0; i < 200 && !s->is_running(); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
         check(s->is_running(), "§2.3: source running before destruction");
         // Destroy while the worker is actively in process()/produce(). The leaf's own auto_stop (last
         // member) stops the worker while this vtable is still intact, so produce() is never called on
@@ -175,22 +196,26 @@ int main() {
     // ---- §2.4 (round 3): done()/EOS is reachable even when the output is UN-SENDABLE ----
     {
         application app{"done-under-backpressure"};
-        auto s = std::make_shared<range_source>("s", 0);  // produces NO data — first produce() is done()
+        auto s = std::make_shared<range_source>("s", 0); // produces NO data — first produce() is done()
         auto k = std::make_shared<counting_sink>("k");
         app.add_component(s);
         app.add_component(k);
         check(s->connect("out", k, "in"), "done-bp: connect s->k");
-        k->m_in.depth(0);  // consumer permanently un-sendable (models a paused/disabled downstream)
+        k->m_in.depth(0); // consumer permanently un-sendable (models a paused/disabled downstream)
         app.start();
         // With the round-2 gate-BEFORE-produce(), can_send()==false -> AWAIT_OUTPUT forever, so
         // produce() (hence done()) is never called and the source hangs. With produce-then-hold, only
         // the `data` case is backpressure-gated: done() is reached and FINISH fires regardless of
         // output room (EOS is out-of-band). A finite source must never be starved of completion.
-        check(s->wait_until_finished(3s), "§2.4-r3: source with un-sendable output still self-finishes (done not gated)");
+        check(s->wait_until_finished(3s),
+              "§2.4-r3: source with un-sendable output still self-finishes (done not gated)");
         check(s->finished_reason() == finish_reason::completed, "§2.4-r3: source completed via done()");
     }
 
-    if (g_failures) { std::printf("\n%d FAILURE(S)\n", g_failures); return 1; }
+    if (g_failures) {
+        std::printf("\n%d FAILURE(S)\n", g_failures);
+        return 1;
+    }
     std::puts("SOURCE COMPONENT OK: produce()/emit/idle/done, auto-EOS-to-completion on done(), "
               "and application::drain_stop graceful shutdown of a forever source");
     return 0;

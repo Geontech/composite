@@ -21,7 +21,10 @@ using json = composite::properties::json;
 class noop_comp : public component {
 public:
     explicit noop_comp(std::string_view id) : component(id) {}
-    auto process() -> retval override { m_iters.fetch_add(1, std::memory_order_relaxed); return retval::NOOP; }
+    auto process() -> retval override {
+        m_iters.fetch_add(1, std::memory_order_relaxed);
+        return retval::NOOP;
+    }
     std::atomic<long> m_iters{0};
     component::auto_stop m_auto_stop{*this};
 };
@@ -43,13 +46,18 @@ public:
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 template <typename Pred>
 static bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) { return true; }
+        if (pred()) {
+            return true;
+        }
         std::this_thread::yield();
     }
     return pred();
@@ -76,7 +84,7 @@ int main() {
         noop_comp c{"b"};
         c.set_properties(json{{"enabled", true}}, config_type::RUNTIME);
         check(wait_until([&] { return c.is_running(); }, 2s), "started");
-        c.stop();  // direct stop (NOT via the enabled write): observed stops, desired stays true
+        c.stop(); // direct stop (NOT via the enabled write): observed stops, desired stays true
         check(!c.is_running() && c.is_enabled(),
               "direct stop: not running yet still desired-enabled (no stale mirror to desync)");
         // The desired value is still true (unchanged), but the write must STILL restart —
@@ -102,13 +110,13 @@ int main() {
     // ---- (4) legacy two-step set_properties(INITIALIZE) + apply_lifecycle_changes() reconcile ----
     {
         noop_comp c{"e"};
-        c.set_properties(json{{"enabled", true}});  // INITIALIZE: records desired, does NOT start
+        c.set_properties(json{{"enabled", true}}); // INITIALIZE: records desired, does NOT start
         check(!c.is_running(), "INITIALIZE enabled does not start immediately");
         check(c.is_enabled(), "INITIALIZE recorded desired = true");
-        c.apply_lifecycle_changes();                 // reconcile -> start
+        c.apply_lifecycle_changes(); // reconcile -> start
         check(wait_until([&] { return c.is_running(); }, 2s), "apply_lifecycle_changes() reconciles to start");
-        c.set_properties(json{{"enabled", false}});  // INITIALIZE: desired false
-        c.apply_lifecycle_changes();                 // reconcile -> stop
+        c.set_properties(json{{"enabled", false}}); // INITIALIZE: desired false
+        c.apply_lifecycle_changes();                // reconcile -> stop
         check(!c.is_running(), "apply_lifecycle_changes() reconciles to stop");
     }
 
@@ -124,8 +132,11 @@ int main() {
     {
         noop_comp c{"g"};
         bool threw = false;
-        try { c.set_properties(json{{"enabled", 1}}, config_type::RUNTIME); }
-        catch (const std::exception&) { threw = true; }
+        try {
+            c.set_properties(json{{"enabled", 1}}, config_type::RUNTIME);
+        } catch (const std::exception&) {
+            threw = true;
+        }
         check(threw, "non-boolean enabled rejected");
     }
 
@@ -133,7 +144,7 @@ int main() {
     //          not the stale jthread handle — else the no-op trap returns for self-stops) ----
     {
         finish_once_comp c{"finish"};
-        c.set_properties(json{{"enabled", true}}, config_type::RUNTIME);  // start; process() FINISHes once
+        c.set_properties(json{{"enabled", true}}, config_type::RUNTIME); // start; process() FINISHes once
         check(wait_until([&] { return !c.is_running() && c.m_iters.load(std::memory_order_acquire) >= 1; }, 2s),
               "component self-stopped after process() returned FINISH");
         check(c.is_enabled(), "still desired-enabled after a FINISH self-stop");
@@ -144,7 +155,10 @@ int main() {
               "re-enable after a FINISH self-stop RESTARTS (park-liveness reconcile, not stale handle)");
     }
 
-    if (g_fails != 0) { std::fprintf(stderr, "%d enabled-lifecycle check(s) FAILED\n", g_fails); return 1; }
+    if (g_fails != 0) {
+        std::fprintf(stderr, "%d enabled-lifecycle check(s) FAILED\n", g_fails);
+        return 1;
+    }
     std::puts("ENABLED SPEC/STATUS LIFECYCLE TESTS PASSED");
     return 0;
 }

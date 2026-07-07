@@ -271,7 +271,7 @@ private:
     // atomic so is_initialized() reads it without the registry lock.
     std::atomic<bool> m_initialized{false};
     port_registry m_registry;
-    std::map<std::string, mempool_config> m_mempool_configs;  ///< Mempool name → config (init-time only)
+    std::map<std::string, mempool_config> m_mempool_configs; ///< Mempool name → config (init-time only)
 
 }; // class manager
 

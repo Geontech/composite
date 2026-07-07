@@ -31,9 +31,7 @@ struct port_stats {
      */
     port_stats() {
         auto now = std::chrono::steady_clock::now();
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()
-        ).count();
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
         m_start_time_ns.store(ns, std::memory_order_relaxed);
         m_last_activity_ns.store(ns, std::memory_order_relaxed);
     }
@@ -48,39 +46,22 @@ struct port_stats {
      * @param port_name Name of the port
      * @param port_type "input" or "output"
      */
-    auto register_metrics(
-        std::string_view component_id,
-        std::string_view port_name,
-        std::string_view port_type
-    ) -> void {
+    auto register_metrics(std::string_view component_id, std::string_view port_name, std::string_view port_type)
+        -> void {
         auto& registry = metrics::registry::instance();
 
-        metrics::labels_t labels = {
-            {"component_id", std::string{component_id}},
-            {"port_name", std::string{port_name}},
-            {"port_type", std::string{port_type}}
-        };
+        metrics::labels_t labels = {{"component_id", std::string{component_id}},
+                                    {"port_name", std::string{port_name}},
+                                    {"port_type", std::string{port_type}}};
 
         m_packets_transferred = &registry.get_or_create_counter(
-            "composite.port.packets_transferred",
-            "Number of packets successfully transferred",
-            "1",
-            labels
-        );
+            "composite.port.packets_transferred", "Number of packets successfully transferred", "1", labels);
 
         m_packets_dropped = &registry.get_or_create_counter(
-            "composite.port.packets_dropped",
-            "Number of packets dropped due to queue overflow",
-            "1",
-            labels
-        );
+            "composite.port.packets_dropped", "Number of packets dropped due to queue overflow", "1", labels);
 
         m_bytes_transferred = &registry.get_or_create_counter(
-            "composite.port.bytes_transferred",
-            "Total bytes transferred through this port",
-            "By",
-            labels
-        );
+            "composite.port.bytes_transferred", "Total bytes transferred through this port", "By", labels);
     }
 
     /**
@@ -162,9 +143,7 @@ struct port_stats {
     auto throughput_mbps() const -> double {
         auto start = m_start_time_ns.load(std::memory_order_relaxed);
         auto now = std::chrono::steady_clock::now();
-        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()
-        ).count();
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
         auto elapsed_ns = now_ns - start;
         if (elapsed_ns <= 0) {
@@ -208,9 +187,7 @@ struct port_stats {
     [[nodiscard]]
     auto time_since_last_activity() const -> std::chrono::nanoseconds {
         auto now = std::chrono::steady_clock::now();
-        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()
-        ).count();
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
         const auto traffic = packets_transferred() + packets_dropped();
         if (traffic != m_last_seen_traffic.load(std::memory_order_relaxed)) {
@@ -229,9 +206,7 @@ struct port_stats {
      */
     auto reset() -> void {
         auto now = std::chrono::steady_clock::now();
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()
-        ).count();
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
         m_start_time_ns.store(ns, std::memory_order_relaxed);
         m_last_activity_ns.store(ns, std::memory_order_relaxed);

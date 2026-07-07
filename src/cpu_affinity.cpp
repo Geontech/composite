@@ -35,8 +35,7 @@ auto try_parse_cpuset(const std::string& cpuset_str) -> std::optional<cpu_set_t>
     return std::nullopt;
 }
 
-auto try_read_cpuset_file(const std::string& path, const std::string& label)
-    -> std::optional<cpu_set_t> {
+auto try_read_cpuset_file(const std::string& path, const std::string& label) -> std::optional<cpu_set_t> {
     if (auto line = read_first_line(path)) {
         if (auto cpuset = try_parse_cpuset(*line)) {
             spdlog::debug("Read CPU set from {} ({}): {}", path, label, *line);
@@ -163,13 +162,11 @@ auto parse_cpuset(const std::string& cpuset_str) -> cpu_set_t {
     return cpuset;
 }
 
-auto parse_affinity_config(
-    const std::string& affinity_str,
-    const std::vector<int>& available_cores
-) -> std::optional<cpu_set_t> {
+auto parse_affinity_config(const std::string& affinity_str, const std::vector<int>& available_cores)
+    -> std::optional<cpu_set_t> {
     // Handle special cases
     if (affinity_str == "none" || affinity_str.empty()) {
-        return std::nullopt;  // No affinity configuration
+        return std::nullopt; // No affinity configuration
     }
 
     cpu_set_t cpuset;
@@ -204,8 +201,8 @@ auto parse_affinity_config(
             // Map logical indices to physical cores
             for (int logical_idx = start; logical_idx <= end; logical_idx++) {
                 if (logical_idx < 0 || static_cast<size_t>(logical_idx) >= available_cores.size()) {
-                    spdlog::error("Logical CPU index {} out of range (have {} cores)",
-                        logical_idx, available_cores.size());
+                    spdlog::error("Logical CPU index {} out of range (have {} cores)", logical_idx,
+                                  available_cores.size());
                     return std::nullopt;
                 }
                 int physical_core = available_cores[logical_idx];
@@ -215,8 +212,7 @@ auto parse_affinity_config(
             // Single logical index
             int logical_idx = std::stoi(token);
             if (logical_idx < 0 || static_cast<size_t>(logical_idx) >= available_cores.size()) {
-                spdlog::error("Logical CPU index {} out of range (have {} cores)",
-                    logical_idx, available_cores.size());
+                spdlog::error("Logical CPU index {} out of range (have {} cores)", logical_idx, available_cores.size());
                 return std::nullopt;
             }
             int physical_core = available_cores[logical_idx];
@@ -233,10 +229,8 @@ auto parse_affinity_config(
     return cpuset;
 }
 
-auto translate_dpdk_eal_args(
-    const std::vector<std::string>& eal_args,
-    const std::vector<int>& available_cores
-) -> std::pair<std::vector<std::string>, std::vector<int>> {
+auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std::vector<int>& available_cores)
+    -> std::pair<std::vector<std::string>, std::vector<int>> {
     std::vector<std::string> translated_args;
     std::vector<int> dpdk_logical_cores;
 
@@ -267,8 +261,8 @@ auto translate_dpdk_eal_args(
                             physical_cores.push_back(available_cores[logical]);
                             dpdk_logical_cores.push_back(logical);
                         } else {
-                            spdlog::error("DPDK lcore logical index {} out of range (have {} cores)",
-                                logical, available_cores.size());
+                            spdlog::error("DPDK lcore logical index {} out of range (have {} cores)", logical,
+                                          available_cores.size());
                         }
                     }
                 } else {
@@ -278,8 +272,8 @@ auto translate_dpdk_eal_args(
                         physical_cores.push_back(available_cores[logical]);
                         dpdk_logical_cores.push_back(logical);
                     } else {
-                        spdlog::error("DPDK lcore logical index {} out of range (have {} cores)",
-                            logical, available_cores.size());
+                        spdlog::error("DPDK lcore logical index {} out of range (have {} cores)", logical,
+                                      available_cores.size());
                     }
                 }
             }
@@ -292,14 +286,13 @@ auto translate_dpdk_eal_args(
             }
             translated_args.push_back(physical_str);
 
-            spdlog::debug("Translated DPDK -l {} (logical) -> {} (physical)",
-                lcore_str, physical_str);
+            spdlog::debug("Translated DPDK -l {} (logical) -> {} (physical)", lcore_str, physical_str);
 
         } else if (arg == "--lcores" && i + 1 < eal_args.size()) {
             // --lcores format is more complex, e.g., "(0-1)@(0-1)"
             // For now, log a warning and pass through unchanged
             spdlog::warn("DPDK --lcores argument detected. Translation not yet implemented, "
-                "passing through as-is. Use -l for automatic translation.");
+                         "passing through as-is. Use -l for automatic translation.");
             translated_args.push_back(arg);
             translated_args.push_back(eal_args[++i]);
 

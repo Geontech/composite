@@ -43,20 +43,20 @@ public:
     logger(const logger&) = delete;
     logger& operator=(const logger&) = delete;
 
-#define COMPOSITE_LOG_LEVEL_METHODS(LVL, ENUM)                                                  \
-    template <class Arg0, class... Args>                                                        \
-    void LVL(std::format_string<Arg0, Args...> fmt, Arg0&& a0, Args&&... args) {                \
-        if (should_log(ENUM)) {                                                                 \
-            log(ENUM, std::format(fmt, std::forward<Arg0>(a0), std::forward<Args>(args)...));   \
-        }                                                                                       \
-    }                                                                                           \
+#define COMPOSITE_LOG_LEVEL_METHODS(LVL, ENUM)                                                                         \
+    template <class Arg0, class... Args>                                                                               \
+    void LVL(std::format_string<Arg0, Args...> fmt, Arg0&& a0, Args&&... args) {                                       \
+        if (should_log(ENUM)) {                                                                                        \
+            log(ENUM, std::format(fmt, std::forward<Arg0>(a0), std::forward<Args>(args)...));                          \
+        }                                                                                                              \
+    }                                                                                                                  \
     void LVL(std::string_view msg) { log(ENUM, msg); }
 
-    COMPOSITE_LOG_LEVEL_METHODS(trace,    log_level::trace)
-    COMPOSITE_LOG_LEVEL_METHODS(debug,    log_level::debug)
-    COMPOSITE_LOG_LEVEL_METHODS(info,     log_level::info)
-    COMPOSITE_LOG_LEVEL_METHODS(warn,     log_level::warn)
-    COMPOSITE_LOG_LEVEL_METHODS(error,    log_level::error)
+    COMPOSITE_LOG_LEVEL_METHODS(trace, log_level::trace)
+    COMPOSITE_LOG_LEVEL_METHODS(debug, log_level::debug)
+    COMPOSITE_LOG_LEVEL_METHODS(info, log_level::info)
+    COMPOSITE_LOG_LEVEL_METHODS(warn, log_level::warn)
+    COMPOSITE_LOG_LEVEL_METHODS(error, log_level::error)
     COMPOSITE_LOG_LEVEL_METHODS(critical, log_level::critical)
 #undef COMPOSITE_LOG_LEVEL_METHODS
 
@@ -66,10 +66,10 @@ public:
     [[nodiscard]] auto name() const -> const std::string&;
 
 private:
-    auto log(log_level level, std::string_view msg) -> void;  // defined in logger.cpp (backend)
+    auto log(log_level level, std::string_view msg) -> void; // defined in logger.cpp (backend)
 
     struct impl;
-    std::shared_ptr<impl> m_impl;  // pimpl: the spdlog logger/sink live here, never in this header
+    std::shared_ptr<impl> m_impl; // pimpl: the spdlog logger/sink live here, never in this header
 };
 
 /// Set the process-wide default log level (CLI --log-level). Mirrors the prior global behavior.

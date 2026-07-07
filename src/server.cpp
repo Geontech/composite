@@ -5,10 +5,10 @@
 
 #include "composite/core/application.hpp"
 #include "composite/metrics/metrics.hpp"
-#include "composite/version.hpp"  // COMPOSITE_VERSION for the OpenAPI document
+#include "composite/version.hpp" // COMPOSITE_VERSION for the OpenAPI document
 
 #include "helpers.hpp"
-#include "property_handlers/common.hpp"  // CORS/JSON response helpers
+#include "property_handlers/common.hpp" // CORS/JSON response helpers
 
 #include <atomic>
 #include <chrono>
@@ -81,10 +81,10 @@ auto to_json(nlohmann::json& json_obj, const application& app) {
 }
 
 // Use response helpers from property_handlers for consistency
-using property_handlers::set_cors;
-using property_handlers::json_ok;
-using property_handlers::json_created;
 using property_handlers::error;
+using property_handlers::json_created;
+using property_handlers::json_ok;
+using property_handlers::set_cors;
 
 // Helper to serialize a port to JSON
 auto port_to_json(const std::string& name, port_base* port) -> nlohmann::json {
@@ -130,19 +130,13 @@ struct connection_request {
             return "input must specify 'component' and 'port'";
         }
 
-        return connection_request{
-            output["component"].get<std::string>(),
-            output["port"].get<std::string>(),
-            input["component"].get<std::string>(),
-            input["port"].get<std::string>()
-        };
+        return connection_request{output["component"].get<std::string>(), output["port"].get<std::string>(),
+                                  input["component"].get<std::string>(), input["port"].get<std::string>()};
     }
 
     [[nodiscard]] auto to_json() const -> nlohmann::json {
-        return {
-            {"output", {{"component", source_comp_id}, {"port", source_port_name}}},
-            {"input", {{"component", target_comp_id}, {"port", target_port_name}}}
-        };
+        return {{"output", {{"component", source_comp_id}, {"port", source_port_name}}},
+                {"input", {{"component", target_comp_id}, {"port", target_port_name}}}};
     }
 };
 
@@ -165,23 +159,25 @@ auto metric_snapshot_to_json(const metrics::metric_snapshot& snap) -> nlohmann::
     json_obj["labels"] = labels_obj;
 
     // Value based on type
-    std::visit([&json_obj](auto&& val) {
-        using T = std::decay_t<decltype(val)>;
-        if constexpr (std::is_same_v<T, uint64_t>) {
-            json_obj["value"] = val;
-        } else if constexpr (std::is_same_v<T, int64_t>) {
-            json_obj["value"] = val;
-        } else if constexpr (std::is_same_v<T, double>) {
-            json_obj["value"] = val;
-        } else if constexpr (std::is_same_v<T, metrics::histogram_snapshot>) {
-            auto hist_obj = nlohmann::json::object();
-            hist_obj["count"] = val.count;
-            hist_obj["sum"] = val.sum;
-            hist_obj["boundaries"] = val.boundaries;
-            hist_obj["bucket_counts"] = val.bucket_counts;
-            json_obj["value"] = hist_obj;
-        }
-    }, snap.value);
+    std::visit(
+        [&json_obj](auto&& val) {
+            using T = std::decay_t<decltype(val)>;
+            if constexpr (std::is_same_v<T, uint64_t>) {
+                json_obj["value"] = val;
+            } else if constexpr (std::is_same_v<T, int64_t>) {
+                json_obj["value"] = val;
+            } else if constexpr (std::is_same_v<T, double>) {
+                json_obj["value"] = val;
+            } else if constexpr (std::is_same_v<T, metrics::histogram_snapshot>) {
+                auto hist_obj = nlohmann::json::object();
+                hist_obj["count"] = val.count;
+                hist_obj["sum"] = val.sum;
+                hist_obj["boundaries"] = val.boundaries;
+                hist_obj["bucket_counts"] = val.bucket_counts;
+                json_obj["value"] = hist_obj;
+            }
+        },
+        snap.value);
 
     // Timestamp as ISO 8601 (thread-safe)
     auto time_t = std::chrono::system_clock::to_time_t(snap.timestamp);
@@ -220,38 +216,38 @@ namespace {
 /// document; it must be kept in lockstep with the routes registered in make_server() (the
 /// "openapi catalog matches the registered routes" integration test guards against drift).
 struct route_doc {
-    std::string_view method;   ///< lowercase HTTP method: get|post|patch|put|delete
-    std::string_view path;     ///< OpenAPI-templated path (httplib uses :param; OpenAPI uses {param})
+    std::string_view method; ///< lowercase HTTP method: get|post|patch|put|delete
+    std::string_view path;   ///< OpenAPI-templated path (httplib uses :param; OpenAPI uses {param})
     std::string_view summary;
 };
 
 /// The complete REST control-plane surface, in OpenAPI {param} path templating.
 inline auto rest_catalog() -> const std::vector<route_doc>& {
     static const std::vector<route_doc> catalog = {
-        {"get",    "/app/healthz",                                       "Liveness probe (always 200)"},
-        {"get",    "/app/openapi.json",                                  "This OpenAPI 3.1 API description"},
-        {"get",    "/app/metrics",                                       "Snapshot of all metrics"},
-        {"get",    "/app/metrics/stream",                                "Server-Sent Events metrics stream"},
-        {"get",    "/app",                                               "Full application graph"},
-        {"post",   "/app/start",                                         "Start (reconcile to desired-enabled) all components"},
-        {"post",   "/app/stop",                                          "Stop all component workers"},
-        {"get",    "/app/components",                                    "List all components"},
-        {"post",   "/app/components",                                    "Create and add a component"},
-        {"patch",  "/app/components",                                    "Multi-component property batch (207 on partial failure)"},
-        {"get",    "/app/components/{id}",                               "Get one component"},
-        {"delete", "/app/components/{id}",                               "Stop, disconnect, and unload a component"},
-        {"patch",  "/app/components/{id}",                               "Set a batch of properties on one component"},
-        {"get",    "/app/components/{id}/schema",                        "JSON Schema of the component's properties"},
-        {"get",    "/app/components/{id}/properties",                    "Full property state"},
-        {"get",    "/app/components/{id}/properties/{name}",             "Get one property value"},
-        {"put",    "/app/components/{id}/properties/{name}",             "Set/replace one property"},
-        {"patch",  "/app/components/{id}/properties/{name}",             "Merge one property (RFC-7396)"},
-        {"delete", "/app/components/{id}/properties/{name}",             "Reset one property to its default"},
-        {"get",    "/app/components/{id}/ports",                         "List ports with connection status"},
-        {"get",    "/app/components/{id}/ports/{port_name}",             "Get one port's details"},
+        {"get", "/app/healthz", "Liveness probe (always 200)"},
+        {"get", "/app/openapi.json", "This OpenAPI 3.1 API description"},
+        {"get", "/app/metrics", "Snapshot of all metrics"},
+        {"get", "/app/metrics/stream", "Server-Sent Events metrics stream"},
+        {"get", "/app", "Full application graph"},
+        {"post", "/app/start", "Start (reconcile to desired-enabled) all components"},
+        {"post", "/app/stop", "Stop all component workers"},
+        {"get", "/app/components", "List all components"},
+        {"post", "/app/components", "Create and add a component"},
+        {"patch", "/app/components", "Multi-component property batch (207 on partial failure)"},
+        {"get", "/app/components/{id}", "Get one component"},
+        {"delete", "/app/components/{id}", "Stop, disconnect, and unload a component"},
+        {"patch", "/app/components/{id}", "Set a batch of properties on one component"},
+        {"get", "/app/components/{id}/schema", "JSON Schema of the component's properties"},
+        {"get", "/app/components/{id}/properties", "Full property state"},
+        {"get", "/app/components/{id}/properties/{name}", "Get one property value"},
+        {"put", "/app/components/{id}/properties/{name}", "Set/replace one property"},
+        {"patch", "/app/components/{id}/properties/{name}", "Merge one property (RFC-7396)"},
+        {"delete", "/app/components/{id}/properties/{name}", "Reset one property to its default"},
+        {"get", "/app/components/{id}/ports", "List ports with connection status"},
+        {"get", "/app/components/{id}/ports/{port_name}", "Get one port's details"},
         {"delete", "/app/components/{id}/ports/{port_name}/connections", "Disconnect all of a port's connections"},
-        {"post",   "/app/connections",                                   "Create a connection"},
-        {"delete", "/app/connections",                                   "Remove a specific connection"},
+        {"post", "/app/connections", "Create a connection"},
+        {"delete", "/app/connections", "Remove a specific connection"},
     };
     return catalog;
 }
@@ -267,22 +263,21 @@ inline auto build_openapi(std::string_view app_name) -> nlohmann::json {
     }
     return {
         {"openapi", "3.1.0"},
-        {"info", {
-            {"title", std::format("{} — composite control plane", app_name)},
-            {"version", COMPOSITE_VERSION},
-            {"description", "REST control plane for a composite streaming application. Property "
-                            "values are native typed JSON; see the README for full semantics."},
-        }},
+        {"info",
+         {
+             {"title", std::format("{} — composite control plane", app_name)},
+             {"version", COMPOSITE_VERSION},
+             {"description", "REST control plane for a composite streaming application. Property "
+                             "values are native typed JSON; see the README for full semantics."},
+         }},
         {"paths", std::move(paths)},
     };
 }
 
 } // namespace
 
-auto set_component_properties(
-  composite::application::component_ptr comp,
-  const nlohmann::json& properties
-) -> httplib::Response {
+auto set_component_properties(composite::application::component_ptr comp, const nlohmann::json& properties)
+    -> httplib::Response {
     auto res = httplib::Response{};
     try {
         spdlog::trace("patching component-level properties on {}", comp->id());
@@ -306,12 +301,8 @@ auto set_component_properties(
 }
 
 #ifdef COMPOSITE_USE_OPENSSL
-auto make_server(
-  application& app,
-  const std::string& cert,
-  const std::string& key,
-  const std::string& ca
-) -> std::unique_ptr<httplib::Server> {
+auto make_server(application& app, const std::string& cert, const std::string& key, const std::string& ca)
+    -> std::unique_ptr<httplib::Server> {
     auto server = std::make_unique<httplib::SSLServer>(cert.c_str(), key.c_str(), ca.c_str());
 #else
 auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
@@ -326,32 +317,31 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
     // appropriate status instead of dropping the connection. Per-route handlers
     // may map specific exceptions to richer statuses first; this is the net that
     // guarantees no exception escapes into httplib's worker loop.
-    server->set_exception_handler(
-        [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
-            try {
-                std::rethrow_exception(ep);
-            } catch (const composite::properties::config_violation& ex) {
-                error(res, ex.what(), 403);
-            } catch (const composite::properties::unknown_property& ex) {
-                error(res, ex.what(), 404);
-            } catch (const composite::properties::validation_error& ex) {
-                error(res, ex.what(), 400);
-            } catch (const nlohmann::json::exception& ex) {
-                error(res, ex.what(), 400);
-            } catch (const std::invalid_argument& ex) {
-                error(res, ex.what(), 400);
-            } catch (const std::out_of_range& ex) {
-                error(res, ex.what(), 400);
-            } catch (const std::exception& ex) {
-                spdlog::error("unhandled exception in REST handler: {}", ex.what());
-                error(res, ex.what(), 500);
-            } catch (...) {
-                error(res, "internal server error", 500);
-            }
-        });
+    server->set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const composite::properties::config_violation& ex) {
+            error(res, ex.what(), 403);
+        } catch (const composite::properties::unknown_property& ex) {
+            error(res, ex.what(), 404);
+        } catch (const composite::properties::validation_error& ex) {
+            error(res, ex.what(), 400);
+        } catch (const nlohmann::json::exception& ex) {
+            error(res, ex.what(), 400);
+        } catch (const std::invalid_argument& ex) {
+            error(res, ex.what(), 400);
+        } catch (const std::out_of_range& ex) {
+            error(res, ex.what(), 400);
+        } catch (const std::exception& ex) {
+            spdlog::error("unhandled exception in REST handler: {}", ex.what());
+            error(res, ex.what(), 500);
+        } catch (...) {
+            error(res, "internal server error", 500);
+        }
+    });
 
     // Bound request bodies so an oversized/hostile payload cannot exhaust memory.
-    server->set_payload_max_length(8ULL * 1024 * 1024);  // 8 MiB
+    server->set_payload_max_length(8ULL * 1024 * 1024); // 8 MiB
 
     // Concurrent SSE metric streams are capped: each stream pins a server worker
     // thread for its lifetime, so unbounded streams would drain the pool and wedge
@@ -361,12 +351,12 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
     static constexpr int max_sse_streams = 8;
 
     // Add a common handler for preflight requests (OPTIONS method)
-    server->Options(".*", [](const httplib::Request &, httplib::Response &res) {
-        res.set_header("Access-Control-Allow-Origin", "*"); // allow all origins
+    server->Options(".*", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");                                  // allow all origins
         res.set_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS"); // allowed HTTP methods
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization"); // allowed headers
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");       // allowed headers
         res.set_header("Access-Control-Max-Age", "86400"); // cache preflight response for 1 day
-        res.status = 204; // no content
+        res.status = 204;                                  // no content
     });
 
     const auto APP = std::string{"app"};
@@ -375,9 +365,7 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
     // GET health
     auto endpoint = std::format("/{}/healthz", APP);
-    server->Get(endpoint, [](const httplib::Request&, httplib::Response& res) {
-        json_ok(res, {});
-    });
+    server->Get(endpoint, [](const httplib::Request&, httplib::Response& res) { json_ok(res, {}); });
 
     // ========================================================================
     // Metrics Endpoints
@@ -399,9 +387,8 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         }
         // Check for label filter
         else if (req.has_param("label_key") && req.has_param("label_value")) {
-            snapshots = registry.snapshot_by_label(
-                req.get_param_value("label_key"),
-                req.get_param_value("label_value"));
+            snapshots =
+                registry.snapshot_by_label(req.get_param_value("label_key"), req.get_param_value("label_value"));
         }
         // All metrics
         else {
@@ -424,17 +411,16 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         // Release the slot when this stream ends. The guard is copied into the
         // content-provider lambda below, so the decrement runs when httplib
         // destroys the provider (client disconnect or server shutdown).
-        auto sse_slot = std::shared_ptr<void>(nullptr, [](void*) {
-            sse_active.fetch_sub(1, std::memory_order_acq_rel);
-        });
+        auto sse_slot =
+            std::shared_ptr<void>(nullptr, [](void*) { sse_active.fetch_sub(1, std::memory_order_acq_rel); });
 
         // Parse interval from query params (default 1000ms)
         int interval_ms = 1000;
         if (req.has_param("interval")) {
             try {
                 interval_ms = std::stoi(req.get_param_value("interval"));
-                if (interval_ms < 100) interval_ms = 100;      // Min 100ms
-                if (interval_ms > 60000) interval_ms = 60000;  // Max 60s
+                if (interval_ms < 100) interval_ms = 100;     // Min 100ms
+                if (interval_ms > 60000) interval_ms = 60000; // Max 60s
             } catch (...) {
                 // Use default
             }
@@ -457,69 +443,63 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
 
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [interval_ms, prefix_filter, label_key, label_value, sse_slot](
-                std::size_t /*offset*/,
-                httplib::DataSink& sink
-            ) -> bool {
-                // Check if client disconnected before doing any work
-                if (sink.is_writable != nullptr && !sink.is_writable()) {
-                    return false;  // Client disconnected
-                }
+        res.set_chunked_content_provider("text/event-stream",
+                                         [interval_ms, prefix_filter, label_key, label_value,
+                                          sse_slot](std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                                             // Check if client disconnected before doing any work
+                                             if (sink.is_writable != nullptr && !sink.is_writable()) {
+                                                 return false; // Client disconnected
+                                             }
 
-                auto& registry = metrics::registry::instance();
+                                             auto& registry = metrics::registry::instance();
 
-                // Get filtered snapshots
-                std::vector<metrics::metric_snapshot> snapshots;
-                if (!prefix_filter.empty()) {
-                    snapshots = registry.snapshot_by_prefix(prefix_filter);
-                } else if (!label_key.empty()) {
-                    snapshots = registry.snapshot_by_label(label_key, label_value);
-                } else {
-                    snapshots = registry.snapshot_all();
-                }
+                                             // Get filtered snapshots
+                                             std::vector<metrics::metric_snapshot> snapshots;
+                                             if (!prefix_filter.empty()) {
+                                                 snapshots = registry.snapshot_by_prefix(prefix_filter);
+                                             } else if (!label_key.empty()) {
+                                                 snapshots = registry.snapshot_by_label(label_key, label_value);
+                                             } else {
+                                                 snapshots = registry.snapshot_all();
+                                             }
 
-                // Format as SSE event
-                auto data = metrics_to_json(snapshots).dump();
-                auto event = std::format("event: metrics\ndata: {}\n\n", data);
+                                             // Format as SSE event
+                                             auto data = metrics_to_json(snapshots).dump();
+                                             auto event = std::format("event: metrics\ndata: {}\n\n", data);
 
-                if (!sink.write(event.c_str(), event.size())) {
-                    return false;  // Connection closed
-                }
+                                             if (!sink.write(event.c_str(), event.size())) {
+                                                 return false; // Connection closed
+                                             }
 
-                // Sleep in smaller chunks to detect disconnection faster
-                // Poll every 100ms to check connection status
-                constexpr int poll_interval_ms = 100;
-                int remaining_ms = interval_ms;
-                while (remaining_ms > 0) {
-                    int sleep_ms = std::min(remaining_ms, poll_interval_ms);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-                    remaining_ms -= sleep_ms;
+                                             // Sleep in smaller chunks to detect disconnection faster
+                                             // Poll every 100ms to check connection status
+                                             constexpr int poll_interval_ms = 100;
+                                             int remaining_ms = interval_ms;
+                                             while (remaining_ms > 0) {
+                                                 int sleep_ms = std::min(remaining_ms, poll_interval_ms);
+                                                 std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                                                 remaining_ms -= sleep_ms;
 
-                    // Check if client disconnected during sleep
-                    if (sink.is_writable != nullptr && !sink.is_writable()) {
-                        return false;  // Client disconnected
-                    }
-                }
+                                                 // Check if client disconnected during sleep
+                                                 if (sink.is_writable != nullptr && !sink.is_writable()) {
+                                                     return false; // Client disconnected
+                                                 }
+                                             }
 
-                return true;  // Continue streaming
-            }
-        );
+                                             return true; // Continue streaming
+                                         });
     });
 
     // GET application
     endpoint = std::format("/{}", APP);
-    server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
-        json_ok(res, nlohmann::json(app));
-    });
+    server->Get(endpoint,
+                [&app](const httplib::Request&, httplib::Response& res) { json_ok(res, nlohmann::json(app)); });
 
     // GET /app/openapi.json - machine-readable OpenAPI 3.1 description of this control plane
     // (generated from rest_catalog()), so clients/UIs can discover the API and generate bindings.
     endpoint = std::format("/{}/openapi.json", APP);
-    server->Get(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
-        json_ok(res, build_openapi(app.name()));
-    });
+    server->Get(endpoint,
+                [&app](const httplib::Request&, httplib::Response& res) { json_ok(res, build_openapi(app.name())); });
 
     // POST /app/start - reconcile every component toward its desired `enabled` state
     // (starts the enabled ones). Safe to call repeatedly.
@@ -562,17 +542,16 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
             auto comp_ptr = composite::make_component(comp_json);
             if (comp_ptr == nullptr) {
-                auto msg = std::format("failed to create component {} from library {}",
-                    comp_id,
-                    comp_json["library"].get<std::string>());
+                auto msg = std::format("failed to create component {} from library {}", comp_id,
+                                       comp_json["library"].get<std::string>());
                 spdlog::error(msg);
                 return error(res, msg, 500);
             }
 
             if (comp_json.contains("properties")) {
                 spdlog::trace("setting component-level properties on {}", comp_ptr->id());
-                comp_ptr->set_properties(comp_json["properties"],
-                                         composite::properties::config_type::INITIALIZE, /*allow_unknown=*/true);
+                comp_ptr->set_properties(comp_json["properties"], composite::properties::config_type::INITIALIZE,
+                                         /*allow_unknown=*/true);
             }
 
             if (!app.add_component(comp_ptr)) {
@@ -622,9 +601,15 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         std::size_t failed = 0;
         auto record = [&](const std::string& id, int status, std::string_view detail) {
             nlohmann::json entry{{"status", status}};
-            if (!id.empty()) { entry["id"] = id; }
-            if (status >= 400) { entry["error"] = detail; ++failed; }
-            else { ++applied; }
+            if (!id.empty()) {
+                entry["id"] = id;
+            }
+            if (status >= 400) {
+                entry["error"] = detail;
+                ++failed;
+            } else {
+                ++applied;
+            }
             results.push_back(std::move(entry));
         };
 
@@ -647,8 +632,10 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
             if (comp_res.status >= 400) {
                 // set_component_properties returns {"error": "..."} on failure; surface it.
                 std::string detail = comp_res.body;
-                try { detail = nlohmann::json::parse(comp_res.body).value("error", comp_res.body); }
-                catch (...) { /* keep raw body */ }
+                try {
+                    detail = nlohmann::json::parse(comp_res.body).value("error", comp_res.body);
+                } catch (...) { /* keep raw body */
+                }
                 record(comp_id, comp_res.status, detail);
             } else {
                 record(comp_id, comp_res.status, {});
@@ -657,13 +644,12 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
         if (failed > 0) {
             set_cors(res);
-            res.status = 207;  // Multi-Status: at least one component in the batch failed
-            res.set_content(nlohmann::json{
-                {"applied", applied}, {"failed", failed}, {"results", results}
-            }.dump(2), "application/json");
+            res.status = 207; // Multi-Status: at least one component in the batch failed
+            res.set_content(nlohmann::json{{"applied", applied}, {"failed", failed}, {"results", results}}.dump(2),
+                            "application/json");
         } else {
-            json_ok(res, {{"success", std::format("set properties on {} component(s)", applied)},
-                          {"results", results}});
+            json_ok(res,
+                    {{"success", std::format("set properties on {} component(s)", applied)}, {"results", results}});
         }
     });
 
@@ -718,8 +704,10 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
     server->Get(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
         auto comp_id = req.path_params.at("id");
         auto comp = app.get_component(comp_id);
-        if (!comp) { return error(res, std::format("component not found: {}", comp_id), 404); }
-        json_ok(res, comp->property_schema());  // takes the read lock internally
+        if (!comp) {
+            return error(res, std::format("component not found: {}", comp_id), 404);
+        }
+        json_ok(res, comp->property_schema()); // takes the read lock internally
     });
 
     // GET /app/components/:id/properties  -> full property state
@@ -727,8 +715,10 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
     server->Get(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
         auto comp_id = req.path_params.at("id");
         auto comp = app.get_component(comp_id);
-        if (!comp) { return error(res, std::format("component not found: {}", comp_id), 404); }
-        auto state = comp->property_state();  // property_state() takes the read lock internally
+        if (!comp) {
+            return error(res, std::format("component not found: {}", comp_id), 404);
+        }
+        auto state = comp->property_state(); // property_state() takes the read lock internally
         json_ok(res, state);
     });
 
@@ -738,9 +728,13 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         auto comp_id = req.path_params.at("id");
         auto prop_name = req.path_params.at("name");
         auto comp = app.get_component(comp_id);
-        if (!comp) { return error(res, std::format("component not found: {}", comp_id), 404); }
-        auto state = comp->property_state();  // property_state() takes the read lock internally
-        if (!state.contains(prop_name)) { return error(res, std::format("property not found: {}", prop_name), 404); }
+        if (!comp) {
+            return error(res, std::format("component not found: {}", comp_id), 404);
+        }
+        auto state = comp->property_state(); // property_state() takes the read lock internally
+        if (!state.contains(prop_name)) {
+            return error(res, std::format("property not found: {}", prop_name), 404);
+        }
         json_ok(res, {{prop_name, state.at(prop_name)}});
     });
 
@@ -750,10 +744,15 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         auto comp_id = req.path_params.at("id");
         auto prop_name = req.path_params.at("name");
         auto comp = app.get_component(comp_id);
-        if (!comp) { return error(res, std::format("component not found: {}", comp_id), 404); }
+        if (!comp) {
+            return error(res, std::format("component not found: {}", comp_id), 404);
+        }
         nlohmann::json body;
-        try { body = nlohmann::json::parse(req.body); }
-        catch (...) { return error(res, "invalid json request", 400); }
+        try {
+            body = nlohmann::json::parse(req.body);
+        } catch (...) {
+            return error(res, "invalid json request", 400);
+        }
         res = set_component_properties(comp, {{prop_name, property_handlers::extract_value(body)}});
     };
     server->Put(endpoint, put_one);
@@ -765,7 +764,9 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         auto comp_id = req.path_params.at("id");
         auto prop_name = req.path_params.at("name");
         auto comp = app.get_component(comp_id);
-        if (!comp) { return error(res, std::format("component not found: {}", comp_id), 404); }
+        if (!comp) {
+            return error(res, std::format("component not found: {}", comp_id), 404);
+        }
         res = set_component_properties(comp, {{prop_name, nullptr}});
     });
 
@@ -784,7 +785,9 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
         auto ports_json = nlohmann::json::array();
         for (const auto& [name, port] : comp->ports()) {
-            if (port) { ports_json.push_back(port_to_json(name, port)); }
+            if (port) {
+                ports_json.push_back(port_to_json(name, port));
+            }
         }
 
         json_ok(res, {{"component_id", comp_id}, {"ports", ports_json}});
@@ -839,10 +842,8 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         // Route through component::disconnect_all so the worker is parked around
         // the producer-claim release and m_connections is updated.
         auto count = comp->disconnect_all(port_name);
-        json_ok(res, {
-            {"success", std::format("disconnected {} connections from port '{}'", count, port_name)},
-            {"disconnected_count", count}
-        });
+        json_ok(res, {{"success", std::format("disconnected {} connections from port '{}'", count, port_name)},
+                      {"disconnected_count", count}});
     });
 
     // DELETE /app/connections
@@ -889,16 +890,14 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         // Route through component::disconnect so the worker is parked around the
         // producer-claim release and m_connections is updated.
         if (source_comp->disconnect(conn.source_port_name, target_comp, conn.target_port_name)) {
-            json_ok(res, {
-                {"success", std::format("disconnected {}:{} from {}:{}",
-                    conn.source_comp_id, conn.source_port_name,
-                    conn.target_comp_id, conn.target_port_name)},
-                {"connection", conn.to_json()}
-            });
+            json_ok(res, {{"success", std::format("disconnected {}:{} from {}:{}", conn.source_comp_id,
+                                                  conn.source_port_name, conn.target_comp_id, conn.target_port_name)},
+                          {"connection", conn.to_json()}});
         } else {
-            error(res, std::format("ports were not connected: {}:{} -> {}:{}",
-                conn.source_comp_id, conn.source_port_name,
-                conn.target_comp_id, conn.target_port_name), 400);
+            error(res,
+                  std::format("ports were not connected: {}:{} -> {}:{}", conn.source_comp_id, conn.source_port_name,
+                              conn.target_comp_id, conn.target_port_name),
+                  400);
         }
     });
 
@@ -928,16 +927,15 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         }
 
         if (source_comp->connect(conn.source_port_name, target_comp, conn.target_port_name)) {
-            json_created(res, {
-                {"success", std::format("connected {}:{} to {}:{}",
-                    conn.source_comp_id, conn.source_port_name,
-                    conn.target_comp_id, conn.target_port_name)},
-                {"connection", conn.to_json()}
-            });
+            json_created(res,
+                         {{"success", std::format("connected {}:{} to {}:{}", conn.source_comp_id,
+                                                  conn.source_port_name, conn.target_comp_id, conn.target_port_name)},
+                          {"connection", conn.to_json()}});
         } else {
-            error(res, std::format("failed to connect {}:{} to {}:{} (check port types and names)",
-                conn.source_comp_id, conn.source_port_name,
-                conn.target_comp_id, conn.target_port_name), 400);
+            error(res,
+                  std::format("failed to connect {}:{} to {}:{} (check port types and names)", conn.source_comp_id,
+                              conn.source_port_name, conn.target_comp_id, conn.target_port_name),
+                  400);
         }
     });
 

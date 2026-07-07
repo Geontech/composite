@@ -14,13 +14,13 @@
  */
 
 #if defined(_WIN32) || defined(_WIN64)
-    // Windows DLL export/import
-    #ifdef COMPOSITE_EXPORTS
-        #define COMPOSITE_API __declspec(dllexport)
-    #else
-        #define COMPOSITE_API __declspec(dllimport)
-    #endif
+// Windows DLL export/import
+#ifdef COMPOSITE_EXPORTS
+#define COMPOSITE_API __declspec(dllexport)
 #else
-    // GCC/Clang visibility attribute
-    #define COMPOSITE_API __attribute__((visibility("default")))
+#define COMPOSITE_API __declspec(dllimport)
+#endif
+#else
+// GCC/Clang visibility attribute
+#define COMPOSITE_API __attribute__((visibility("default")))
 #endif

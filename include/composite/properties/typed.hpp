@@ -6,7 +6,7 @@
 #pragma once
 
 #include "reflect.hpp"
-#include "types.hpp"  // config_type
+#include "types.hpp" // config_type
 
 #include <functional>
 #include <map>
@@ -37,12 +37,12 @@ using reflect::json;
 class validation_error : public std::runtime_error {
 public:
     std::string name;
-    std::string reason;  ///< optional explanation; empty if none was supplied
+    std::string reason; ///< optional explanation; empty if none was supplied
     explicit validation_error(std::string n)
         : std::runtime_error("property change rejected: " + n), name(std::move(n)) {}
     validation_error(std::string n, std::string why)
-        : std::runtime_error("property change rejected: " + n + " (" + why + ")"),
-          name(std::move(n)), reason(std::move(why)) {}
+        : std::runtime_error("property change rejected: " + n + " (" + why + ")"), name(std::move(n)),
+          reason(std::move(why)) {}
 };
 
 /// A RUNTIME apply touched an INITIALIZE-only property.
@@ -57,8 +57,7 @@ public:
 class unknown_property : public std::runtime_error {
 public:
     std::string name;
-    explicit unknown_property(std::string n)
-        : std::runtime_error("unknown property: " + n), name(std::move(n)) {}
+    explicit unknown_property(std::string n) : std::runtime_error("unknown property: " + n), name(std::move(n)) {}
 };
 
 /**
@@ -109,8 +108,7 @@ public:
     using listener_fn = std::function<void(const json& diff)>;
 
     typed_property(std::string name, T* ref, config_type cfg = config_type::INITIALIZE)
-        : m_name(std::move(name)), m_ref(ref), m_config(cfg),
-          m_default(ref != nullptr ? *ref : T{}) {}
+        : m_name(std::move(name)), m_ref(ref), m_config(cfg), m_default(ref != nullptr ? *ref : T{}) {}
 
     /// Attach a validator. The two-argument form supplies a human-readable reason
     /// surfaced in the rejection (REST 400 / log) instead of just the property name.
@@ -122,8 +120,14 @@ public:
         m_validators.push_back({std::move(fn), std::move(reason)});
         return *this;
     }
-    auto on_change(listener_fn fn) -> typed_property& { m_listeners.push_back(std::move(fn)); return *this; }
-    auto units(std::string u) -> typed_property& { m_units = std::move(u); return *this; }
+    auto on_change(listener_fn fn) -> typed_property& {
+        m_listeners.push_back(std::move(fn));
+        return *this;
+    }
+    auto units(std::string u) -> typed_property& {
+        m_units = std::move(u);
+        return *this;
+    }
 
     [[nodiscard]] auto name() const -> const std::string& override { return m_name; }
     [[nodiscard]] auto configurability() const -> config_type override { return m_config; }
@@ -133,11 +137,13 @@ public:
     [[nodiscard]] auto get() const -> const T& { return *m_ref; }
 
     [[nodiscard]] auto describe() const -> json override {
-        json o = reflect::type_schema<T>();   // type + nested fields / items / choices / int range
+        json o = reflect::type_schema<T>(); // type + nested fields / items / choices / int range
         o["name"] = m_name;
         o["configurability"] = (m_config == config_type::RUNTIME) ? "runtime" : "initialize";
         o["default"] = reflect::encode(m_default);
-        if (!m_units.empty()) { o["unit"] = m_units; }
+        if (!m_units.empty()) {
+            o["unit"] = m_units;
+        }
         return o;
     }
 
@@ -147,19 +153,21 @@ public:
         }
         T candidate = *m_ref;
         if (value.is_null()) {
-            candidate = m_default;                      // RFC-7396 null: reset to the value captured
-                                                        // at registration (re-runs member initializers;
-                                                        // T{} would lose them — the noop_thread_delay bug)
+            candidate = m_default; // RFC-7396 null: reset to the value captured
+                                   // at registration (re-runs member initializers;
+                                   // T{} would lose them — the noop_thread_delay bug)
         } else if constexpr (reflect::is_reflected_v<T>) {
             // pass m_default so a nested-field null resets to the registered default
             // at that depth (not the zero value).
             reflect::merge(candidate, value, m_name, &m_default);
         } else {
-            reflect::decode(value, candidate, m_name);  // scalar/enum/optional/vector: strict replace
+            reflect::decode(value, candidate, m_name); // scalar/enum/optional/vector: strict replace
         }
         for (auto& v : m_validators) {
             if (!v.fn(candidate)) {
-                if (v.reason.empty()) { throw validation_error(m_name); }
+                if (v.reason.empty()) {
+                    throw validation_error(m_name);
+                }
                 throw validation_error(m_name, v.reason);
             }
         }
@@ -167,8 +175,13 @@ public:
     }
 
     auto commit() -> json override {
-        if (!m_pending.has_value()) { return json(); }
-        if (reflect::equal(*m_ref, *m_pending)) { m_pending.reset(); return json(); }
+        if (!m_pending.has_value()) {
+            return json();
+        }
+        if (reflect::equal(*m_ref, *m_pending)) {
+            m_pending.reset();
+            return json();
+        }
         const json d = make_diff(*m_ref, *m_pending);
         *m_ref = std::move(*m_pending);
         m_pending.reset();
@@ -176,40 +189,60 @@ public:
     }
 
     auto notify(const json& diff) -> void override {
-        if (diff.is_null()) { return; }
-        for (auto& l : m_listeners) { l(diff); }
+        if (diff.is_null()) {
+            return;
+        }
+        for (auto& l : m_listeners) {
+            l(diff);
+        }
     }
 
     auto abort() noexcept -> void override { m_pending.reset(); }
 
 private:
     static auto make_diff(const T& before, const T& after) -> json {
-        if constexpr (reflect::is_reflected_v<T>) { return reflect::diff(before, after); }
-        else { return reflect::encode(after); }
+        if constexpr (reflect::is_reflected_v<T>) {
+            return reflect::diff(before, after);
+        } else {
+            return reflect::encode(after);
+        }
     }
     template <typename U>
     static auto type_name_for() -> std::string {
-        if constexpr (reflect::is_reflected_v<U>) { return "struct"; }
-        else if constexpr (std::is_enum_v<U>) { return "enum"; }
-        else if constexpr (reflect::is_optional<U>::value) { return "optional"; }
-        else if constexpr (reflect::is_vector<U>::value) { return "array"; }
-        else if constexpr (std::is_same_v<U, bool>) { return "bool"; }
-        else if constexpr (std::is_floating_point_v<U>) { return "number"; }
-        else if constexpr (std::is_integral_v<U>) { return "integer"; }
-        else if constexpr (std::is_same_v<U, std::string>) { return "string"; }
-        else { return "unknown"; }
+        if constexpr (reflect::is_reflected_v<U>) {
+            return "struct";
+        } else if constexpr (std::is_enum_v<U>) {
+            return "enum";
+        } else if constexpr (reflect::is_optional<U>::value) {
+            return "optional";
+        } else if constexpr (reflect::is_vector<U>::value) {
+            return "array";
+        } else if constexpr (std::is_same_v<U, bool>) {
+            return "bool";
+        } else if constexpr (std::is_floating_point_v<U>) {
+            return "number";
+        } else if constexpr (std::is_integral_v<U>) {
+            return "integer";
+        } else if constexpr (std::is_same_v<U, std::string>) {
+            return "string";
+        } else {
+            return "unknown";
+        }
     }
 
-    struct val_entry { validator_fn fn; std::string reason; };
+    struct val_entry {
+        validator_fn fn;
+        std::string reason;
+    };
 
     std::string m_name;
     T* m_ref;
     config_type m_config;
     std::string m_units;
-    T m_default;  ///< value captured at registration, used for null-reset and describe()
+    T m_default; ///< value captured at registration, used for null-reset and describe()
     std::vector<val_entry> m_validators;
     std::vector<listener_fn> m_listeners;
-    std::optional<T> m_pending;  ///< prepared candidate, awaiting commit
+    std::optional<T> m_pending; ///< prepared candidate, awaiting commit
 };
 
 // ---------------------------------------------------------------------------
@@ -248,7 +281,10 @@ public:
         m_list_validators.push_back({std::move(fn), std::move(reason)});
         return *this;
     }
-    auto on_change(listener_fn fn) -> keyed_collection& { m_listeners.push_back(std::move(fn)); return *this; }
+    auto on_change(listener_fn fn) -> keyed_collection& {
+        m_listeners.push_back(std::move(fn));
+        return *this;
+    }
 
     [[nodiscard]] auto name() const -> const std::string& override { return m_name; }
     [[nodiscard]] auto configurability() const -> config_type override { return m_config; }
@@ -257,7 +293,9 @@ public:
 
     [[nodiscard]] auto encode() const -> json override {
         json o = json::object();
-        for (const auto& [k, e] : *m_ref) { o[k] = reflect::encode(e); }
+        for (const auto& [k, e] : *m_ref) {
+            o[k] = reflect::encode(e);
+        }
         return o;
     }
 
@@ -266,7 +304,7 @@ public:
             {"name", m_name},
             {"type", "keyed_collection"},
             {"configurability", (m_config == config_type::RUNTIME) ? "runtime" : "initialize"},
-            {"element", reflect::type_schema<E>()},  // schema of each map value
+            {"element", reflect::type_schema<E>()}, // schema of each map value
         };
     }
 
@@ -277,11 +315,14 @@ public:
         map_type candidate = *m_ref;
         std::vector<std::string> touched;
         if (patch.is_null()) {
-            candidate.clear();                     // RFC-7396 null: clear the whole collection
+            candidate.clear(); // RFC-7396 null: clear the whole collection
         } else if (patch.is_object()) {
             for (const auto& [k, v] : patch.items()) {
-                if (v.is_null()) { candidate.erase(k); }
-                else { reflect::merge(candidate[k], v, m_name + "/" + k); }  // path-precise errors
+                if (v.is_null()) {
+                    candidate.erase(k);
+                } else {
+                    reflect::merge(candidate[k], v, m_name + "/" + k);
+                } // path-precise errors
                 touched.push_back(k);
             }
         } else {
@@ -289,17 +330,23 @@ public:
         }
         for (const auto& k : touched) {
             auto it = candidate.find(k);
-            if (it == candidate.end()) { continue; }  // erased
+            if (it == candidate.end()) {
+                continue;
+            } // erased
             for (auto& ev : m_elem_validators) {
                 if (!ev.fn(k, it->second)) {
-                    if (ev.reason.empty()) { throw validation_error(m_name + "/" + k); }
+                    if (ev.reason.empty()) {
+                        throw validation_error(m_name + "/" + k);
+                    }
                     throw validation_error(m_name + "/" + k, ev.reason);
                 }
             }
         }
         for (auto& lv : m_list_validators) {
             if (!lv.fn(candidate)) {
-                if (lv.reason.empty()) { throw validation_error(m_name + " (list invariant)"); }
+                if (lv.reason.empty()) {
+                    throw validation_error(m_name + " (list invariant)");
+                }
                 throw validation_error(m_name + " (list invariant)", lv.reason);
             }
         }
@@ -307,9 +354,14 @@ public:
     }
 
     auto commit() -> json override {
-        if (!m_pending.has_value()) { return json(); }
+        if (!m_pending.has_value()) {
+            return json();
+        }
         const json d = collection_diff(*m_ref, *m_pending);
-        if (d.empty()) { m_pending.reset(); return json(); }
+        if (d.empty()) {
+            m_pending.reset();
+            return json();
+        }
         // Node-stable apply: overwrite surviving elements in place and erase/insert
         // only what changed, so a held reference to an unchanged element stays valid
         // across the commit (the whole-map move would invalidate every address).
@@ -319,8 +371,12 @@ public:
     }
 
     auto notify(const json& diff) -> void override {
-        if (diff.is_null()) { return; }
-        for (auto& l : m_listeners) { l(diff); }
+        if (diff.is_null()) {
+            return;
+        }
+        for (auto& l : m_listeners) {
+            l(diff);
+        }
     }
 
     auto abort() noexcept -> void override { m_pending.reset(); }
@@ -331,13 +387,19 @@ private:
     /// insert genuinely new keys.
     static auto apply_node_stable(map_type& live, const map_type& cand) -> void {
         for (auto it = live.begin(); it != live.end();) {
-            if (cand.find(it->first) == cand.end()) { it = live.erase(it); }
-            else { ++it; }
+            if (cand.find(it->first) == cand.end()) {
+                it = live.erase(it);
+            } else {
+                ++it;
+            }
         }
         for (const auto& [k, v] : cand) {
             auto it = live.find(k);
-            if (it == live.end()) { live.emplace(k, v); }
-            else { it->second = v; }  // overwrite in place — address preserved
+            if (it == live.end()) {
+                live.emplace(k, v);
+            } else {
+                it->second = v;
+            } // overwrite in place — address preserved
         }
     }
 
@@ -345,12 +407,17 @@ private:
         json d = json::object();
         for (const auto& [k, e] : b) {
             auto it = a.find(k);
-            if (it == a.end()) { d[k] = reflect::encode(e); }
-            else if (!reflect::equal(it->second, e)) { d[k] = reflect::diff(it->second, e); }
+            if (it == a.end()) {
+                d[k] = reflect::encode(e);
+            } else if (!reflect::equal(it->second, e)) {
+                d[k] = reflect::diff(it->second, e);
+            }
         }
         for (const auto& [k, e] : a) {
             (void)e;
-            if (b.find(k) == b.end()) { d[k] = nullptr; }
+            if (b.find(k) == b.end()) {
+                d[k] = nullptr;
+            }
         }
         return d;
     }
@@ -358,8 +425,14 @@ private:
     std::string m_name;
     map_type* m_ref;
     config_type m_config;
-    struct elem_entry { elem_validator fn; std::string reason; };
-    struct list_entry { list_validator fn; std::string reason; };
+    struct elem_entry {
+        elem_validator fn;
+        std::string reason;
+    };
+    struct list_entry {
+        list_validator fn;
+        std::string reason;
+    };
 
     std::vector<elem_entry> m_elem_validators;
     std::vector<list_entry> m_list_validators;

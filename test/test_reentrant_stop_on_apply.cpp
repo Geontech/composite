@@ -30,7 +30,12 @@ using json = composite::properties::json;
 
 namespace {
 int g_fail = 0;
-void check(bool ok, const char* what) { if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fail; } }
+void check(bool ok, const char* what) {
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fail;
+    }
+}
 
 struct scfg {
     int gen{0};
@@ -45,7 +50,7 @@ public:
         m_cfg.on_apply([this](const scfg&, const changes<scfg>& ch) {
             if (ch.changed(&scfg::gen)) {
                 m_on_apply_ran.store(true, std::memory_order_release);
-                stop();  // must NOT deadlock even when run during the inline drain in EXITING
+                stop(); // must NOT deadlock even when run during the inline drain in EXITING
             }
         });
     }
@@ -55,7 +60,7 @@ public:
 
     config<scfg> m_cfg{};
     std::atomic<bool> m_on_apply_ran{false};
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 } // namespace
 
@@ -75,7 +80,9 @@ int main() {
     // Wait for the worker to self-FINISH, then poll until the park actually settles out of RUNNING
     // (EXITING can lag the wait_until_finished signal). Now: EXITING + m_thread still set.
     check(c->wait_until_finished(2s), "worker self-finished");
-    for (int i = 0; i < 2000 && c->is_running(); ++i) { std::this_thread::sleep_for(1ms); }
+    for (int i = 0; i < 2000 && c->is_running(); ++i) {
+        std::this_thread::sleep_for(1ms);
+    }
     check(!c->is_running(), "park settled to EXITING/NO_WORKER (inline-drain path)");
     check(c->is_finished(), "component reports finished");
 

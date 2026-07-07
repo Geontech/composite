@@ -13,10 +13,10 @@
 #include "composite/core/metadata.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
-#include <vector>
-#include <deque>
 #include <array>
+#include <deque>
 #include <numeric>
+#include <vector>
 
 using namespace composite;
 
@@ -28,7 +28,9 @@ template <typename Pred>
 static auto wait_until(Pred pred, std::chrono::milliseconds timeout = std::chrono::seconds(2)) -> bool {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) { return true; }
+        if (pred()) {
+            return true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return pred();
@@ -43,9 +45,7 @@ static auto wait_until(Pred pred, std::chrono::milliseconds timeout = std::chron
  */
 class TestMutableSource : public component {
 public:
-    TestMutableSource() : component("TestMutableSource") {
-        add_port(m_output);
-    }
+    TestMutableSource() : component("TestMutableSource") { add_port(m_output); }
 
     auto process() -> retval override {
         if (m_sent) {
@@ -75,9 +75,7 @@ private:
  */
 class TestImmutableSource : public component {
 public:
-    TestImmutableSource() : component("TestImmutableSource") {
-        add_port(m_output);
-    }
+    TestImmutableSource() : component("TestImmutableSource") { add_port(m_output); }
 
     auto process() -> retval override {
         if (m_sent) {
@@ -109,9 +107,7 @@ private:
  */
 class TestMutableSink : public component {
 public:
-    TestMutableSink() : component("TestMutableSink") {
-        add_port(m_input);
-    }
+    TestMutableSink() : component("TestMutableSink") { add_port(m_input); }
 
     auto process() -> retval override {
         auto [buffer, ts, metadata] = m_input.get_data();
@@ -143,9 +139,7 @@ private:
  */
 class TestImmutableSink : public component {
 public:
-    explicit TestImmutableSink(std::string_view id = "TestImmutableSink") : component(id) {
-        add_port(m_input);
-    }
+    explicit TestImmutableSink(std::string_view id = "TestImmutableSink") : component(id) { add_port(m_input); }
 
     auto process() -> retval override {
         auto [buffer, ts, metadata] = m_input.get_data();
@@ -191,7 +185,7 @@ public:
         }
 
         m_processed = true;
-        
+
         // Modify in place
         for (std::size_t i = 0; i < buffer.size(); ++i) {
             buffer[i] *= m_gain;
@@ -255,9 +249,7 @@ private:
  */
 class TestMetadataSource : public component {
 public:
-    TestMetadataSource() : component("TestMetadataSource") {
-        add_port(m_output);
-    }
+    TestMetadataSource() : component("TestMetadataSource") { add_port(m_output); }
 
     auto process() -> retval override {
         if (m_sent) {
@@ -307,9 +299,7 @@ private:
  */
 class TestMetadataSink : public component {
 public:
-    TestMetadataSink() : component("TestMetadataSink") {
-        add_port(m_input);
-    }
+    TestMetadataSink() : component("TestMetadataSink") { add_port(m_input); }
 
     auto process() -> retval override {
         auto [buffer, ts, md] = m_input.get_data();
@@ -320,7 +310,7 @@ public:
 
         m_received = true;
         m_size = buffer.size();
-        m_metadata = md;  // Capture metadata
+        m_metadata = md; // Capture metadata
         m_values.clear();
         for (std::size_t i = 0; i < buffer.size(); ++i) {
             m_values.push_back(buffer[i]);
@@ -423,7 +413,7 @@ TEST_CASE("mutable_buffer basic operations", "[buffer][mutable]") {
 
     SECTION("element access and modification") {
         auto buffer = make_mutable<float>(10);
-        
+
         // Write via operator[]
         for (std::size_t i = 0; i < buffer.size(); ++i) {
             buffer[i] = static_cast<float>(i * 2);
@@ -438,7 +428,7 @@ TEST_CASE("mutable_buffer basic operations", "[buffer][mutable]") {
     SECTION("data pointer access") {
         auto buffer = make_mutable<float>(10);
         auto* ptr = buffer.data();
-        
+
         ptr[5] = 42.0f;
         REQUIRE_THAT(buffer[5], Catch::Matchers::WithinAbs(42.0f, 0.001f));
     }
@@ -446,7 +436,7 @@ TEST_CASE("mutable_buffer basic operations", "[buffer][mutable]") {
     SECTION("span access") {
         auto buffer = make_mutable<float>(10);
         auto span = buffer.as_span();
-        
+
         REQUIRE(span.size() == 10);
         span[3] = 99.0f;
         REQUIRE_THAT(buffer[3], Catch::Matchers::WithinAbs(99.0f, 0.001f));
@@ -471,7 +461,7 @@ TEST_CASE("mutable_buffer basic operations", "[buffer][mutable]") {
 
         auto copy = buffer.copy();
         REQUIRE(copy.size() == buffer.size());
-        
+
         for (std::size_t i = 0; i < buffer.size(); ++i) {
             REQUIRE_THAT(copy[i], Catch::Matchers::WithinAbs(buffer[i], 0.001f));
         }
@@ -547,7 +537,7 @@ TEST_CASE("immutable_buffer basic operations", "[buffer][immutable]") {
         auto shared = buffer.share();
 
         REQUIRE(shared.size() == buffer.size());
-        REQUIRE(!buffer.is_unique());  // Now has multiple references
+        REQUIRE(!buffer.is_unique()); // Now has multiple references
     }
 
     SECTION("uniqueness check") {
@@ -582,27 +572,27 @@ TEST_CASE("buffer empty, has_data, and operator bool semantics", "[buffer][seman
     SECTION("default constructed immutable buffer") {
         immutable_buffer<float> buf;
 
-        REQUIRE(buf.empty());              // No elements
-        REQUIRE_FALSE(buf.has_data());     // No storage
-        REQUIRE_FALSE(buf);                // Not usable (operator bool)
+        REQUIRE(buf.empty());          // No elements
+        REQUIRE_FALSE(buf.has_data()); // No storage
+        REQUIRE_FALSE(buf);            // Not usable (operator bool)
         REQUIRE(buf.size() == 0);
     }
 
     SECTION("zero-size immutable buffer") {
         auto buf = make_immutable<float>(0);
 
-        REQUIRE(buf.empty());              // No elements
-        REQUIRE(buf.has_data());           // Has storage allocation
-        REQUIRE_FALSE(buf);                // Not usable (no elements)
+        REQUIRE(buf.empty());    // No elements
+        REQUIRE(buf.has_data()); // Has storage allocation
+        REQUIRE_FALSE(buf);      // Not usable (no elements)
         REQUIRE(buf.size() == 0);
     }
 
     SECTION("non-empty immutable buffer") {
         auto buf = make_immutable<float>(10);
 
-        REQUIRE_FALSE(buf.empty());        // Has elements
-        REQUIRE(buf.has_data());           // Has storage
-        REQUIRE(buf);                      // Usable (operator bool)
+        REQUIRE_FALSE(buf.empty()); // Has elements
+        REQUIRE(buf.has_data());    // Has storage
+        REQUIRE(buf);               // Usable (operator bool)
         REQUIRE(buf.size() == 10);
     }
 
@@ -623,27 +613,27 @@ TEST_CASE("buffer empty, has_data, and operator bool semantics", "[buffer][seman
     SECTION("default constructed mutable buffer") {
         mutable_buffer<float> buf;
 
-        REQUIRE(buf.empty());              // No elements
-        REQUIRE_FALSE(buf.has_data());     // No storage
-        REQUIRE_FALSE(buf);                // Not usable (operator bool)
+        REQUIRE(buf.empty());          // No elements
+        REQUIRE_FALSE(buf.has_data()); // No storage
+        REQUIRE_FALSE(buf);            // Not usable (operator bool)
         REQUIRE(buf.size() == 0);
     }
 
     SECTION("zero-size mutable buffer") {
         auto buf = make_mutable<float>(0);
 
-        REQUIRE(buf.empty());              // No elements
-        REQUIRE(buf.has_data());           // Has storage allocation
-        REQUIRE_FALSE(buf);                // Not usable (no elements)
+        REQUIRE(buf.empty());    // No elements
+        REQUIRE(buf.has_data()); // Has storage allocation
+        REQUIRE_FALSE(buf);      // Not usable (no elements)
         REQUIRE(buf.size() == 0);
     }
 
     SECTION("non-empty mutable buffer") {
         auto buf = make_mutable<float>(10);
 
-        REQUIRE_FALSE(buf.empty());        // Has elements
-        REQUIRE(buf.has_data());           // Has storage
-        REQUIRE(buf);                      // Usable (operator bool)
+        REQUIRE_FALSE(buf.empty()); // Has elements
+        REQUIRE(buf.has_data());    // Has storage
+        REQUIRE(buf);               // Usable (operator bool)
         REQUIRE(buf.size() == 10);
     }
 
@@ -755,8 +745,7 @@ TEST_CASE("mutable to mutable connection", "[port][connection]") {
     REQUIRE(sink->m_values.size() == 5);
 
     for (std::size_t i = 0; i < sink->m_values.size(); ++i) {
-        REQUIRE_THAT(sink->m_values[i],
-                    Catch::Matchers::WithinAbs(i * 2.0f, 0.001f));
+        REQUIRE_THAT(sink->m_values[i], Catch::Matchers::WithinAbs(i * 2.0f, 0.001f));
     }
 }
 
@@ -783,7 +772,7 @@ TEST_CASE("component connect/disconnect bookkeeping (P0.2/P0.3)", "[port][connec
     // ...and disconnect_all clears the record and releases the claim again.
     REQUIRE(source->disconnect_all("data_out") == 1);
     REQUIRE(source->connections().empty());
-    REQUIRE(source->connect("data_out", sink, "data_in"));  // re-claimable
+    REQUIRE(source->connect("data_out", sink, "data_in")); // re-claimable
     REQUIRE(source->connections().size() == 1);
 }
 
@@ -806,8 +795,7 @@ TEST_CASE("immutable to immutable connection", "[port][connection]") {
     REQUIRE(sink->m_values.size() == 7);
 
     for (std::size_t i = 0; i < sink->m_values.size(); ++i) {
-        REQUIRE_THAT(sink->m_values[i],
-                    Catch::Matchers::WithinAbs(i * 3.0f, 0.001f));
+        REQUIRE_THAT(sink->m_values[i], Catch::Matchers::WithinAbs(i * 3.0f, 0.001f));
     }
 }
 
@@ -877,8 +865,7 @@ TEST_CASE("mutable processing chain (zero copy)", "[port][chain]") {
     REQUIRE(sink->m_size == 10);
 
     for (std::size_t i = 0; i < sink->m_values.size(); ++i) {
-        REQUIRE_THAT(sink->m_values[i],
-                    Catch::Matchers::WithinAbs(i * 6.0f, 0.001f));
+        REQUIRE_THAT(sink->m_values[i], Catch::Matchers::WithinAbs(i * 6.0f, 0.001f));
     }
 }
 
@@ -1093,13 +1080,13 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         auto source = std::make_shared<TestMetadataSource>();
         auto sink = std::make_shared<TestMetadataSink>();
 
-        source->m_size = 0;  // Send no data
+        source->m_size = 0; // Send no data
         source->m_metadata_cf = 1.0e9;
 
         REQUIRE(source->connect("data_out", sink, "data_in"));
 
         REQUIRE(source->process() == retval::NORMAL);
-        REQUIRE(sink->process() == retval::NOOP);  // No data
+        REQUIRE(sink->process() == retval::NOOP); // No data
 
         // No metadata should be received without data
         REQUIRE_FALSE(sink->m_received);
@@ -1161,7 +1148,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
 
         source->m_size = 50;
         source->m_metadata_cf = 1.0e9;
-        modifier->m_cf_offset = 100e6;  // Add 100 MHz
+        modifier->m_cf_offset = 100e6; // Add 100 MHz
 
         REQUIRE(source->connect("data_out", modifier, "data_in"));
         REQUIRE(modifier->connect("data_out", sink, "data_in"));
@@ -1184,7 +1171,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         auto sink = std::make_shared<TestMetadataSink>();
 
         source->m_size = 10;
-        source->m_metadata_eos = true;  // End of stream
+        source->m_metadata_eos = true; // End of stream
 
         REQUIRE(source->connect("data_out", sink, "data_in"));
 
@@ -1219,7 +1206,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         source->m_size = 30;
         source->m_annotation_key = "source_info";
         source->m_annotation_value = "test_source";
-        modifier->m_cf_offset = 0.0;  // No frequency change
+        modifier->m_cf_offset = 0.0; // No frequency change
 
         REQUIRE(source->connect("data_out", modifier, "data_in"));
         REQUIRE(modifier->connect("data_out", sink, "data_in"));
@@ -1303,7 +1290,7 @@ TEST_CASE("to_immutable error handling", "[buffer][error]") {
 
     SECTION("large buffer converts safely") {
         // Test with large but reasonable size
-        auto mut = make_mutable<float>(1000000);  // 1 million floats
+        auto mut = make_mutable<float>(1000000); // 1 million floats
 
         // Should not throw - no overflow
         REQUIRE_NOTHROW([&]() {
@@ -1342,7 +1329,7 @@ TEST_CASE("large buffer transfer", "[port][performance]") {
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
-    source->m_size = 1000000;  // 1 million elements
+    source->m_size = 1000000; // 1 million elements
 
     REQUIRE(source->connect("data_out", sink, "data_in"));
 
@@ -1442,9 +1429,7 @@ TEST_CASE("complete pipeline integration", "[integration]") {
  */
 class TestIntSource : public component {
 public:
-    TestIntSource() : component("TestIntSource") {
-        add_port(m_output);
-    }
+    TestIntSource() : component("TestIntSource") { add_port(m_output); }
 
     auto process() -> retval override {
         auto buffer = make_mutable<int32_t>(10);
@@ -1490,19 +1475,13 @@ TEST_CASE("concurrent port access", "[port][concurrent]") {
     REQUIRE(source->connect("data_out", sink2, "data_in"));
 
     // Start components in separate threads
-    std::thread source_thread([&]() {
-        source->process();
-    });
+    std::thread source_thread([&]() { source->process(); });
 
     // Poll process() until the source (running on its own thread) has delivered — avoids a
     // fixed-sleep race where a sink could run process() before the source sends.
-    std::thread sink1_thread([&]() {
-        wait_until([&] { return sink1->process() != retval::NOOP; });
-    });
+    std::thread sink1_thread([&]() { wait_until([&] { return sink1->process() != retval::NOOP; }); });
 
-    std::thread sink2_thread([&]() {
-        wait_until([&] { return sink2->process() != retval::NOOP; });
-    });
+    std::thread sink2_thread([&]() { wait_until([&] { return sink2->process() != retval::NOOP; }); });
 
     source_thread.join();
     sink1_thread.join();
@@ -1541,7 +1520,7 @@ TEST_CASE("immutable buffer copy semantics", "[buffer][lifetime]") {
     auto* ptr2 = buffer2.data();
 
     REQUIRE(buffer1.size() == buffer2.size());
-    REQUIRE(ptr1 == ptr2);  // Same underlying data
+    REQUIRE(ptr1 == ptr2); // Same underlying data
     REQUIRE(!buffer1.is_unique());
     REQUIRE(!buffer2.is_unique());
 }
@@ -1606,7 +1585,7 @@ TEST_CASE("single element buffer", "[buffer][edge_case]") {
 }
 
 TEST_CASE("very large buffer", "[buffer][edge_case]") {
-    constexpr std::size_t large_size = 10000000;  // 10 million elements
+    constexpr std::size_t large_size = 10000000; // 10 million elements
 
     auto buffer = make_mutable<float>(large_size);
     REQUIRE(buffer.size() == large_size);
@@ -1696,7 +1675,7 @@ TEST_CASE("concept rejects invalid containers", "[buffer][concept][negative]") {
     SECTION("container with wrong data() return type fails") {
         struct WrongDataReturn {
             using value_type [[maybe_unused]] = float;
-            auto data() -> void* { return nullptr; }  // Should return float*
+            auto data() -> void* { return nullptr; } // Should return float*
             auto size() const -> std::size_t { return 10; }
         };
 
@@ -1786,7 +1765,7 @@ TEST_CASE("immutable_buffer slice basic operations", "[buffer][slice]") {
         auto slice = buf.slice(0, 10);
 
         REQUIRE(slice.size() == 10);
-        REQUIRE(slice.data() == buf.data());  // Same data pointer
+        REQUIRE(slice.data() == buf.data()); // Same data pointer
         REQUIRE(slice.is_unique() == buf.is_unique());
     }
 
@@ -1821,7 +1800,7 @@ TEST_CASE("immutable_buffer slice basic operations", "[buffer][slice]") {
 
     SECTION("slice with npos (to end)") {
         auto buf = make_immutable<int>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
-        auto slice = buf.slice(7);  // From 7 to end
+        auto slice = buf.slice(7); // From 7 to end
 
         REQUIRE(slice.size() == 3);
         REQUIRE(slice[0] == 7);
@@ -1880,7 +1859,7 @@ TEST_CASE("immutable_buffer slice sharing and lifetime", "[buffer][slice][lifeti
     SECTION("slice keeps data alive after original destroyed") {
         auto slice = [&]() {
             auto buf = make_immutable<int>({10, 20, 30, 40, 50});
-            return buf.slice(2, 2);  // Returns slice, buf goes out of scope
+            return buf.slice(2, 2); // Returns slice, buf goes out of scope
         }();
 
         // Slice should still have valid data
@@ -1902,8 +1881,8 @@ TEST_CASE("immutable_buffer slice sharing and lifetime", "[buffer][slice][lifeti
 TEST_CASE("immutable_buffer slice chaining", "[buffer][slice]") {
     SECTION("slice of a slice") {
         auto buf = make_immutable<int>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
-        auto slice1 = buf.slice(2, 6);     // {2, 3, 4, 5, 6, 7}
-        auto slice2 = slice1.slice(1, 4);  // {3, 4, 5, 6}
+        auto slice1 = buf.slice(2, 6);    // {2, 3, 4, 5, 6, 7}
+        auto slice2 = slice1.slice(1, 4); // {3, 4, 5, 6}
 
         REQUIRE(slice2.size() == 4);
         REQUIRE(slice2[0] == 3);
@@ -1912,9 +1891,9 @@ TEST_CASE("immutable_buffer slice chaining", "[buffer][slice]") {
 
     SECTION("multiple levels of slicing") {
         auto buf = make_immutable<int>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
-        auto slice1 = buf.slice(1, 8);      // {1, 2, 3, 4, 5, 6, 7, 8}
-        auto slice2 = slice1.slice(2, 4);   // {3, 4, 5, 6}
-        auto slice3 = slice2.slice(1, 2);   // {4, 5}
+        auto slice1 = buf.slice(1, 8);    // {1, 2, 3, 4, 5, 6, 7, 8}
+        auto slice2 = slice1.slice(2, 4); // {3, 4, 5, 6}
+        auto slice3 = slice2.slice(1, 2); // {4, 5}
 
         REQUIRE(slice3.size() == 2);
         REQUIRE(slice3[0] == 4);
@@ -1951,7 +1930,7 @@ TEST_CASE("immutable_buffer slice error handling", "[buffer][slice][error]") {
 
     SECTION("npos on empty buffer works") {
         immutable_buffer<int> buf;
-        auto slice = buf.slice(0);  // npos
+        auto slice = buf.slice(0); // npos
         REQUIRE(slice.empty());
     }
 }
@@ -2146,8 +2125,8 @@ TEST_CASE("port disconnect with data transmission", "[port][disconnect]") {
         }
         source->output.send_data(std::move(buffer2), timestamp{});
 
-        REQUIRE(sink1->input.size() == 1);  // Still has first packet
-        REQUIRE(sink2->input.size() == 2);  // Has both packets
+        REQUIRE(sink1->input.size() == 1); // Still has first packet
+        REQUIRE(sink2->input.size() == 2); // Has both packets
 
         // Verify data integrity in sink2
         auto [data1, ts1, md1] = sink2->input.get_data();
@@ -2183,8 +2162,8 @@ TEST_CASE("port disconnect with data transmission", "[port][disconnect]") {
         auto buffer2 = make_mutable<float>(10);
         source->output.send_data(std::move(buffer2), timestamp{});
 
-        REQUIRE(sink1->input.size() == 1);  // No new data
-        REQUIRE(sink2->input.size() == 1);  // No new data
+        REQUIRE(sink1->input.size() == 1); // No new data
+        REQUIRE(sink2->input.size() == 1); // No new data
     }
 
     SECTION("reconnect after disconnect works correctly") {
@@ -2195,7 +2174,9 @@ TEST_CASE("port disconnect with data transmission", "[port][disconnect]") {
         source->output.connect(&sink->input);
 
         auto buffer1 = make_mutable<float>(5);
-        for (std::size_t i = 0; i < 5; ++i) { buffer1[i] = static_cast<float>(i); }
+        for (std::size_t i = 0; i < 5; ++i) {
+            buffer1[i] = static_cast<float>(i);
+        }
         source->output.send_data(std::move(buffer1), timestamp{});
         REQUIRE(sink->input.size() == 1);
 
@@ -2203,12 +2184,14 @@ TEST_CASE("port disconnect with data transmission", "[port][disconnect]") {
 
         auto buffer2 = make_mutable<float>(5);
         source->output.send_data(std::move(buffer2), timestamp{});
-        REQUIRE(sink->input.size() == 1);  // No new data
+        REQUIRE(sink->input.size() == 1); // No new data
 
         source->output.connect(&sink->input);
 
         auto buffer3 = make_mutable<float>(5);
-        for (std::size_t i = 0; i < 5; ++i) { buffer3[i] = static_cast<float>(i + 100); }
+        for (std::size_t i = 0; i < 5; ++i) {
+            buffer3[i] = static_cast<float>(i + 100);
+        }
         source->output.send_data(std::move(buffer3), timestamp{});
         REQUIRE(sink->input.size() == 2);
 
@@ -2317,9 +2300,9 @@ TEST_CASE("port disconnect fanout scenarios", "[port][disconnect][fanout]") {
         auto buffer2 = make_mutable<float>(5);
         source->output.send_data(std::move(buffer2), timestamp{});
 
-        REQUIRE(sink1->input.size() == 1);  // No new data
-        REQUIRE(sink2->input.size() == 2);  // Got both
-        REQUIRE(sink3->input.size() == 1);  // Got second
+        REQUIRE(sink1->input.size() == 1); // No new data
+        REQUIRE(sink2->input.size() == 2); // Got both
+        REQUIRE(sink3->input.size() == 1); // Got second
     }
 }
 
@@ -2398,9 +2381,7 @@ TEST_CASE("port disconnect thread safety", "[port][disconnect][thread]") {
         // Multiple threads trying to disconnect different sinks
         std::vector<std::thread> threads;
         for (std::size_t i = 0; i < sinks.size(); ++i) {
-            threads.emplace_back([&, i]() {
-                source->output.disconnect(&sinks[i]->input);
-            });
+            threads.emplace_back([&, i]() { source->output.disconnect(&sinks[i]->input); });
         }
 
         for (auto& t : threads) {
@@ -2485,7 +2466,7 @@ TEST_CASE("buffer capacity management basic operations", "[buffer][capacity]") {
 
         buffer.resize(20);
         REQUIRE(buffer.size() == 20);
-        REQUIRE(buffer[9] == 9.0f);  // Old data preserved
+        REQUIRE(buffer[9] == 9.0f); // Old data preserved
         // New elements are default-initialized (0.0f)
         REQUIRE(buffer[19] == 0.0f);
     }
@@ -2511,8 +2492,8 @@ TEST_CASE("buffer capacity management basic operations", "[buffer][capacity]") {
         auto initial_capacity = buffer.capacity();
         buffer.reserve(1000);
 
-        REQUIRE(buffer.size() == 10);  // Size unchanged
-        REQUIRE(buffer.capacity() >= 1000);  // Capacity increased
+        REQUIRE(buffer.size() == 10);       // Size unchanged
+        REQUIRE(buffer.capacity() >= 1000); // Capacity increased
         REQUIRE(buffer.capacity() >= initial_capacity);
 
         // Data preserved
@@ -2524,7 +2505,7 @@ TEST_CASE("buffer capacity management basic operations", "[buffer][capacity]") {
     SECTION("capacity returns current capacity") {
         auto buffer = make_mutable<float>(10);
         auto cap = buffer.capacity();
-        REQUIRE(cap >= 10);  // At least the size
+        REQUIRE(cap >= 10); // At least the size
     }
 
     SECTION("shrink_to_fit reduces capacity") {
@@ -2535,7 +2516,7 @@ TEST_CASE("buffer capacity management basic operations", "[buffer][capacity]") {
         buffer.shrink_to_fit();
         // Note: shrink_to_fit is non-binding, but typically reduces capacity
         REQUIRE(buffer.size() == 10);
-        REQUIRE(buffer.capacity() >= 10);  // Still at least size
+        REQUIRE(buffer.capacity() >= 10); // Still at least size
     }
 
     SECTION("clear removes all elements but preserves capacity") {
@@ -2549,7 +2530,7 @@ TEST_CASE("buffer capacity management basic operations", "[buffer][capacity]") {
 
         REQUIRE(buffer.size() == 0);
         REQUIRE(buffer.empty());
-        REQUIRE(buffer.capacity() == cap_before);  // Capacity preserved
+        REQUIRE(buffer.capacity() == cap_before); // Capacity preserved
     }
 }
 
@@ -2625,7 +2606,7 @@ TEST_CASE("buffer capacity with data transfer", "[buffer][capacity][integration]
 
     SECTION("reserve before growing buffer incrementally") {
         auto buffer = make_mutable<float>(0);
-        buffer.resize(0);  // Ensure size is 0
+        buffer.resize(0); // Ensure size is 0
 
         // Pre-allocate space
         buffer.reserve(1000);
@@ -2662,7 +2643,7 @@ TEST_CASE("buffer capacity with data transfer", "[buffer][capacity][integration]
         REQUIRE(buffer.size() == 50);
         REQUIRE(buffer[0] == 0.0f);
         REQUIRE(buffer[49] == 98.0f);
-        REQUIRE(buffer.capacity() >= cap);  // Should not have shrunk
+        REQUIRE(buffer.capacity() >= cap); // Should not have shrunk
     }
 }
 
@@ -2716,7 +2697,7 @@ TEST_CASE("buffer capacity std::array compatibility", "[buffer][capacity]") {
         // Capacity operations should throw on std::array-based buffers
         REQUIRE_THROWS_AS(buffer.resize(5), std::runtime_error);
         REQUIRE_THROWS_AS(buffer.reserve(20), std::runtime_error);
-        REQUIRE(buffer.capacity() == 0);  // Returns 0 for non-dynamic containers
+        REQUIRE(buffer.capacity() == 0); // Returns 0 for non-dynamic containers
 
         // These should be no-ops
         REQUIRE_NOTHROW(buffer.shrink_to_fit());
@@ -2748,7 +2729,7 @@ TEST_CASE("buffer capacity std::array compatibility", "[buffer][capacity]") {
 
 //             m_output.send_data(std::move(buffer), timestamp{});
 //             m_send_count++;
-            
+
 //             return retval::NORMAL;
 //         }
 
@@ -2773,7 +2754,7 @@ TEST_CASE("buffer capacity std::array compatibility", "[buffer][capacity]") {
 //             }
 
 //             m_receive_count++;
-            
+
 //             // Store first value of each buffer
 //             if (buffer.size() > 0) {
 //                 m_first_values.push_back(buffer[0]);
@@ -2810,7 +2791,7 @@ TEST_CASE("buffer capacity std::array compatibility", "[buffer][capacity]") {
 //     REQUIRE(source->m_send_count == 3);
 //     REQUIRE(sink->m_receive_count == 3);
 //     REQUIRE(sink->m_first_values.size() == 3);
-    
+
 //     // Check values
 //     REQUIRE_THAT(sink->m_first_values[0], Catch::Matchers::WithinAbs(0.0f, 0.001f));
 //     REQUIRE_THAT(sink->m_first_values[1], Catch::Matchers::WithinAbs(100.0f, 0.001f));
@@ -2963,20 +2944,14 @@ TEST_CASE("queue depth and capacity metrics", "[port][stats]") {
     // Verify queue_capacity metric reflects the configured depth
     auto& registry = metrics::registry::instance();
 
-    metrics::labels_t labels = {
-        {"component_id", "TestMutableSink"},
-        {"port_name", "data_in"},
-        {"port_type", "input"}
-    };
+    metrics::labels_t labels = {{"component_id", "TestMutableSink"}, {"port_name", "data_in"}, {"port_type", "input"}};
 
     // Get the queue_capacity gauge (get_or_create returns existing one)
-    auto& capacity_gauge = registry.get_or_create_gauge(
-        "composite.port.queue_capacity", "", "1", labels);
+    auto& capacity_gauge = registry.get_or_create_gauge("composite.port.queue_capacity", "", "1", labels);
     REQUIRE(capacity_gauge.value() == 20.0);
 
     // Get the queue_depth gauge
-    auto& depth_gauge = registry.get_or_create_gauge(
-        "composite.port.queue_depth", "", "1", labels);
+    auto& depth_gauge = registry.get_or_create_gauge("composite.port.queue_depth", "", "1", labels);
 
     // Initially queue should be empty
     REQUIRE(depth_gauge.value() == 0.0);
@@ -3086,9 +3061,7 @@ TEST_CASE("overflow callback invocation", "[port][backpressure]") {
 
     // Track dropped packets
     std::atomic<std::size_t> total_dropped{0};
-    input_port->set_overflow_callback([&total_dropped](std::size_t count) {
-        total_dropped.fetch_add(count);
-    });
+    input_port->set_overflow_callback([&total_dropped](std::size_t count) { total_dropped.fetch_add(count); });
 
     // Set small depth to trigger overflow
     input_port->depth(2);
@@ -3157,7 +3130,6 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
     REQUIRE(!output_port->can_send());
 }
 
-
 // ============================================================================
 // Blocking Variants Tests
 // ============================================================================
@@ -3171,14 +3143,14 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
 
 // TEST_CASE("rapid buffer creation and destruction", "[stress]") {
 //     constexpr std::size_t iterations = 10000;
-    
+
 //     for (std::size_t i = 0; i < iterations; ++i) {
 //         auto buffer = make_mutable<float>(100);
 //         buffer[0] = static_cast<float>(i);
-        
+
 //         // Immediately destroy
 //     }
-    
+
 //     REQUIRE(true);  // If we get here without crash, test passes
 // }
 
@@ -3236,31 +3208,31 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
 // TEST_CASE("benchmark: mutable chain vs copies", "[.benchmark]") {
 //     // This test is tagged with [.benchmark] so it won't run by default
 //     // Run with: ./test_ports "[.benchmark]"
-    
+
 //     constexpr std::size_t buffer_size = 1000000;
 //     constexpr std::size_t iterations = 100;
 
 //     SECTION("mutable chain (zero copy)") {
 //         auto total_duration = std::chrono::nanoseconds{0};
-        
+
 //         for (std::size_t iter = 0; iter < iterations; ++iter) {
 //             auto buffer = make_mutable<float>(buffer_size);
-            
+
 //             auto start = std::chrono::high_resolution_clock::now();
-            
+
 //             // Simulate 3-stage pipeline
 //             auto buf1 = std::move(buffer);
 //             auto buf2 = std::move(buf1);
 //             auto buf3 = std::move(buf2);
-            
+
 //             auto end = std::chrono::high_resolution_clock::now();
 //             total_duration += (end - start);
-            
+
 //             // Prevent optimization
 //             volatile float val = buf3[0];
 //             (void)val;
 //         }
-        
+
 //         auto avg_ns = total_duration.count() / iterations;
 //         INFO("Average time (mutable chain): " << avg_ns << " ns");
 //         REQUIRE(avg_ns < 1000000);  // Should be very fast
@@ -3268,25 +3240,25 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
 
 //     SECTION("copy chain") {
 //         auto total_duration = std::chrono::nanoseconds{0};
-        
+
 //         for (std::size_t iter = 0; iter < iterations; ++iter) {
 //             auto buffer = make_mutable<float>(buffer_size);
-            
+
 //             auto start = std::chrono::high_resolution_clock::now();
-            
+
 //             // Simulate 3-stage pipeline with copies
 //             auto buf1 = buffer.copy();
 //             auto buf2 = buf1.copy();
 //             auto buf3 = buf2.copy();
-            
+
 //             auto end = std::chrono::high_resolution_clock::now();
 //             total_duration += (end - start);
-            
+
 //             // Prevent optimization
 //             volatile float val = buf3[0];
 //             (void)val;
 //         }
-        
+
 //         auto avg_ns = total_duration.count() / iterations;
 //         INFO("Average time (copy chain): " << avg_ns << " ns");
 //         // Copies should be slower
@@ -3300,21 +3272,21 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
 
 //     SECTION("immutable sharing (zero copy)") {
 //         auto total_duration = std::chrono::nanoseconds{0};
-        
+
 //         for (std::size_t iter = 0; iter < iterations; ++iter) {
 //             auto buffer = make_immutable<float>(buffer_size);
-            
+
 //             auto start = std::chrono::high_resolution_clock::now();
-            
+
 //             std::vector<immutable_buffer<float>> outputs;
 //             for (std::size_t i = 0; i < num_outputs; ++i) {
 //                 outputs.push_back(buffer.share());
 //             }
-            
+
 //             auto end = std::chrono::high_resolution_clock::now();
 //             total_duration += (end - start);
 //         }
-        
+
 //         auto avg_ns = total_duration.count() / iterations;
 //         INFO("Average time (immutable sharing): " << avg_ns << " ns");
 //         REQUIRE(avg_ns < 1000000);
@@ -3322,21 +3294,21 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
 
 //     SECTION("mutable copying") {
 //         auto total_duration = std::chrono::nanoseconds{0};
-        
+
 //         for (std::size_t iter = 0; iter < iterations; ++iter) {
 //             auto buffer = make_mutable<float>(buffer_size);
-            
+
 //             auto start = std::chrono::high_resolution_clock::now();
-            
+
 //             std::vector<mutable_buffer<float>> outputs;
 //             for (std::size_t i = 0; i < num_outputs; ++i) {
 //                 outputs.push_back(buffer.copy());
 //             }
-            
+
 //             auto end = std::chrono::high_resolution_clock::now();
 //             total_duration += (end - start);
 //         }
-        
+
 //         auto avg_ns = total_duration.count() / iterations;
 //         INFO("Average time (mutable copying): " << avg_ns << " ns");
 //         // Copying should be much slower
@@ -3403,11 +3375,11 @@ TEST_CASE("timestamp comparison operators", "[timestamp][comparison]") {
 
 TEST_CASE("timestamp arithmetic operations", "[timestamp][arithmetic]") {
     SECTION("timestamp difference") {
-        timestamp ts1{100, 500'000'000'000};  // 100.5 seconds
-        timestamp ts2{100, 0};                 // 100.0 seconds
+        timestamp ts1{100, 500'000'000'000}; // 100.5 seconds
+        timestamp ts2{100, 0};               // 100.0 seconds
 
         auto diff = ts1 - ts2;
-        REQUIRE(diff.count() == 500'000'000);  // 0.5 seconds = 500M nanoseconds
+        REQUIRE(diff.count() == 500'000'000); // 0.5 seconds = 500M nanoseconds
     }
 
     SECTION("timestamp difference (negative)") {
@@ -3415,20 +3387,20 @@ TEST_CASE("timestamp arithmetic operations", "[timestamp][arithmetic]") {
         timestamp ts2{100, 500'000'000'000};
 
         auto diff = ts1 - ts2;
-        REQUIRE(diff.count() == -500'000'000);  // -0.5 seconds
+        REQUIRE(diff.count() == -500'000'000); // -0.5 seconds
     }
 
     SECTION("timestamp difference (cross second boundary)") {
-        timestamp ts1{101, 200'000'000'000};  // 101.2 seconds
-        timestamp ts2{100, 800'000'000'000};  // 100.8 seconds
+        timestamp ts1{101, 200'000'000'000}; // 101.2 seconds
+        timestamp ts2{100, 800'000'000'000}; // 100.8 seconds
 
         auto diff = ts1 - ts2;
-        REQUIRE(diff.count() == 400'000'000);  // 0.4 seconds = 400M nanoseconds
+        REQUIRE(diff.count() == 400'000'000); // 0.4 seconds = 400M nanoseconds
     }
 
     SECTION("add positive duration") {
         timestamp ts{100, 0};
-        auto dur = std::chrono::nanoseconds{500'000'000};  // 0.5 seconds
+        auto dur = std::chrono::nanoseconds{500'000'000}; // 0.5 seconds
 
         auto result = ts + dur;
         REQUIRE(result.seconds == 100);
@@ -3437,18 +3409,18 @@ TEST_CASE("timestamp arithmetic operations", "[timestamp][arithmetic]") {
     }
 
     SECTION("add duration causing second rollover") {
-        timestamp ts{100, 700'000'000'000};  // 100.7 seconds
-        auto dur = std::chrono::nanoseconds{500'000'000};  // 0.5 seconds
+        timestamp ts{100, 700'000'000'000};               // 100.7 seconds
+        auto dur = std::chrono::nanoseconds{500'000'000}; // 0.5 seconds
 
         auto result = ts + dur;
         REQUIRE(result.seconds == 101);
-        REQUIRE(result.picoseconds == 200'000'000'000);  // 101.2 seconds total
+        REQUIRE(result.picoseconds == 200'000'000'000); // 101.2 seconds total
         REQUIRE(result.is_valid());
     }
 
     SECTION("subtract duration") {
         timestamp ts{100, 500'000'000'000};
-        auto dur = std::chrono::nanoseconds{200'000'000};  // 0.2 seconds
+        auto dur = std::chrono::nanoseconds{200'000'000}; // 0.2 seconds
 
         auto result = ts - dur;
         REQUIRE(result.seconds == 100);
@@ -3457,8 +3429,8 @@ TEST_CASE("timestamp arithmetic operations", "[timestamp][arithmetic]") {
     }
 
     SECTION("subtract duration causing underflow throws") {
-        timestamp ts{0, 100'000'000'000};  // 0.1 seconds
-        auto dur = std::chrono::nanoseconds{200'000'000};  // 0.2 seconds
+        timestamp ts{0, 100'000'000'000};                 // 0.1 seconds
+        auto dur = std::chrono::nanoseconds{200'000'000}; // 0.2 seconds
 
         REQUIRE_THROWS_AS(ts - dur, std::underflow_error);
     }
@@ -3466,13 +3438,12 @@ TEST_CASE("timestamp arithmetic operations", "[timestamp][arithmetic]") {
 
 TEST_CASE("timestamp chrono conversions", "[timestamp][chrono]") {
     SECTION("from_chrono basic") {
-        auto tp = std::chrono::system_clock::time_point{
-            std::chrono::seconds{100} + std::chrono::nanoseconds{500'000'000}
-        };
+        auto tp =
+            std::chrono::system_clock::time_point{std::chrono::seconds{100} + std::chrono::nanoseconds{500'000'000}};
 
         auto ts = timestamp::from_chrono(tp);
         REQUIRE(ts.seconds == 100);
-        REQUIRE(ts.picoseconds == 500'000'000'000);  // 500M ns = 500B ps
+        REQUIRE(ts.picoseconds == 500'000'000'000); // 500M ns = 500B ps
     }
 
     SECTION("to_chrono basic") {
@@ -3496,29 +3467,29 @@ TEST_CASE("timestamp chrono conversions", "[timestamp][chrono]") {
         // Should be equal within nanosecond precision
         auto diff = converted_tp - original_tp;
         auto ns_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(diff);
-        REQUIRE(std::abs(ns_diff.count()) < 1000);  // Within 1 microsecond
+        REQUIRE(std::abs(ns_diff.count()) < 1000); // Within 1 microsecond
     }
 
     SECTION("now returns valid timestamp") {
         auto ts = timestamp::now();
         REQUIRE(ts.is_valid());
-        REQUIRE(ts.seconds > 0);  // Should be well past epoch
+        REQUIRE(ts.seconds > 0); // Should be well past epoch
     }
 }
 
 TEST_CASE("timestamp validation and normalization", "[timestamp][validation]") {
     SECTION("valid timestamp") {
-        timestamp ts{100, 999'999'999'999};  // Just under 1 second
+        timestamp ts{100, 999'999'999'999}; // Just under 1 second
         REQUIRE(ts.is_valid());
     }
 
     SECTION("invalid timestamp (picoseconds >= 1 second)") {
-        timestamp ts{100, 1'000'000'000'000};  // Exactly 1 second in picoseconds
+        timestamp ts{100, 1'000'000'000'000}; // Exactly 1 second in picoseconds
         REQUIRE_FALSE(ts.is_valid());
     }
 
     SECTION("normalize removes excess picoseconds") {
-        timestamp ts{100, 1'500'000'000'000};  // 1.5 seconds too many picoseconds
+        timestamp ts{100, 1'500'000'000'000}; // 1.5 seconds too many picoseconds
         REQUIRE_FALSE(ts.is_valid());
 
         ts.normalize();
@@ -3528,7 +3499,7 @@ TEST_CASE("timestamp validation and normalization", "[timestamp][validation]") {
     }
 
     SECTION("normalize with multiple seconds") {
-        timestamp ts{100, 3'200'000'000'000};  // 3.2 seconds too many
+        timestamp ts{100, 3'200'000'000'000}; // 3.2 seconds too many
         ts.normalize();
 
         REQUIRE(ts.is_valid());
@@ -3555,7 +3526,7 @@ TEST_CASE("timestamp formatting", "[timestamp][formatting]") {
     }
 
     SECTION("format with leading zeros in picoseconds") {
-        timestamp ts{42, 123'456'789};  // Small picosecond value
+        timestamp ts{42, 123'456'789}; // Small picosecond value
         auto str = ts.to_string();
         REQUIRE(str == "42.000123456789");
     }
@@ -3587,7 +3558,7 @@ TEST_CASE("timestamp edge cases", "[timestamp][edge_case]") {
 
     SECTION("arithmetic preserves normalization") {
         timestamp ts{100, 0};
-        auto dur = std::chrono::nanoseconds{1'500'000'000};  // 1.5 seconds
+        auto dur = std::chrono::nanoseconds{1'500'000'000}; // 1.5 seconds
 
         auto result = ts + dur;
         REQUIRE(result.is_valid());
@@ -3596,8 +3567,8 @@ TEST_CASE("timestamp edge cases", "[timestamp][edge_case]") {
     }
 
     SECTION("comparison works with unnormalized timestamps after normalize") {
-        timestamp ts1{100, 1'500'000'000'000};  // Unnormalized
-        timestamp ts2{101, 500'000'000'000};    // Normalized equivalent
+        timestamp ts1{100, 1'500'000'000'000}; // Unnormalized
+        timestamp ts2{101, 500'000'000'000};   // Normalized equivalent
 
         ts1.normalize();
         REQUIRE(ts1 == ts2);
@@ -3661,7 +3632,7 @@ class TestLifecycleSink : public component {
 public:
     TestLifecycleSink() : component("TestLifecycleSink") {
         add_port(m_input);
-        m_input.depth(100);  // Default depth
+        m_input.depth(100); // Default depth
     }
 
     auto process() -> retval override {
@@ -3673,19 +3644,17 @@ public:
         return retval::NORMAL;
     }
 
-    auto get_input_depth() const -> std::size_t {
-        return m_input.depth();
-    }
+    auto get_input_depth() const -> std::size_t { return m_input.depth(); }
 
     // Written by the worker (process()), read by the test's main thread while the worker
     // runs -> must be atomic (this counter races the main-thread reads below otherwise; the
     // doorbell's scheduling shift surfaced the latent race under TSan).
     std::atomic<std::size_t> m_packets_received{0};
-    std::size_t m_last_size{0};  // worker-only (written, never read cross-thread)
+    std::size_t m_last_size{0}; // worker-only (written, never read cross-thread)
 
 private:
     input_port<immutable_buffer<float>> m_input{"data_in"};
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 
 /**
@@ -3693,9 +3662,7 @@ private:
  */
 class TestContinuousSource : public component {
 public:
-    TestContinuousSource() : component("TestContinuousSource") {
-        add_port(m_output);
-    }
+    TestContinuousSource() : component("TestContinuousSource") { add_port(m_output); }
 
     auto process() -> retval override {
         if (m_packets_sent >= m_max_packets) {
@@ -3706,7 +3673,7 @@ public:
         m_output.send_data(std::move(buffer), timestamp::now());
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         m_packets_sent++;
-        
+
         return retval::NORMAL;
     }
 
@@ -3715,62 +3682,65 @@ public:
 
 private:
     output_port<immutable_buffer<float>> m_output{"data_out"};
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 
 TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
     SECTION("Disabling component stops thread and pauses input ports") {
         auto sink = std::make_shared<TestLifecycleSink>();
-        
+
         // Verify initial state
         REQUIRE(sink->get_property<bool>("enabled") == true);
         REQUIRE(sink->get_input_depth() == 100);
-        
+
         // Start component
         sink->start();
         REQUIRE(wait_until([&] { return sink->is_running(); }));
 
         // Disable component via property (synchronous stop + pause)
-        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        sink->set_properties({{"enabled", false}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
 
         // Verify component stopped and input port paused
         REQUIRE(sink->get_property<bool>("enabled") == false);
-        REQUIRE(sink->get_input_depth() == 0);  // Should be paused
+        REQUIRE(sink->get_input_depth() == 0); // Should be paused
     }
-    
+
     SECTION("Re-enabling component restores input port depths") {
         auto sink = std::make_shared<TestLifecycleSink>();
-        
+
         // Set initial depth
         REQUIRE(sink->get_input_depth() == 100);
-        
+
         // Start and then disable
         sink->start();
         REQUIRE(wait_until([&] { return sink->is_running(); }));
-        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        sink->set_properties({{"enabled", false}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
 
         // Verify paused
         REQUIRE(sink->get_input_depth() == 0);
 
         // Re-enable
-        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+        sink->set_properties({{"enabled", true}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == 100; }));
 
         // Verify depth restored
         REQUIRE(sink->get_property<bool>("enabled") == true);
-        REQUIRE(sink->get_input_depth() == 100);  // Should be restored
+        REQUIRE(sink->get_input_depth() == 100); // Should be restored
     }
-    
+
     SECTION("Paused input ports drop incoming data") {
         auto source = std::make_shared<TestContinuousSource>();
         auto sink = std::make_shared<TestLifecycleSink>();
-        source->m_max_packets = 100000;  // Ensure source keeps sending throughout test
-        
+        source->m_max_packets = 100000; // Ensure source keeps sending throughout test
+
         // Connect components
         source->connect("data_out", sink, "data_in");
-        
+
         // Start both, then wait until the sink's worker has actually received some packets
         // (async processing — this is a genuine wait, not a synchronous lifecycle op).
         source->start();
@@ -3778,11 +3748,12 @@ TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
         REQUIRE(wait_until([&] { return sink->m_packets_received.load() > 0; }));
 
         auto initial_received = sink->m_packets_received.load();
-        REQUIRE(initial_received > 0);  // Should have received some packets
+        REQUIRE(initial_received > 0); // Should have received some packets
 
         // Disable sink (synchronous stop + pause to depth 0)
-        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle: let any in-flight packet land
+        sink->set_properties({{"enabled", false}});
+        sink->apply_lifecycle_changes();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // settle: let any in-flight packet land
 
         // Source continues sending, but sink's input port should drop everything
         auto packets_after_disable = sink->m_packets_received.load();
@@ -3790,35 +3761,40 @@ TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
         REQUIRE(packets_after_disable - initial_received <= 2);
 
         // Re-enable sink — it should start receiving again (async, so poll).
-        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+        sink->set_properties({{"enabled", true}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->m_packets_received.load() > packets_after_disable; }));
-        
+
         // Cleanup
         source->stop();
         sink->stop();
     }
-    
+
     SECTION("Multiple enable/disable cycles preserve depths") {
         auto sink = std::make_shared<TestLifecycleSink>();
         sink->start();
-        
+
         const std::size_t original_depth = 100;
         REQUIRE(sink->get_input_depth() == original_depth);
-        
+
         // Cycle 1
-        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        sink->set_properties({{"enabled", false}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
-        
-        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+
+        sink->set_properties({{"enabled", true}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == original_depth; }));
-        
+
         // Cycle 2
-        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        sink->set_properties({{"enabled", false}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
-        
-        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+
+        sink->set_properties({{"enabled", true}});
+        sink->apply_lifecycle_changes();
         REQUIRE(wait_until([&] { return sink->get_input_depth() == original_depth; }));
-        
+
         sink->stop();
     }
 }
@@ -3827,18 +3803,19 @@ TEST_CASE("Component lifecycle memory management", "[lifecycle][memory]") {
     SECTION("Disabled component prevents queue growth") {
         auto source = std::make_shared<TestContinuousSource>();
         auto sink = std::make_shared<TestLifecycleSink>();
-        
-        source->m_max_packets = 1000;  // Lots of packets
+
+        source->m_max_packets = 1000; // Lots of packets
         source->connect("data_out", sink, "data_in");
-        
+
         // Start source and sink, then wait until the sink is actually receiving.
         source->start();
         sink->start();
         REQUIRE(wait_until([&] { return sink->m_packets_received.load() > 0; }));
 
         // Now disable it - synchronous stop + pause of the input ports.
-        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle: let any in-flight packet land
+        sink->set_properties({{"enabled", false}});
+        sink->apply_lifecycle_changes();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // settle: let any in-flight packet land
 
         auto packets_at_disable = sink->m_packets_received.load();
 
@@ -3847,7 +3824,7 @@ TEST_CASE("Component lifecycle memory management", "[lifecycle][memory]") {
 
         // ...the sink must NOT receive any more (asserting absence over the window).
         REQUIRE(sink->m_packets_received.load() == packets_at_disable);
-        
+
         source->stop();
         sink->stop();
     }

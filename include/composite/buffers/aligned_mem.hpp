@@ -31,16 +31,16 @@ namespace composite {
 template <typename T>
 class aligned_mem {
 public:
-    using value_type = T;                       ///< Element type stored in the buffer
-    using size_type = std::size_t;              ///< Type used for sizes and indices
-    using reference = value_type&;              ///< Mutable reference to element
-    using const_reference = const value_type&;  ///< Const reference to element
-    using iterator = value_type*;               ///< Iterator type (raw pointer)
-    using const_iterator = const value_type*;   ///< Const iterator type (raw const pointer)
+    using value_type = T;                      ///< Element type stored in the buffer
+    using size_type = std::size_t;             ///< Type used for sizes and indices
+    using reference = value_type&;             ///< Mutable reference to element
+    using const_reference = const value_type&; ///< Const reference to element
+    using iterator = value_type*;              ///< Iterator type (raw pointer)
+    using const_iterator = const value_type*;  ///< Const iterator type (raw const pointer)
 
     static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>,
-        "aligned_mem assigns / std::copy's into raw aligned_alloc memory and frees without running "
-        "~T() — T must be trivially copyable and trivially destructible (its DSP/POD domain).");
+                  "aligned_mem assigns / std::copy's into raw aligned_alloc memory and frees without running "
+                  "~T() — T must be trivially copyable and trivially destructible (its DSP/POD domain).");
 
     /**
      * @brief Constructs an aligned memory buffer
@@ -49,16 +49,11 @@ public:
      * @throws std::invalid_argument if alignment is not valid
      * @throws std::runtime_error if memory allocation fails
      */
-    explicit aligned_mem(size_type alignment, size_type count) :
-      m_data(),
-      m_alignment(alignment),
-      m_count(count),
-      m_capacity(count) {
+    explicit aligned_mem(size_type alignment, size_type count)
+        : m_data(), m_alignment(alignment), m_count(count), m_capacity(count) {
         if (alignment < alignof(std::max_align_t) || !std::has_single_bit(alignment)) {
-            auto err = std::format(
-              "invalid alignment: {}: must be a power of 2 and at least alignof(std::max_align_t)",
-              alignment
-            );
+            auto err = std::format("invalid alignment: {}: must be a power of 2 and at least alignof(std::max_align_t)",
+                                   alignment);
             throw std::invalid_argument(err);
         }
         if (count > 0) {
@@ -103,19 +98,15 @@ public:
     /**
      * @brief Destructor that frees allocated memory
      */
-    ~aligned_mem() {
-        std::free(m_data);
-    }
+    ~aligned_mem() { std::free(m_data); }
 
     /**
      * @brief Copy constructor (deep copy)
      * @param other The aligned_mem instance to copy
      * @throws std::runtime_error if memory allocation fails
      */
-    aligned_mem(const aligned_mem& other) :
-      m_alignment(other.m_alignment),
-      m_count(other.m_count),
-      m_capacity(other.m_capacity) {
+    aligned_mem(const aligned_mem& other)
+        : m_alignment(other.m_alignment), m_count(other.m_count), m_capacity(other.m_capacity) {
         if (m_capacity > 0) {
             m_data = static_cast<T*>(aligned_alloc_padded(m_alignment, bytes_for(m_capacity)));
             if (m_data == nullptr) {
@@ -135,9 +126,7 @@ public:
         if (this != &other) {
             T* new_data = nullptr;
             if (other.m_capacity > 0) {
-                new_data = static_cast<T*>(
-                  aligned_alloc_padded(other.m_alignment, bytes_for(other.m_capacity))
-                );
+                new_data = static_cast<T*>(aligned_alloc_padded(other.m_alignment, bytes_for(other.m_capacity)));
                 if (new_data == nullptr) {
                     throw std::runtime_error("memory allocation failed during copy assignment");
                 }
@@ -156,9 +145,7 @@ public:
      * @brief Move constructor (transfers ownership)
      * @param other The aligned_mem instance to move
      */
-    aligned_mem(aligned_mem&& other) noexcept {
-        *this = std::move(other);
-    }
+    aligned_mem(aligned_mem&& other) noexcept { *this = std::move(other); }
 
     /**
      * @brief Move assignment operator (transfers ownership)
@@ -213,10 +200,8 @@ public:
      */
     auto at(size_type pos) -> reference {
         if (pos >= m_count) {
-            auto err = std::format(
-                "aligned_mem range check: pos (which is {}) >= this->size() (which is {})",
-                pos, m_count
-            );
+            auto err =
+                std::format("aligned_mem range check: pos (which is {}) >= this->size() (which is {})", pos, m_count);
             throw std::out_of_range(err);
         }
         return m_data[pos];
@@ -230,10 +215,8 @@ public:
      */
     auto at(size_type pos) const -> const_reference {
         if (pos >= m_count) {
-            auto err = std::format(
-                "aligned_mem range check: pos (which is {}) >= this->size() (which is {})",
-                pos, m_count
-            );
+            auto err =
+                std::format("aligned_mem range check: pos (which is {}) >= this->size() (which is {})", pos, m_count);
             throw std::out_of_range(err);
         }
         return m_data[pos];
@@ -244,18 +227,14 @@ public:
      * @param pos The index of the element
      * @return Reference to the element at specified location
      */
-    auto operator[](size_type pos) -> reference {
-        return m_data[pos];
-    }
+    auto operator[](size_type pos) -> reference { return m_data[pos]; }
 
     /**
      * @brief Unchecked element access
      * @param pos The index of the element
      * @return Const reference to the element at specified location
      */
-    auto operator[](size_type pos) const -> const_reference {
-        return m_data[pos];
-    }
+    auto operator[](size_type pos) const -> const_reference { return m_data[pos]; }
 
     /**
      * @brief Returns the memory alignment of the allocated buffer
@@ -437,9 +416,7 @@ public:
      * After clear(), capacity() is unchanged but size() is 0.
      * No memory is deallocated or reallocated.
      */
-    auto clear() -> void {
-        m_count = 0;
-    }
+    auto clear() -> void { m_count = 0; }
 
     /**
      * @brief Returns an iterator to the beginning of the buffer
@@ -512,10 +489,10 @@ public:
     };
 
 private:
-    value_type* m_data{nullptr}; ///< Pointer to allocated memory
+    value_type* m_data{nullptr};                      ///< Pointer to allocated memory
     size_type m_alignment{alignof(std::max_align_t)}; ///< Memory alignment
-    size_type m_count{0}; ///< Number of elements stored
-    size_type m_capacity{0}; ///< Number of elements allocated
+    size_type m_count{0};                             ///< Number of elements stored
+    size_type m_capacity{0};                          ///< Number of elements allocated
 
 }; // class aligned_mem
 

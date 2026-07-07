@@ -22,8 +22,15 @@ using json = composite::properties::json;
 
 namespace {
 enum class Win { hann, hamming };
-struct Chan { double cf{}; double bw{}; Win win{Win::hann}; };
-struct Net  { std::string host{"localhost"}; std::uint16_t port{8080}; };
+struct Chan {
+    double cf{};
+    double bw{};
+    Win win{Win::hann};
+};
+struct Net {
+    std::string host{"localhost"};
+    std::uint16_t port{8080};
+};
 } // namespace
 
 COMPOSITE_ENUM(Win, hann, hamming);
@@ -34,14 +41,19 @@ namespace {
 class cfg_component : public component {
 public:
     explicit cfg_component(std::string_view id) : component(id) {
-        add_property("gain", m_gain, config_type::RUNTIME).units("dB")
-            .validate([](const double& g) { return g > 0.0; });
+        add_property("gain", m_gain, config_type::RUNTIME).units("dB").validate([](const double& g) {
+            return g > 0.0;
+        });
         add_property("buf_size", m_buf, config_type::INITIALIZE);
         add_property("net", m_net, config_type::RUNTIME);
         add_keyed("channels", m_channels, config_type::RUNTIME)
             .validate_element([](const std::string&, const Chan& c) { return c.bw > 0.0; })
             .validate_list([this](const std::map<std::string, Chan>& m) {
-                double total = 0; for (const auto& [k, c] : m) { (void)k; total += c.bw; }
+                double total = 0;
+                for (const auto& [k, c] : m) {
+                    (void)k;
+                    total += c.bw;
+                }
                 return total <= m_budget;
             })
             .on_change([this](const json& d) { m_last_diff = d; });
@@ -56,7 +68,7 @@ public:
     double m_budget{25e6};
     json m_last_diff;
     int m_handler_calls{0};
-    component::auto_stop m_auto_stop{*this};  // MUST be last
+    component::auto_stop m_auto_stop{*this}; // MUST be last
 };
 } // namespace
 
@@ -68,7 +80,7 @@ TEST_CASE("scalar property: set / get / validate / no-op", "[properties]") {
 
     REQUIRE_THROWS_AS(c.set_properties(json::parse(R"({"gain": -1.0})"), config_type::RUNTIME),
                       properties::validation_error);
-    REQUIRE(c.get_property<double>("gain") == 2.5);  // unchanged on reject
+    REQUIRE(c.get_property<double>("gain") == 2.5); // unchanged on reject
 }
 
 TEST_CASE("INITIALIZE property rejects a runtime apply", "[properties]") {
@@ -82,14 +94,14 @@ TEST_CASE("INITIALIZE property rejects a runtime apply", "[properties]") {
 TEST_CASE("multi-property batch is atomic (one reject commits nothing)", "[properties]") {
     cfg_component c{"c"};
     REQUIRE_THROWS(c.set_properties(json::parse(R"({"gain": 9.0, "buf_size": 9})"), config_type::RUNTIME));
-    REQUIRE(c.get_property<double>("gain") == 1.0);  // gain not committed
+    REQUIRE(c.get_property<double>("gain") == 1.0); // gain not committed
 }
 
 TEST_CASE("nested struct: RFC-7396 partial merge", "[properties]") {
     cfg_component c{"c"};
     c.set_properties(json::parse(R"({"net": {"port": 9000}})"), config_type::RUNTIME);
     REQUIRE(c.m_net.port == 9000);
-    REQUIRE(c.m_net.host == "localhost");  // untouched field preserved
+    REQUIRE(c.m_net.host == "localhost"); // untouched field preserved
 }
 
 TEST_CASE("keyed collection: add / modify / remove + cross-element invariant", "[properties][keyed]") {
@@ -113,7 +125,7 @@ TEST_CASE("keyed collection: add / modify / remove + cross-element invariant", "
     c.set_properties(json::parse(R"({"channels": {"C": null}})"), config_type::RUNTIME);
     REQUIRE(c.m_channels.size() == 1);
     REQUIRE(c.m_channels.count("C") == 0);
-    REQUIRE(c.m_channels["L"].cf == l_cf);  // survivor undisturbed
+    REQUIRE(c.m_channels["L"].cf == l_cf); // survivor undisturbed
 }
 
 TEST_CASE("property_state and property_schema", "[properties]") {
@@ -128,7 +140,10 @@ TEST_CASE("property_state and property_schema", "[properties]") {
     REQUIRE(schema.is_array());
     bool found_gain = false;
     for (const auto& p : schema) {
-        if (p["name"] == "gain") { found_gain = true; REQUIRE(p["configurability"] == "runtime"); }
+        if (p["name"] == "gain") {
+            found_gain = true;
+            REQUIRE(p["configurability"] == "runtime");
+        }
     }
     REQUIRE(found_gain);
 }

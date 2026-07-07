@@ -66,13 +66,13 @@ struct config {
  * when config values are left at their defaults.
  */
 namespace env {
-    inline constexpr auto SERVICE_NAME = "OTEL_SERVICE_NAME";
-    inline constexpr auto EXPORTER_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT";
-    inline constexpr auto EXPORTER_PROTOCOL = "OTEL_EXPORTER_OTLP_PROTOCOL";
-    inline constexpr auto EXPORTER_METRICS_PROTOCOL = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL";
-    inline constexpr auto EXPORTER_TIMEOUT = "OTEL_EXPORTER_OTLP_TIMEOUT";
-    inline constexpr auto EXPORTER_HEADERS = "OTEL_EXPORTER_OTLP_HEADERS";
-    inline constexpr auto METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL";
+inline constexpr auto SERVICE_NAME = "OTEL_SERVICE_NAME";
+inline constexpr auto EXPORTER_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT";
+inline constexpr auto EXPORTER_PROTOCOL = "OTEL_EXPORTER_OTLP_PROTOCOL";
+inline constexpr auto EXPORTER_METRICS_PROTOCOL = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL";
+inline constexpr auto EXPORTER_TIMEOUT = "OTEL_EXPORTER_OTLP_TIMEOUT";
+inline constexpr auto EXPORTER_HEADERS = "OTEL_EXPORTER_OTLP_HEADERS";
+inline constexpr auto METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL";
 } // namespace env
 
 } // namespace composite::telemetry

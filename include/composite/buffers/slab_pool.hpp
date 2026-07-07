@@ -16,8 +16,8 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
-#include <type_traits>
 #include <sys/mman.h>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -126,8 +126,7 @@ public:
      * auto pool = slab_pool<float>::create(2048, 32);
      * @endcode
      */
-    static
-    auto create(std::size_t buffer_size, std::size_t buffer_count) -> std::shared_ptr<slab_pool> {
+    static auto create(std::size_t buffer_size, std::size_t buffer_count) -> std::shared_ptr<slab_pool> {
         return std::make_shared<slab_pool>(ctor_tag{}, buffer_size, buffer_count);
     }
 
@@ -145,13 +144,12 @@ public:
      * @throws std::overflow_error if size calculations overflow
      * @throws std::bad_alloc if allocation fails
      */
-    slab_pool(ctor_tag, std::size_t buffer_size, std::size_t buffer_count) :
-      m_buffer_size(buffer_size),
-      m_buffer_count(buffer_count) {
+    slab_pool(ctor_tag, std::size_t buffer_size, std::size_t buffer_count)
+        : m_buffer_size(buffer_size), m_buffer_count(buffer_count) {
         static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>,
-            "slab_pool hands out raw, uninitialized slab memory reinterpret_cast to T* and never "
-            "runs T's constructor/destructor — T must be trivially copyable and trivially destructible "
-            "(the DSP/POD domain it targets).");
+                      "slab_pool hands out raw, uninitialized slab memory reinterpret_cast to T* and never "
+                      "runs T's constructor/destructor — T must be trivially copyable and trivially destructible "
+                      "(the DSP/POD domain it targets).");
         if (buffer_size == 0 || buffer_count == 0) {
             throw std::invalid_argument("slab_pool: size and count must be > 0");
         }
@@ -179,7 +177,9 @@ public:
 
         // Allocate slab
         void* ptr = std::aligned_alloc(Alignment, m_total_bytes);
-        if (!ptr) { throw std::bad_alloc(); }
+        if (!ptr) {
+            throw std::bad_alloc();
+        }
         m_slab.reset(static_cast<uint8_t*>(ptr));
 
 #ifdef MADV_HUGEPAGE
@@ -199,7 +199,7 @@ public:
         for (std::uint32_t i = 0; i < buffer_count; ++i) {
             m_next[i].store((i + 1 < buffer_count) ? (i + 1) : NULL_IDX, std::memory_order_relaxed);
         }
-        m_free_head.store(0, std::memory_order_relaxed);  // index 0, tag 0
+        m_free_head.store(0, std::memory_order_relaxed); // index 0, tag 0
     }
 
     /**
@@ -243,7 +243,9 @@ public:
     [[nodiscard]]
     auto acquire() -> std::optional<buffer_type> {
         const std::uint32_t idx = pop_index();
-        if (idx == NULL_IDX) { return std::nullopt; }
+        if (idx == NULL_IDX) {
+            return std::nullopt;
+        }
         m_outstanding.fetch_add(1, std::memory_order_relaxed);
         return make_handle(this->shared_from_this(), slot_ptr(idx));
     }
@@ -292,7 +294,9 @@ public:
 
         while (acquired < count) {
             const std::uint32_t idx = pop_index();
-            if (idx == NULL_IDX) { break; }
+            if (idx == NULL_IDX) {
+                break;
+            }
             out.emplace_back(make_handle(self, slot_ptr(idx)));
             acquired++;
         }
@@ -489,8 +493,8 @@ private:
         bool aligned = ((addr - base) % m_stride_bytes) == 0;
         assert(in_range && aligned && "slab_pool: attempt to release invalid pointer");
 #endif
-        const auto idx = static_cast<std::uint32_t>(
-            (reinterpret_cast<std::uint8_t*>(ptr) - m_slab.get()) / m_stride_bytes);
+        const auto idx =
+            static_cast<std::uint32_t>((reinterpret_cast<std::uint8_t*>(ptr) - m_slab.get()) / m_stride_bytes);
         push_index(idx);
         m_outstanding.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -509,14 +513,15 @@ private:
         std::uint64_t head = m_free_head.load(std::memory_order_acquire);
         for (;;) {
             const auto idx = static_cast<std::uint32_t>(head);
-            if (idx == NULL_IDX) { return NULL_IDX; }
+            if (idx == NULL_IDX) {
+                return NULL_IDX;
+            }
             // The link value is only USED if the CAS succeeds (head unchanged ⇒ idx
             // still the free head ⇒ its link is current). The head-acquire above
             // orders this load after the matching push's head-release.
             const std::uint32_t next = m_next[idx].load(std::memory_order_relaxed);
             const std::uint64_t nh = (static_cast<std::uint64_t>(tag_of(head) + 1) << 32) | next;
-            if (m_free_head.compare_exchange_weak(head, nh,
-                    std::memory_order_acquire, std::memory_order_acquire)) {
+            if (m_free_head.compare_exchange_weak(head, nh, std::memory_order_acquire, std::memory_order_acquire)) {
                 return idx;
             }
         }
@@ -525,10 +530,9 @@ private:
     auto push_index(std::uint32_t idx) -> void {
         std::uint64_t head = m_free_head.load(std::memory_order_relaxed);
         for (;;) {
-            m_next[idx].store(static_cast<std::uint32_t>(head), std::memory_order_relaxed);  // link = head
+            m_next[idx].store(static_cast<std::uint32_t>(head), std::memory_order_relaxed); // link = head
             const std::uint64_t nh = (static_cast<std::uint64_t>(tag_of(head) + 1) << 32) | idx;
-            if (m_free_head.compare_exchange_weak(head, nh,
-                    std::memory_order_release, std::memory_order_relaxed)) {
+            if (m_free_head.compare_exchange_weak(head, nh, std::memory_order_release, std::memory_order_relaxed)) {
                 return;
             }
         }
@@ -560,11 +564,7 @@ private:
         // Return wrapper with a deleter that returns the slot to the pool and keeps
         // the pool alive (captures shared_ptr self). The deleter is invoked with the
         // buffer pointer, so it need not capture ptr.
-        return buffer_type(
-            ptr,
-            m_buffer_size,
-            [self = std::move(self)](T* p) { self->release(p); }
-        );
+        return buffer_type(ptr, m_buffer_size, [self = std::move(self)](T* p) { self->release(p); });
     }
 
     // ===== Member Variables =====

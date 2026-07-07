@@ -13,18 +13,16 @@
 #include <string>
 
 namespace cp = composite::properties;
-using composite::config;
 using composite::changes;
+using composite::config;
 using cp::config_type;
-using cp::property_set;
 using cp::json;
+using cp::property_set;
 
 struct net_cfg {
     std::string host{"0.0.0.0"};
     std::uint16_t port{5000};
-    COMPOSITE_FIELDS(net_cfg,
-        (host, runtime),
-        (port, runtime, range(1, 65535)));
+    COMPOSITE_FIELDS(net_cfg, (host, runtime), (port, runtime, range(1, 65535)));
 };
 
 // a second config with DISJOINT field names, to test cross-config reaction ordering.
@@ -35,7 +33,10 @@ struct proc_cfg {
 
 static int g_fails = 0;
 static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fails; }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what);
+        ++g_fails;
+    }
 }
 
 int main() {
@@ -57,7 +58,7 @@ int main() {
     cfg.validate([](const net_cfg& c) { return c.host == "127.0.0.1" || c.port >= 1024; },
                  "a non-loopback host requires port >= 1024");
 
-    ps.add_config(cfg, config_type::INITIALIZE);                       // host/port -> top-level (runtime attr)
+    ps.add_config(cfg, config_type::INITIALIZE); // host/port -> top-level (runtime attr)
     ps.add("rate", rate, config_type::RUNTIME).validate([](const double& r) { return r > 0.0; });
 
     // ---- encode flattens config fields next to the plain property ----
@@ -74,7 +75,7 @@ int main() {
         const json d = ps.apply(json::parse(R"({"port": 8080})"), config_type::RUNTIME);
         check(cfg->port == 8080, "single-field patch updates the struct (value synchronous)");
         check(on_apply_fires == 0, "B2: apply stages the reaction; it has not run yet");
-        ps.run_pending_reactions();  // worker loop-top / inline drain
+        ps.run_pending_reactions(); // worker loop-top / inline drain
         check(on_apply_fires == 1 && port_ch && !host_ch, "on_apply ran once on drain, scoped to port");
         check(seen_prev.port == 5000, "on_apply prev is the pre-change value");
         check(d.contains("port") && !d.contains("host") && !d.contains("rate"),
@@ -84,19 +85,20 @@ int main() {
     // ---- batch mixing config fields + a plain property in ONE apply ----
     {
         on_apply_fires = 0;
-        const json d = ps.apply(json::parse(R"({"host": "10.0.0.1", "port": 9000, "rate": 2.0})"),
-                                config_type::RUNTIME);
+        const json d =
+            ps.apply(json::parse(R"({"host": "10.0.0.1", "port": 9000, "rate": 2.0})"), config_type::RUNTIME);
         check(cfg->host == "10.0.0.1" && cfg->port == 9000 && rate == 2.0, "mixed batch applied");
         ps.run_pending_reactions();
         check(on_apply_fires == 1, "one config reaction for the whole batch (host+port in one struct diff)");
-        check(d.contains("host") && d.contains("port") && d.contains("rate"),
-              "diff carries all three at top level");
+        check(d.contains("host") && d.contains("port") && d.contains("rate"), "diff carries all three at top level");
     }
 
     // ---- cross-field invariant enforced on a single-field write; nothing mutates ----
     {
         bool threw = false;
-        try { ps.apply(json::parse(R"({"port": 500})"), config_type::RUNTIME); }  // host=10.0.0.1, 500 < 1024
+        try {
+            ps.apply(json::parse(R"({"port": 500})"), config_type::RUNTIME);
+        } // host=10.0.0.1, 500 < 1024
         catch (const cp::validation_error& e) {
             threw = true;
             check(std::string(e.what()).find("non-loopback host requires port") != std::string::npos,
@@ -108,14 +110,17 @@ int main() {
     // ---- atomic batch: one bad value rejects the whole batch, nothing commits ----
     {
         bool threw = false;
-        try { ps.apply(json::parse(R"({"port": 7000, "rate": -1.0})"), config_type::RUNTIME); }
-        catch (const cp::validation_error&) { threw = true; }
+        try {
+            ps.apply(json::parse(R"({"port": 7000, "rate": -1.0})"), config_type::RUNTIME);
+        } catch (const cp::validation_error&) {
+            threw = true;
+        }
         check(threw && cfg->port == 9000 && rate == 2.0, "rejection in a mixed batch mutates nothing");
     }
 
     // ---- single-name apply (the PUT .../properties/:name route) routes to the field ----
     {
-        const bool changed = ps.apply("port", json(1234), config_type::RUNTIME);  // host non-loopback, 1234 >= 1024
+        const bool changed = ps.apply("port", json(1234), config_type::RUNTIME); // host non-loopback, 1234 >= 1024
         check(changed && cfg->port == 1234, "single-name apply routes to the config field + commits the struct");
         const bool noop = ps.apply("port", json(1234), config_type::RUNTIME);
         check(!noop, "single-name apply reports no change on a no-op");
@@ -124,8 +129,11 @@ int main() {
     // ---- unknown top-level key is still rejected ----
     {
         bool threw = false;
-        try { ps.apply(json::parse(R"({"prt": 1})"), config_type::RUNTIME); }
-        catch (const cp::unknown_property&) { threw = true; }
+        try {
+            ps.apply(json::parse(R"({"prt": 1})"), config_type::RUNTIME);
+        } catch (const cp::unknown_property&) {
+            threw = true;
+        }
         check(threw, "unknown top-level key rejected");
     }
 
@@ -152,8 +160,12 @@ int main() {
         ps2.add_config(cfg2);
         double host_clash = 0;
         bool threw = false;
-        try { ps2.add("host", host_clash); }  // collides with config field "host"
-        catch (const std::logic_error&) { threw = true; }
+        try {
+            ps2.add("host", host_clash);
+        } // collides with config field "host"
+        catch (const std::logic_error&) {
+            threw = true;
+        }
         check(threw, "a plain property colliding with a config field name throws");
     }
 
@@ -165,15 +177,18 @@ int main() {
         std::string order;
         a.on_apply([&](const net_cfg&, const changes<net_cfg>&) { order += "A"; });
         b.on_apply([&](const proc_cfg&, const changes<proc_cfg>&) { order += "B"; });
-        ps2.add_config(a);   // registered first
-        ps2.add_config(b);   // registered second
+        ps2.add_config(a); // registered first
+        ps2.add_config(b); // registered second
         // one batch touching a field of each (disjoint names: port -> A, rate -> B)
         ps2.apply(json::parse(R"({"rate": 2.0, "port": 8080})"), config_type::RUNTIME);
-        ps2.run_pending_reactions();  // drain both staged reactions
+        ps2.run_pending_reactions(); // drain both staged reactions
         check(order == "AB", "config reactions fire in registration order (A before B), independent of pointers");
     }
 
-    if (g_fails != 0) { std::fprintf(stderr, "%d config-crux check(s) FAILED\n", g_fails); return 1; }
+    if (g_fails != 0) {
+        std::fprintf(stderr, "%d config-crux check(s) FAILED\n", g_fails);
+        return 1;
+    }
     std::puts("CONFIG<T> CRUX (property_set integration) TESTS PASSED");
     return 0;
 }

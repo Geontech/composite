@@ -48,10 +48,8 @@ auto parse_cpuset(const std::string& cpuset_str) -> cpu_set_t;
  * - Logical 2 -> Physical 51
  * - Logical 3 -> Physical 53
  */
-auto parse_affinity_config(
-    const std::string& affinity_str,
-    const std::vector<int>& available_cores
-) -> std::optional<cpu_set_t>;
+auto parse_affinity_config(const std::string& affinity_str, const std::vector<int>& available_cores)
+    -> std::optional<cpu_set_t>;
 
 /**
  * @brief Translate DPDK EAL args from logical to physical core indices
@@ -70,9 +68,7 @@ auto parse_affinity_config(
  * - "-l 0-3" or "-l 0,2,4"
  * - "--lcores (0-1)@(0-1)" is not translated (passed through as-is)
  */
-auto translate_dpdk_eal_args(
-    const std::vector<std::string>& eal_args,
-    const std::vector<int>& available_cores
-) -> std::pair<std::vector<std::string>, std::vector<int>>;
+auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std::vector<int>& available_cores)
+    -> std::pair<std::vector<std::string>, std::vector<int>>;
 
 } // namespace composite

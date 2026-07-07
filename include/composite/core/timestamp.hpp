@@ -2,7 +2,7 @@
  * Copyright (C) 2024-2025 Geon Technologies, LLC
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
- 
+
 #pragma once
 
 #include <chrono>
@@ -60,10 +60,9 @@ public:
      */
     auto operator-(const timestamp& other) const -> std::chrono::nanoseconds {
         // Calculate total nanoseconds for each timestamp
-        auto this_ns = static_cast<int64_t>(seconds) * 1'000'000'000LL +
-                       static_cast<int64_t>(picoseconds / 1000);
-        auto other_ns = static_cast<int64_t>(other.seconds) * 1'000'000'000LL +
-                        static_cast<int64_t>(other.picoseconds / 1000);
+        auto this_ns = static_cast<int64_t>(seconds) * 1'000'000'000LL + static_cast<int64_t>(picoseconds / 1000);
+        auto other_ns =
+            static_cast<int64_t>(other.seconds) * 1'000'000'000LL + static_cast<int64_t>(other.picoseconds / 1000);
 
         auto diff = this_ns - other_ns;
         return std::chrono::nanoseconds{diff};
@@ -76,8 +75,7 @@ public:
      * @return New timestamp with duration added
      */
     auto operator+(std::chrono::nanoseconds dur) const -> timestamp {
-        auto total_ns = static_cast<int64_t>(seconds) * 1'000'000'000LL +
-                        static_cast<int64_t>(picoseconds / 1000);
+        auto total_ns = static_cast<int64_t>(seconds) * 1'000'000'000LL + static_cast<int64_t>(picoseconds / 1000);
         total_ns += dur.count();
 
         if (total_ns < 0) {
@@ -93,9 +91,7 @@ public:
     /**
      * @brief Subtract a duration from this timestamp
      */
-    auto operator-(std::chrono::nanoseconds dur) const -> timestamp {
-        return *this + (-dur);
-    }
+    auto operator-(std::chrono::nanoseconds dur) const -> timestamp { return *this + (-dur); }
 
     // ========================================================================
     // std::chrono conversions
@@ -133,9 +129,7 @@ public:
     /**
      * @brief Get current system time as timestamp
      */
-    static auto now() -> timestamp {
-        return from_chrono(std::chrono::system_clock::now());
-    }
+    static auto now() -> timestamp { return from_chrono(std::chrono::system_clock::now()); }
 
     // ========================================================================
     // Validation and normalization
@@ -146,9 +140,7 @@ public:
      *
      * @return true if picoseconds < 1 second (1e12 picoseconds)
      */
-    auto is_valid() const -> bool {
-        return picoseconds < 1'000'000'000'000ULL;
-    }
+    auto is_valid() const -> bool { return picoseconds < 1'000'000'000'000ULL; }
 
     /**
      * @brief Normalize timestamp by moving excess picoseconds into seconds
@@ -173,9 +165,7 @@ public:
      *
      * @return String in format "seconds.picoseconds"
      */
-    auto to_string() const -> std::string {
-        return std::format("{}.{:012}", seconds, picoseconds);
-    }
+    auto to_string() const -> std::string { return std::format("{}.{:012}", seconds, picoseconds); }
 
 }; // class timestamp
 

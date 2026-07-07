@@ -46,5 +46,5 @@
  * @endcode
  */
 
-#include "types.hpp"
 #include "registry.hpp"
+#include "types.hpp"

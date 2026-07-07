@@ -2,7 +2,7 @@
  * Copyright (C) 2024-2025 Geon Technologies, LLC
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
- 
+
 #pragma once
 
 #include "port_base.hpp"
@@ -19,9 +19,7 @@ class port_set {
 public:
     using port_map_type = std::map<std::string, port_base*>;
 
-    auto add_port(port_base& port) -> void {
-        add_port(&port);
-    }
+    auto add_port(port_base& port) -> void { add_port(&port); }
 
     auto add_port(port_base* port) -> void {
         if (!port) {
@@ -31,13 +29,10 @@ public:
     }
 
     /**
-     * @brief Get port by name with type checking 
+     * @brief Get port by name with type checking
      */
     template <typename T>
-    requires (
-      std::is_base_of_v<input_port_base, T> ||
-      std::is_base_of_v<output_port_base, T>
-    )
+        requires(std::is_base_of_v<input_port_base, T> || std::is_base_of_v<output_port_base, T>)
     auto get_port(std::string_view name) -> T* {
         if (auto it = m_ports.find(std::string{name}); it != m_ports.end()) {
             if (auto* casted = dynamic_cast<T*>(it->second)) {
@@ -48,7 +43,7 @@ public:
     }
 
     /**
-     * @brief Query port mutability by name 
+     * @brief Query port mutability by name
      */
     auto is_mutable_port(std::string_view name) const -> std::optional<bool> {
         if (auto it = m_ports.find(std::string{name}); it != m_ports.end()) {
@@ -64,9 +59,7 @@ public:
         return std::nullopt;
     }
 
-    auto ports() const -> const port_map_type& {
-        return m_ports;
-    }
+    auto ports() const -> const port_map_type& { return m_ports; }
 
 private:
     port_map_type m_ports;

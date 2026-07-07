@@ -12,7 +12,7 @@ public:
     auto process() -> composite::retval override;
 
 private:
-    composite::input_port<composite::mutable_buffer<float>>  m_in{"data_in"};
+    composite::input_port<composite::mutable_buffer<float>> m_in{"data_in"};
     composite::output_port<composite::mutable_buffer<float>> m_out{"data_out"};
     float m_gain{1.0F};
 

@@ -19,10 +19,14 @@ auto passthrough_gain::process() -> composite::retval {
     // upstream closes and this ring drains, the base auto-FINISHes and forwards EOS — no manual
     // end-of-stream handling needed. (Override on_end_of_stream() only if you hold buffered state.)
     auto pkt = m_in.try_get();
-    if (!pkt) { return NOOP; }
+    if (!pkt) {
+        return NOOP;
+    }
     auto& [buffer, ts, metadata] = *pkt;
 
-    for (std::size_t i = 0; i < buffer.size(); ++i) { buffer[i] *= m_gain; }
+    for (std::size_t i = 0; i < buffer.size(); ++i) {
+        buffer[i] *= m_gain;
+    }
 
     // Metadata (if any) rides atomically with the packet as a shared immutable instance;
     // forwarding it is a refcount bump.

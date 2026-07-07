@@ -211,7 +211,7 @@ TEST_CASE("Histogram basic operations", "[metrics][histogram]") {
         REQUIRE(h.count() == 0);
         REQUIRE_THAT(h.sum(), WithinAbs(0.0, 0.001));
         auto counts = h.bucket_counts();
-        REQUIRE(counts.size() == 6);  // 5 boundaries + 1 overflow
+        REQUIRE(counts.size() == 6); // 5 boundaries + 1 overflow
         for (auto count : counts) {
             REQUIRE(count == 0);
         }
@@ -251,7 +251,7 @@ TEST_CASE("Histogram power-of-2 boundaries", "[metrics][histogram]") {
     auto bounds = histogram::power_of_2_boundaries(10);
 
     SECTION("Generates correct boundaries") {
-        REQUIRE(bounds.size() == 9);  // num_buckets - 1
+        REQUIRE(bounds.size() == 9); // num_buckets - 1
         REQUIRE_THAT(bounds[0], WithinAbs(1.0, 0.001));
         REQUIRE_THAT(bounds[1], WithinAbs(2.0, 0.001));
         REQUIRE_THAT(bounds[2], WithinAbs(4.0, 0.001));
@@ -300,54 +300,35 @@ TEST_CASE("Registry metric creation", "[metrics][registry]") {
     registry::instance().clear();
 
     SECTION("Create counter") {
-        auto& c = registry::instance().create_counter(
-            "test.counter",
-            "A test counter",
-            "1",
-            {{"component", "test"}}
-        );
+        auto& c = registry::instance().create_counter("test.counter", "A test counter", "1", {{"component", "test"}});
         c.inc();
         REQUIRE(c.value() == 1);
         REQUIRE(registry::instance().metric_count() == 1);
     }
 
     SECTION("Create updown_counter") {
-        auto& c = registry::instance().create_updown_counter(
-            "test.updown",
-            "A test updown counter"
-        );
+        auto& c = registry::instance().create_updown_counter("test.updown", "A test updown counter");
         c.add(5);
         c.dec();
         REQUIRE(c.value() == 4);
     }
 
     SECTION("Create gauge") {
-        auto& g = registry::instance().create_gauge(
-            "test.gauge",
-            "A test gauge"
-        );
+        auto& g = registry::instance().create_gauge("test.gauge", "A test gauge");
         g.set(3.14);
         REQUIRE_THAT(g.value(), WithinAbs(3.14, 0.001));
     }
 
     SECTION("Create histogram") {
-        auto& h = registry::instance().create_histogram(
-            "test.histogram",
-            "A test histogram",
-            "ms",
-            {1.0, 5.0, 10.0, 50.0, 100.0}
-        );
+        auto& h = registry::instance().create_histogram("test.histogram", "A test histogram", "ms",
+                                                        {1.0, 5.0, 10.0, 50.0, 100.0});
         h.record(7.5);
         REQUIRE(h.count() == 1);
     }
 
     SECTION("Create histogram with power-of-2 boundaries") {
-        auto& h = registry::instance().create_histogram_pow2(
-            "test.histogram_pow2",
-            "A test power-of-2 histogram",
-            "ns",
-            16
-        );
+        auto& h =
+            registry::instance().create_histogram_pow2("test.histogram_pow2", "A test power-of-2 histogram", "ns", 16);
         h.record(100);
         REQUIRE(h.count() == 1);
     }
@@ -357,23 +338,10 @@ TEST_CASE("Registry snapshot operations", "[metrics][registry]") {
     registry::instance().clear();
 
     // Create some metrics
-    auto& counter1 = registry::instance().create_counter(
-        "app.packets.sent",
-        "Packets sent",
-        "1",
-        {{"port", "eth0"}}
-    );
-    auto& counter2 = registry::instance().create_counter(
-        "app.packets.received",
-        "Packets received",
-        "1",
-        {{"port", "eth0"}}
-    );
-    auto& gauge1 = registry::instance().create_gauge(
-        "system.cpu.usage",
-        "CPU usage percentage",
-        "%"
-    );
+    auto& counter1 = registry::instance().create_counter("app.packets.sent", "Packets sent", "1", {{"port", "eth0"}});
+    auto& counter2 =
+        registry::instance().create_counter("app.packets.received", "Packets received", "1", {{"port", "eth0"}});
+    auto& gauge1 = registry::instance().create_gauge("system.cpu.usage", "CPU usage percentage", "%");
 
     counter1.add(100);
     counter2.add(200);
@@ -405,10 +373,8 @@ TEST_CASE("Registry observer registration", "[metrics][registry]") {
 
     SECTION("Observer is notified on metric creation") {
         auto observer_id = registry::instance().add_observer(
-            [&registered_names](const metric_metadata& meta, void*) {
-                registered_names.push_back(meta.name);
-            },
-            false  // Don't notify for existing metrics
+            [&registered_names](const metric_metadata& meta, void*) { registered_names.push_back(meta.name); },
+            false // Don't notify for existing metrics
         );
 
         registry::instance().create_counter("observed.counter1");
@@ -426,10 +392,8 @@ TEST_CASE("Registry observer registration", "[metrics][registry]") {
         registry::instance().create_gauge("existing.gauge");
 
         auto observer_id = registry::instance().add_observer(
-            [&registered_names](const metric_metadata& meta, void*) {
-                registered_names.push_back(meta.name);
-            },
-            true  // Notify for existing metrics
+            [&registered_names](const metric_metadata& meta, void*) { registered_names.push_back(meta.name); },
+            true // Notify for existing metrics
         );
 
         REQUIRE(registered_names.size() == 2);
@@ -575,7 +539,7 @@ TEST_CASE("Metric name sanitization", "[metrics][validation]") {
         // When sanitization changes the name, a hash suffix is appended
         auto result = sanitize_for_metric_name("my-component");
         REQUIRE(result.starts_with("my_component_"));
-        REQUIRE(result.size() == std::string("my_component_").size() + 16);  // 16 hex chars
+        REQUIRE(result.size() == std::string("my_component_").size() + 16); // 16 hex chars
     }
 
     SECTION("Leading digits get 'c' prefix plus hash") {
@@ -590,7 +554,7 @@ TEST_CASE("Metric name sanitization", "[metrics][validation]") {
         auto result2 = sanitize_for_metric_name("my_component");
         REQUIRE(result1 != result2);
         REQUIRE(result1.starts_with("my_component_"));
-        REQUIRE(result2 == "my_component");  // unchanged, no hash
+        REQUIRE(result2 == "my_component"); // unchanged, no hash
     }
 
     SECTION("Empty string returns 'unnamed'") {
@@ -633,40 +597,18 @@ TEST_CASE("Duplicate metric detection", "[metrics][registry][validation]") {
     registry::instance().clear();
 
     SECTION("Duplicate counter with same name and labels throws") {
-        registry::instance().create_counter(
-            "duplicate.test.counter",
-            "First counter",
-            "1",
-            {{"component", "test"}}
-        );
+        registry::instance().create_counter("duplicate.test.counter", "First counter", "1", {{"component", "test"}});
 
-        REQUIRE_THROWS_AS(
-            registry::instance().create_counter(
-                "duplicate.test.counter",
-                "Second counter",
-                "1",
-                {{"component", "test"}}
-            ),
-            duplicate_metric_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_counter("duplicate.test.counter", "Second counter", "1",
+                                                              {{"component", "test"}}),
+                          duplicate_metric_error);
     }
 
     SECTION("Counter with same name but different labels is allowed") {
-        registry::instance().create_counter(
-            "duplicate.label.counter",
-            "Counter for eth0",
-            "1",
-            {{"port", "eth0"}}
-        );
+        registry::instance().create_counter("duplicate.label.counter", "Counter for eth0", "1", {{"port", "eth0"}});
 
-        REQUIRE_NOTHROW(
-            registry::instance().create_counter(
-                "duplicate.label.counter",
-                "Counter for eth1",
-                "1",
-                {{"port", "eth1"}}
-            )
-        );
+        REQUIRE_NOTHROW(registry::instance().create_counter("duplicate.label.counter", "Counter for eth1", "1",
+                                                            {{"port", "eth1"}}));
 
         REQUIRE(registry::instance().metric_count() == 2);
     }
@@ -674,47 +616,28 @@ TEST_CASE("Duplicate metric detection", "[metrics][registry][validation]") {
     SECTION("Duplicate updown_counter throws") {
         registry::instance().create_updown_counter("duplicate.updown");
 
-        REQUIRE_THROWS_AS(
-            registry::instance().create_updown_counter("duplicate.updown"),
-            duplicate_metric_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_updown_counter("duplicate.updown"), duplicate_metric_error);
     }
 
     SECTION("Duplicate gauge throws") {
         registry::instance().create_gauge("duplicate.gauge");
 
-        REQUIRE_THROWS_AS(
-            registry::instance().create_gauge("duplicate.gauge"),
-            duplicate_metric_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_gauge("duplicate.gauge"), duplicate_metric_error);
     }
 
     SECTION("Duplicate histogram throws") {
-        registry::instance().create_histogram(
-            "duplicate.histogram",
-            "First histogram",
-            "ms",
-            {1.0, 10.0, 100.0}
-        );
+        registry::instance().create_histogram("duplicate.histogram", "First histogram", "ms", {1.0, 10.0, 100.0});
 
         REQUIRE_THROWS_AS(
-            registry::instance().create_histogram(
-                "duplicate.histogram",
-                "Second histogram",
-                "ms",
-                {1.0, 10.0, 100.0}
-            ),
-            duplicate_metric_error
-        );
+            registry::instance().create_histogram("duplicate.histogram", "Second histogram", "ms", {1.0, 10.0, 100.0}),
+            duplicate_metric_error);
     }
 
     SECTION("Duplicate histogram_pow2 throws") {
         registry::instance().create_histogram_pow2("duplicate.histogram_pow2");
 
-        REQUIRE_THROWS_AS(
-            registry::instance().create_histogram_pow2("duplicate.histogram_pow2"),
-            duplicate_metric_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_histogram_pow2("duplicate.histogram_pow2"),
+                          duplicate_metric_error);
     }
 
     SECTION("Different metric types with same name are allowed") {
@@ -728,34 +651,20 @@ TEST_CASE("Duplicate metric detection", "[metrics][registry][validation]") {
 
     SECTION("Labels in different order are treated as same metric") {
         // First creation with labels in one order
-        auto& c1 = registry::instance().create_counter(
-            "label_order.test",
-            "Test counter",
-            "1",
-            {{"b", "2"}, {"a", "1"}}
-        );
+        auto& c1 =
+            registry::instance().create_counter("label_order.test", "Test counter", "1", {{"b", "2"}, {"a", "1"}});
         c1.add(10);
 
         // Attempt to create with same labels in different order should throw
-        REQUIRE_THROWS_AS(
-            registry::instance().create_counter(
-                "label_order.test",
-                "Same counter different label order",
-                "1",
-                {{"a", "1"}, {"b", "2"}}
-            ),
-            duplicate_metric_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_counter("label_order.test", "Same counter different label order",
+                                                              "1", {{"a", "1"}, {"b", "2"}}),
+                          duplicate_metric_error);
 
         // get_or_create with different order should return the same counter
-        auto& c2 = registry::instance().get_or_create_counter(
-            "label_order.test",
-            "ignored",
-            "ignored",
-            {{"a", "1"}, {"b", "2"}}
-        );
-        REQUIRE(c2.value() == 10);  // Same counter, should have our added value
-        REQUIRE(&c1 == &c2);  // Same object
+        auto& c2 = registry::instance().get_or_create_counter("label_order.test", "ignored", "ignored",
+                                                              {{"a", "1"}, {"b", "2"}});
+        REQUIRE(c2.value() == 10); // Same counter, should have our added value
+        REQUIRE(&c1 == &c2);       // Same object
     }
 }
 
@@ -763,29 +672,16 @@ TEST_CASE("Invalid metric name is caught by registry", "[metrics][registry][vali
     registry::instance().clear();
 
     SECTION("Invalid counter name throws") {
-        REQUIRE_THROWS_AS(
-            registry::instance().create_counter("1invalid"),
-            invalid_metric_name_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_counter("1invalid"), invalid_metric_name_error);
     }
 
     SECTION("Invalid gauge name throws") {
-        REQUIRE_THROWS_AS(
-            registry::instance().create_gauge("invalid..name"),
-            invalid_metric_name_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_gauge("invalid..name"), invalid_metric_name_error);
     }
 
     SECTION("Invalid histogram name throws") {
-        REQUIRE_THROWS_AS(
-            registry::instance().create_histogram(
-                "invalid-name",
-                "Description",
-                "ms",
-                {1.0, 10.0}
-            ),
-            invalid_metric_name_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_histogram("invalid-name", "Description", "ms", {1.0, 10.0}),
+                          invalid_metric_name_error);
     }
 }
 
@@ -829,12 +725,10 @@ TEST_CASE("Get-or-create returns existing metric", "[metrics][registry][get_or_c
     }
 
     SECTION("get_or_create_histogram returns existing") {
-        auto& h1 = registry::instance().get_or_create_histogram(
-            "goc.histogram", "desc", "ms", {1.0, 10.0, 100.0});
+        auto& h1 = registry::instance().get_or_create_histogram("goc.histogram", "desc", "ms", {1.0, 10.0, 100.0});
         h1.record(50.0);
 
-        auto& h2 = registry::instance().get_or_create_histogram(
-            "goc.histogram", "ignored", "ignored", {999.0});
+        auto& h2 = registry::instance().get_or_create_histogram("goc.histogram", "ignored", "ignored", {999.0});
 
         REQUIRE(&h1 == &h2);
         REQUIRE(h2.count() == 1);
@@ -865,10 +759,8 @@ TEST_CASE("Get-or-create creates new metric when not exists", "[metrics][registr
     }
 
     SECTION("Different labels create different metrics") {
-        auto& c1 = registry::instance().get_or_create_counter(
-            "labeled.counter", "desc", "1", {{"env", "prod"}});
-        auto& c2 = registry::instance().get_or_create_counter(
-            "labeled.counter", "desc", "1", {{"env", "dev"}});
+        auto& c1 = registry::instance().get_or_create_counter("labeled.counter", "desc", "1", {{"env", "prod"}});
+        auto& c2 = registry::instance().get_or_create_counter("labeled.counter", "desc", "1", {{"env", "dev"}});
 
         REQUIRE(&c1 != &c2);
         REQUIRE(registry::instance().metric_count() == 2);
@@ -879,10 +771,7 @@ TEST_CASE("Get-or-create validates names", "[metrics][registry][get_or_create][v
     registry::instance().clear();
 
     SECTION("Invalid name throws even for get_or_create") {
-        REQUIRE_THROWS_AS(
-            registry::instance().get_or_create_counter("1invalid"),
-            invalid_metric_name_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().get_or_create_counter("1invalid"), invalid_metric_name_error);
     }
 }
 
@@ -904,39 +793,21 @@ TEST_CASE("Label key validation", "[metrics][validation][labels]") {
     }
 
     SECTION("Empty label key throws") {
-        REQUIRE_THROWS_AS(
-            validate_labels({{"", "value"}}),
-            invalid_label_error
-        );
+        REQUIRE_THROWS_AS(validate_labels({{"", "value"}}), invalid_label_error);
     }
 
     SECTION("Label key starting with number throws") {
-        REQUIRE_THROWS_AS(
-            validate_labels({{"1component", "test"}}),
-            invalid_label_error
-        );
+        REQUIRE_THROWS_AS(validate_labels({{"1component", "test"}}), invalid_label_error);
     }
 
     SECTION("Label key starting with underscore throws") {
-        REQUIRE_THROWS_AS(
-            validate_labels({{"_component", "test"}}),
-            invalid_label_error
-        );
+        REQUIRE_THROWS_AS(validate_labels({{"_component", "test"}}), invalid_label_error);
     }
 
     SECTION("Label key with invalid characters throws") {
-        REQUIRE_THROWS_AS(
-            validate_labels({{"component-name", "test"}}),
-            invalid_label_error
-        );
-        REQUIRE_THROWS_AS(
-            validate_labels({{"component.name", "test"}}),
-            invalid_label_error
-        );
-        REQUIRE_THROWS_AS(
-            validate_labels({{"component name", "test"}}),
-            invalid_label_error
-        );
+        REQUIRE_THROWS_AS(validate_labels({{"component-name", "test"}}), invalid_label_error);
+        REQUIRE_THROWS_AS(validate_labels({{"component.name", "test"}}), invalid_label_error);
+        REQUIRE_THROWS_AS(validate_labels({{"component name", "test"}}), invalid_label_error);
     }
 
     SECTION("Empty label value is valid") {
@@ -944,10 +815,7 @@ TEST_CASE("Label key validation", "[metrics][validation][labels]") {
     }
 
     SECTION("Multiple labels are all validated") {
-        REQUIRE_THROWS_AS(
-            validate_labels({{"valid", "value"}, {"1invalid", "value"}}),
-            invalid_label_error
-        );
+        REQUIRE_THROWS_AS(validate_labels({{"valid", "value"}, {"1invalid", "value"}}), invalid_label_error);
     }
 }
 
@@ -956,51 +824,26 @@ TEST_CASE("Registry validates labels on metric creation", "[metrics][registry][v
 
     SECTION("Invalid label on counter throws") {
         REQUIRE_THROWS_AS(
-            registry::instance().create_counter(
-                "label.test.counter",
-                "Test counter",
-                "1",
-                {{"1invalid", "value"}}
-            ),
-            invalid_label_error
-        );
+            registry::instance().create_counter("label.test.counter", "Test counter", "1", {{"1invalid", "value"}}),
+            invalid_label_error);
     }
 
     SECTION("Invalid label on gauge throws") {
         REQUIRE_THROWS_AS(
-            registry::instance().create_gauge(
-                "label.test.gauge",
-                "Test gauge",
-                "1",
-                {{"invalid-key", "value"}}
-            ),
-            invalid_label_error
-        );
+            registry::instance().create_gauge("label.test.gauge", "Test gauge", "1", {{"invalid-key", "value"}}),
+            invalid_label_error);
     }
 
     SECTION("Invalid label on histogram throws") {
-        REQUIRE_THROWS_AS(
-            registry::instance().create_histogram(
-                "label.test.histogram",
-                "Test histogram",
-                "ms",
-                {1.0, 10.0},
-                {{"_invalid", "value"}}
-            ),
-            invalid_label_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_histogram("label.test.histogram", "Test histogram", "ms",
+                                                                {1.0, 10.0}, {{"_invalid", "value"}}),
+                          invalid_label_error);
     }
 
     SECTION("Invalid label on get_or_create also throws") {
         REQUIRE_THROWS_AS(
-            registry::instance().get_or_create_counter(
-                "label.goc.counter",
-                "Test",
-                "1",
-                {{"invalid.key", "value"}}
-            ),
-            invalid_label_error
-        );
+            registry::instance().get_or_create_counter("label.goc.counter", "Test", "1", {{"invalid.key", "value"}}),
+            invalid_label_error);
     }
 }
 
@@ -1016,20 +859,14 @@ TEST_CASE("Error handler for observer failures", "[metrics][registry][error_hand
 
     SECTION("Error handler is called when observer throws") {
         // Set up error handler
-        registry::instance().set_error_handler(
-            [&](std::size_t id, const std::string& name, std::exception_ptr) {
-                error_ids.push_back(id);
-                error_names.push_back(name);
-            }
-        );
+        registry::instance().set_error_handler([&](std::size_t id, const std::string& name, std::exception_ptr) {
+            error_ids.push_back(id);
+            error_names.push_back(name);
+        });
 
         // Add a throwing observer
         auto observer_id = registry::instance().add_observer(
-            [](const metric_metadata&, void*) {
-                throw std::runtime_error("Observer error");
-            },
-            false
-        );
+            [](const metric_metadata&, void*) { throw std::runtime_error("Observer error"); }, false);
 
         // Create a metric - should not throw, but error handler should be called
         REQUIRE_NOTHROW(registry::instance().create_counter("error.test.counter"));
@@ -1049,11 +886,7 @@ TEST_CASE("Error handler for observer failures", "[metrics][registry][error_hand
 
         // Add a throwing observer
         auto observer_id = registry::instance().add_observer(
-            [](const metric_metadata&, void*) {
-                throw std::runtime_error("Observer error");
-            },
-            false
-        );
+            [](const metric_metadata&, void*) { throw std::runtime_error("Observer error"); }, false);
 
         // Create a metric - should not throw (error is silently ignored)
         REQUIRE_NOTHROW(registry::instance().create_counter("silent.error.counter"));
@@ -1079,10 +912,7 @@ TEST_CASE("Metric limit enforcement", "[metrics][registry][limits]") {
         REQUIRE_NOTHROW(registry::instance().create_updown_counter("limit.updown1"));
 
         // Fourth metric should fail
-        REQUIRE_THROWS_AS(
-            registry::instance().create_counter("limit.counter2"),
-            metric_limit_exceeded_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().create_counter("limit.counter2"), metric_limit_exceeded_error);
 
         // Reset limit to default for other tests
         registry::instance().set_max_metrics(registry::DEFAULT_MAX_METRICS);
@@ -1093,9 +923,7 @@ TEST_CASE("Metric limit enforcement", "[metrics][registry][limits]") {
 
         // Should be able to create many metrics
         for (int i = 0; i < 100; ++i) {
-            REQUIRE_NOTHROW(
-                registry::instance().create_counter("unlimited.counter" + std::to_string(i))
-            );
+            REQUIRE_NOTHROW(registry::instance().create_counter("unlimited.counter" + std::to_string(i)));
         }
 
         // Reset limit to default for other tests
@@ -1109,15 +937,10 @@ TEST_CASE("Metric limit enforcement", "[metrics][registry][limits]") {
         registry::instance().create_counter("limit.existing2");
 
         // get_or_create for existing metric should succeed even at limit
-        REQUIRE_NOTHROW(
-            registry::instance().get_or_create_counter("limit.existing1")
-        );
+        REQUIRE_NOTHROW(registry::instance().get_or_create_counter("limit.existing1"));
 
         // But creating a new one should fail
-        REQUIRE_THROWS_AS(
-            registry::instance().get_or_create_counter("limit.new"),
-            metric_limit_exceeded_error
-        );
+        REQUIRE_THROWS_AS(registry::instance().get_or_create_counter("limit.new"), metric_limit_exceeded_error);
 
         registry::instance().set_max_metrics(registry::DEFAULT_MAX_METRICS);
     }
@@ -1202,10 +1025,7 @@ TEST_CASE("Deregistration observer notifications", "[metrics][registry][removal]
     SECTION("Observer is called when metric is removed") {
         std::vector<std::string> removed_names;
         auto observer_id = registry::instance().add_deregistration_observer(
-            [&](const metric_metadata& meta) {
-                removed_names.push_back(meta.name);
-            }
-        );
+            [&](const metric_metadata& meta) { removed_names.push_back(meta.name); });
 
         registry::instance().create_counter("observer.test1");
         registry::instance().create_counter("observer.test2");
@@ -1220,10 +1040,7 @@ TEST_CASE("Deregistration observer notifications", "[metrics][registry][removal]
     SECTION("Observer is called for bulk removal") {
         std::vector<std::string> removed_names;
         auto observer_id = registry::instance().add_deregistration_observer(
-            [&](const metric_metadata& meta) {
-                removed_names.push_back(meta.name);
-            }
-        );
+            [&](const metric_metadata& meta) { removed_names.push_back(meta.name); });
 
         registry::instance().create_counter("bulk.a");
         registry::instance().create_counter("bulk.b");

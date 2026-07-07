@@ -16,8 +16,8 @@
 using namespace composite;
 
 int main() {
-    constexpr std::size_t CAP = 64;     // buffers in the pool
-    constexpr std::size_t ELEMS = 16;   // floats per buffer (slot >= 64B holds the link)
+    constexpr std::size_t CAP = 64;   // buffers in the pool
+    constexpr std::size_t ELEMS = 16; // floats per buffer (slot >= 64B holds the link)
     constexpr int THREADS = 8;
     constexpr std::uint64_t PER_THREAD = 200000;
 
@@ -32,29 +32,39 @@ int main() {
             std::uint64_t ops = 0;
             for (std::uint64_t i = 0; i < PER_THREAD; ++i) {
                 auto buf = pool->acquire();
-                if (!buf) { continue; }                 // pool momentarily empty
-                (*buf)[0] = id;                          // stamp ownership
-                for (int s = 0; s < 4; ++s) { asm volatile("" ::: "memory"); } // brief hold (widens the race window without -Wvolatile)
-                if ((*buf)[0] != id) { bad.store(true, std::memory_order_relaxed); }  // double-alloc!
+                if (!buf) {
+                    continue;
+                } // pool momentarily empty
+                (*buf)[0] = id; // stamp ownership
+                for (int s = 0; s < 4; ++s) {
+                    asm volatile("" ::: "memory");
+                } // brief hold (widens the race window without -Wvolatile)
+                if ((*buf)[0] != id) {
+                    bad.store(true, std::memory_order_relaxed);
+                } // double-alloc!
                 ++ops;
                 // buf released here (lock-free push back to the pool)
             }
             total_ops.fetch_add(ops, std::memory_order_relaxed);
         });
     }
-    for (auto& th : ts) { th.join(); }
+    for (auto& th : ts) {
+        th.join();
+    }
 
-    if (bad.load()) { std::puts("FAIL: double-allocation / torn ownership stamp"); return 1; }
+    if (bad.load()) {
+        std::puts("FAIL: double-allocation / torn ownership stamp");
+        return 1;
+    }
     if (pool->outstanding() != 0) {
         std::printf("FAIL: outstanding=%zu after all released\n", pool->outstanding());
         return 1;
     }
     if (pool->available() != CAP) {
-        std::printf("FAIL: available=%zu expected capacity=%zu (lost buffers)\n",
-                    pool->available(), CAP);
+        std::printf("FAIL: available=%zu expected capacity=%zu (lost buffers)\n", pool->available(), CAP);
         return 1;
     }
-    std::printf("SLAB_POOL lock-free OK: %d threads, %llu ops, outstanding=0, available=%zu/%zu\n",
-                THREADS, (unsigned long long)total_ops.load(), pool->available(), CAP);
+    std::printf("SLAB_POOL lock-free OK: %d threads, %llu ops, outstanding=0, available=%zu/%zu\n", THREADS,
+                (unsigned long long)total_ops.load(), pool->available(), CAP);
     return 0;
 }

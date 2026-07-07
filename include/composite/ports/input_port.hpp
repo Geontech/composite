@@ -7,7 +7,7 @@
 
 #include "composite/buffers/buffer.hpp"
 #include "composite/core/metadata.hpp"
-#include "composite/core/park.hpp"  // doorbell: signal the consumer worker on the empty->non-empty edge
+#include "composite/core/park.hpp" // doorbell: signal the consumer worker on the empty->non-empty edge
 #include "composite/core/timestamp.hpp"
 #include "port_base.hpp"
 
@@ -26,13 +26,17 @@ namespace composite {
 
 /// Trait: is @c Buf a mutable_buffer<T>? Reports a port's mutability without two
 /// separate input_port specializations.
-template <typename> struct is_mutable_buffer : std::false_type {};
-template <typename T> struct is_mutable_buffer<mutable_buffer<T>> : std::true_type {};
+template <typename>
+struct is_mutable_buffer : std::false_type {};
+template <typename T>
+struct is_mutable_buffer<mutable_buffer<T>> : std::true_type {};
 
 namespace detail {
 inline auto round_up_pow2(std::size_t n) -> std::size_t {
     std::size_t p = 1;
-    while (p < n) { p <<= 1; }
+    while (p < n) {
+        p <<= 1;
+    }
     return p;
 }
 } // namespace detail
@@ -67,9 +71,8 @@ public:
     using queue_type = std::tuple<buffer_type, timestamp, composite::metadata_ptr>;
 
     /// @param name Port name. @param depth Initial queue depth (also sizes the ring).
-    explicit input_port(std::string_view name, std::size_t depth = 1024)
-        : input_port_base(name) {
-        this->depth(depth);  // sizes the ring (empty) + sets the soft limit
+    explicit input_port(std::string_view name, std::size_t depth = 1024) : input_port_base(name) {
+        this->depth(depth); // sizes the ring (empty) + sets the soft limit
     }
 
     ~input_port() override = default;
@@ -83,16 +86,15 @@ public:
     /// just adjusts the limit and never reallocates a live ring.
     auto depth(std::size_t value) -> void override {
         const std::size_t want = detail::round_up_pow2(value == 0 ? 1 : value);
-        if (want > m_ring.size()
-            && m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_acquire)) {
-            m_ring = std::vector<queue_type>(want);  // default-construct slots (queue_type is move-only)
+        if (want > m_ring.size() && m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_acquire)) {
+            m_ring = std::vector<queue_type>(want); // default-construct slots (queue_type is move-only)
             m_mask = want - 1;
             m_head.store(0, std::memory_order_relaxed);
             m_tail.store(0, std::memory_order_relaxed);
         }
-        input_port_base::depth(value);  // soft limit + capacity gauge
+        input_port_base::depth(value); // soft limit + capacity gauge
     }
-    using input_port_base::depth;  // keep the const getter overload visible
+    using input_port_base::depth; // keep the const getter overload visible
 
     /// Try-pop that distinguishes an EMPTY ring (returns std::nullopt) from a REAL packet (returns
     /// the packet, even one carrying a zero-length buffer) — resolving the size-0 ambiguity that
@@ -100,7 +102,9 @@ public:
     /// return NOOP to idle on the doorbell (the base auto-FINISHes at end-of-stream). Single-consumer:
     /// pending()>0 guarantees pop() yields the slot.
     [[nodiscard]] auto try_get() -> std::optional<queue_type> {
-        if (pending() == 0) { return std::nullopt; }
+        if (pending() == 0) {
+            return std::nullopt;
+        }
         return pop();
     }
 
@@ -113,8 +117,8 @@ public:
     /// advance for the whole batch (amortizes the release fence + cache-line bounce
     /// across the batch). @return number of packets moved into @p out. Consumer-side.
     auto get_batch(std::span<queue_type> out) -> std::size_t {
-        const auto head = m_head.load(std::memory_order_relaxed);  // consumer-owned
-        const auto tail = m_tail.load(std::memory_order_acquire);  // observe producer
+        const auto head = m_head.load(std::memory_order_relaxed); // consumer-owned
+        const auto tail = m_tail.load(std::memory_order_acquire); // observe producer
         const std::size_t avail = static_cast<std::size_t>(tail - head);
         const std::size_t k = avail < out.size() ? avail : out.size();
         // reverse doorbell: was the ring full before this drain? (see pop() — consumer owns
@@ -122,7 +126,7 @@ public:
         auto* producer_doorbell = m_producer_doorbell.load(std::memory_order_acquire);
         bool was_full = false;
         if (producer_doorbell != nullptr && k != 0) {
-            const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+            const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
             was_full = avail >= cap;
         }
         std::size_t bytes = 0;
@@ -131,11 +135,11 @@ public:
             bytes += std::get<0>(out[i]).size() * sizeof(value_type);
         }
         if (k != 0) {
-            m_head.store(head + k, std::memory_order_release);  // one publish for the batch
-            m_stats.record_transfer(bytes, k);  // k packets, not 1 — keeps packets_transferred / drop_rate accurate
+            m_head.store(head + k, std::memory_order_release); // one publish for the batch
+            m_stats.record_transfer(bytes, k); // k packets, not 1 — keeps packets_transferred / drop_rate accurate
             update_queue_depth_metric(static_cast<std::size_t>(tail - (head + k)));
             if (was_full) {
-                producer_doorbell->signal_data();  // wake an AWAIT_OUTPUT producer (see pop())
+                producer_doorbell->signal_data(); // wake an AWAIT_OUTPUT producer (see pop())
             }
         }
         return k;
@@ -155,29 +159,30 @@ public:
         }
     }
     auto is_full() const -> bool override {
-        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
         return size() >= cap;
     }
     auto available_capacity() const -> std::size_t override {
-        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
         const auto s = size();
         return s >= cap ? 0 : cap - s;
     }
 
 private:
-    template<typename> friend class output_port;
+    template <typename>
+    friend class output_port;
 
     /// Producer side (single thread). Enqueue or drop-if-full.
     auto add_data(buffer_type data, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
-        const auto tail = m_tail.load(std::memory_order_relaxed);   // only the producer writes tail
-        const auto head = m_head.load(std::memory_order_acquire);   // observe consumer progress
+        const auto tail = m_tail.load(std::memory_order_relaxed); // only the producer writes tail
+        const auto head = m_head.load(std::memory_order_acquire); // observe consumer progress
         // Clamp the effective limit to the PHYSICAL ring capacity. depth() is a
         // soft limit that can be raised at runtime above the ring size (the ring
         // only grows while empty); without this clamp, a raised depth lets the
         // producer lap and overwrite unread slots — silent data loss, and a
         // read/write race with the consumer's pop().
         const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();
-        if (tail - head >= cap) {                                   // full (or paused: depth()==0)
+        if (tail - head >= cap) { // full (or paused: depth()==0)
             record_drop();
             return;
         }
@@ -224,14 +229,14 @@ private:
         const auto tail = m_tail.load(std::memory_order_relaxed);
         const auto head = m_head.load(std::memory_order_acquire);
         const auto cur = tail - head;
-        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // clamp to ring capacity
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // clamp to ring capacity
         const std::size_t room = cap > cur ? static_cast<std::size_t>(cap - cur) : 0;
         const std::size_t k = room < in.size() ? room : in.size();
         for (std::size_t i = 0; i < k; ++i) {
             m_ring[(tail + i) & m_mask] = std::move(in[i]);
         }
         if (k != 0) {
-            m_tail.store(tail + k, std::memory_order_release);  // one publish for the batch
+            m_tail.store(tail + k, std::memory_order_release); // one publish for the batch
             update_queue_depth_metric(tail + k - head);
             // doorbell: empty->non-empty edge via a FRESH head re-load (see add_data for
             // why the entry head is stale). fresh_head == tail (the pre-batch index) means
@@ -241,15 +246,19 @@ private:
                 m_doorbell->signal_data();
             }
         }
-        for (std::size_t i = k; i < in.size(); ++i) { record_drop(); }  // overflow
+        for (std::size_t i = k; i < in.size(); ++i) {
+            record_drop();
+        } // overflow
         return k;
     }
 
     /// Consumer side (single thread). Try-pop; empty packet if the ring is empty.
     auto pop() -> queue_type {
-        const auto head = m_head.load(std::memory_order_relaxed);   // only the consumer writes head
-        const auto tail = m_tail.load(std::memory_order_acquire);   // observe producer publication
-        if (head == tail) { return {}; }                            // empty
+        const auto head = m_head.load(std::memory_order_relaxed); // only the consumer writes head
+        const auto tail = m_tail.load(std::memory_order_acquire); // observe producer publication
+        if (head == tail) {
+            return {};
+        } // empty
         // reverse doorbell: was the ring FULL before this pop? (consumer owns head -> fresh;
         // tail is acquire-loaded, and a stale-low tail can only UNDER-report full, never falsely
         // report it.) If so, this pop is the full->not-full edge — the moment to wake an
@@ -258,7 +267,7 @@ private:
         auto* producer_doorbell = m_producer_doorbell.load(std::memory_order_acquire);
         bool was_full = false;
         if (producer_doorbell != nullptr) {
-            const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+            const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
             was_full = (tail - head) >= cap;
         }
         queue_type result = std::move(m_ring[head & m_mask]);
@@ -266,7 +275,8 @@ private:
         // this new head and then overwrites the slot one lap later.
         m_head.store(head + 1, std::memory_order_release);
         const auto& [buffer, ts_val, md] = result;
-        (void)ts_val; (void)md;
+        (void)ts_val;
+        (void)md;
         m_stats.record_transfer(buffer.size() * sizeof(value_type));
         update_queue_depth_metric(tail - (head + 1));
         // signal_data() fences then bails lock-free unless the producer is armed (i.e. actually
@@ -282,14 +292,16 @@ private:
         m_stats.record_drop();
         // Overflow callback is configured at setup; lock guards a runtime re-set.
         const auto lock = std::scoped_lock{m_mtx};
-        if (m_overflow_callback) { m_overflow_callback(1); }
+        if (m_overflow_callback) {
+            m_overflow_callback(1);
+        }
     }
 
-    static constexpr std::size_t k_cacheline = 64;  ///< keep producer/consumer indices off one line
-    std::vector<queue_type> m_ring;   ///< ring storage; size is a power of two
-    std::size_t m_mask{0};            ///< size - 1 (index mask)
-    alignas(k_cacheline) std::atomic<std::size_t> m_head{0};  ///< consumer index (consumer writes)
-    alignas(k_cacheline) std::atomic<std::size_t> m_tail{0};  ///< producer index (producer writes)
+    static constexpr std::size_t k_cacheline = 64;           ///< keep producer/consumer indices off one line
+    std::vector<queue_type> m_ring;                          ///< ring storage; size is a power of two
+    std::size_t m_mask{0};                                   ///< size - 1 (index mask)
+    alignas(k_cacheline) std::atomic<std::size_t> m_head{0}; ///< consumer index (consumer writes)
+    alignas(k_cacheline) std::atomic<std::size_t> m_tail{0}; ///< producer index (producer writes)
 
 }; // class input_port<Buf>
 
