@@ -56,10 +56,16 @@ build:test:
 # Build the documented option combinations so the optional-feature paths
 # (OpenSSL / OpenTelemetry, etc.) don't rot. DPDK is its own job below (it pulls
 # libdpdk via pkg-config, which the base gcc image doesn't carry).
+# OpenTelemetry: trixie's opentelemetry-cpp-dev config find_dependency()s absl,
+# protobuf, curl and gRPC (incl. the grpc_cpp_plugin binary), so all of them must
+# be present for configure to succeed. libssl-dev ships in the base image.
 build:options-matrix:
   stage: build
-  extends: .gcc
-  allow_failure: true   # flip off once each option's deps are provisioned in the image
+  image: gcc:14
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake git nlohmann-json3-dev
+        opentelemetry-cpp-dev libabsl-dev libprotobuf-dev libcurl4-openssl-dev
+        libgrpc++-dev protobuf-compiler-grpc
   parallel:
     matrix:
       - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
@@ -74,12 +80,11 @@ build:options-matrix:
 # EAL-free bookkeeping/locking it delegates to (port_registry) is already unit- and
 # TSan-tested in build:test / sanitize:* without a NIC, so this job only needs to
 # COMPILE the EAL adapter, not run it (no NIC in CI). pkg_check_modules(libdpdk)
-# resolves against libdpdk-dev's pkg-config file. allow_failure until a runner image
-# carries libdpdk-dev — flip it off then so the manager can't silently rot.
+# resolves against libdpdk-dev's pkg-config file (installed below), so this gate is
+# mandatory — the manager can't silently rot.
 build:dpdk:
   stage: build
   image: gcc:14
-  allow_failure: true
   before_script:
     - apt-get update -qq && apt-get install -y -qq cmake git pkg-config libdpdk-dev nlohmann-json3-dev
     - cmake --version && pkg-config --modversion libdpdk

@@ -82,7 +82,10 @@ target_link_libraries(composite
     PRIVATE spdlog::spdlog_header_only)
 
 if(COMPOSITE_USE_DPDK)
-    target_include_directories(composite PRIVATE ${DPDK_INCLUDE_DIRS})
+    # SYSTEM: DPDK's headers are C headers full of GNU extensions (anonymous structs,
+    # flexible array members, volatile ++) that are never clean under -Wpedantic C++;
+    # -isystem suppresses third-party diagnostics so -Werror only gates OUR code.
+    target_include_directories(composite SYSTEM PRIVATE ${DPDK_INCLUDE_DIRS})
     target_compile_definitions(composite PUBLIC COMPOSITE_USE_DPDK=1)
     target_link_libraries(composite PRIVATE ${DPDK_LIBRARIES})
     target_link_directories(composite PRIVATE ${DPDK_LIBRARY_DIRS})

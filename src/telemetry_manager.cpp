@@ -488,8 +488,9 @@ auto manager::shutdown() -> void {
         m_impl->instruments.clear();  // unique_ptr contexts are automatically deleted
     }
 
-    // Reset meter
-    m_impl->meter.reset();
+    // Reset meter. Assignment, not .reset(): nostd::shared_ptr only grew reset() in newer
+    // opentelemetry-cpp releases, and this must compile against distro packages (1.19).
+    m_impl->meter = opentelemetry::nostd::shared_ptr<otel_metrics::Meter>{};
 
     // Replace global provider with noop to flush pending exports
     opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> noop_provider(
