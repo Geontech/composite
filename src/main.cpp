@@ -7,7 +7,6 @@
 #include "composite/util/cpu_affinity.hpp"
 #include "composite/version.hpp"
 #include "helpers.hpp"
-#include "property_changeset.hpp"
 
 #ifdef COMPOSITE_USE_DPDK
 #include "composite/dpdk/manager.hpp"
@@ -20,6 +19,7 @@
 #include <argparse/argparse.hpp>
 #include <atomic>
 #include <csignal>
+#include <ctime>
 #include <dlfcn.h>
 #include <filesystem>
 #include <format>
@@ -30,6 +30,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -38,13 +39,12 @@ namespace composite {
 #ifdef COMPOSITE_USE_OPENSSL
 auto make_server(
   application&,
-  composite::component_handles_type&,
   const std::string&,
   const std::string&,
   const std::string&
 ) -> std::unique_ptr<httplib::Server>;
 #else
-auto make_server(application&, composite::component_handles_type&) -> std::unique_ptr<httplib::Server>;
+auto make_server(application&) -> std::unique_ptr<httplib::Server>;
 #endif
 
 } // namespace composite
@@ -53,7 +53,7 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // Argument Parsing
     // ========================================
-    auto program = argparse::ArgumentParser{"composite-cli", VERSION};
+    auto program = argparse::ArgumentParser{"composite-cli", COMPOSITE_VERSION};
     program.add_argument("config-file")
       .help("application configuration file");
     program.add_argument("-s", "--server")
@@ -106,8 +106,8 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // Logging Configuration
     // ========================================
-    auto level = spdlog::level::from_str(program.get<std::string>("--log-level"));
-    spdlog::set_level(level);
+    auto level = composite::log_level_from_string(program.get<std::string>("--log-level"));
+    composite::set_global_log_level(level);
 
     // ========================================
     // CPU Affinity Capture
@@ -176,7 +176,12 @@ auto main(int argc, char** argv) -> int {
         // Initialize DPDK (best effort; uses config if present)
         auto dpdk_cfg = composite::dpdk::config{};
         if (app_json.contains("dpdk")) {
-            dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
+            try {
+                dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
+            } catch (const std::exception& e) {  // malformed dpdk block -> clean exit, not terminate
+                spdlog::error("invalid dpdk configuration: {}", e.what());
+                return EXIT_FAILURE;
+            }
         } else {
             spdlog::warn("DPDK config not found; attempting discovery with default EAL args");
         }
@@ -242,9 +247,22 @@ auto main(int argc, char** argv) -> int {
     // DPDK Initialization
     // ========================================
     std::vector<int> dpdk_logical_cores;
-    if (app_json.contains("dpdk") && app_json["dpdk"].contains("enabled") && app_json["dpdk"]["enabled"].get<bool>()) {
+    // Guard the dpdk-config read + parse: a malformed dpdk block (a wrong-typed field, or a
+    // non-boolean "enabled") throws nlohmann::json::type_error, which would otherwise escape main()
+    // -> std::terminate. Fail cleanly instead, matching the try/catch this file uses elsewhere.
+    bool dpdk_enabled = false;
+    composite::dpdk::config dpdk_cfg;
+    try {
+        dpdk_enabled = app_json.contains("dpdk") && app_json["dpdk"].value("enabled", false);
+        if (dpdk_enabled) {
+            dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("invalid dpdk configuration: {}", e.what());
+        return EXIT_FAILURE;
+    }
+    if (dpdk_enabled) {
         spdlog::debug("initializing DPDK");
-        auto dpdk_cfg = composite::parse_dpdk_config(app_json["dpdk"]);
 
         // Translate DPDK EAL args from logical to physical cores
         if (!available_cores.empty()) {
@@ -371,9 +389,8 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // Application Initialization
     // ========================================
-    auto comp_handles = composite::component_handles_type{};
     auto app_name = composite::generate_app_name();
-    if (app_json.contains("name")) {
+    if (app_json.contains("name") && app_json["name"].is_string()) {
         app_name = app_json["name"].get<std::string>();
     }
     pthread_setname_np(pthread_self(), app_name.c_str());
@@ -398,13 +415,13 @@ auto main(int argc, char** argv) -> int {
     auto component_ids = std::unordered_set<std::string>{};
     for (const auto& comp : app_json["components"]) {
         // Validate required fields
-        if (!comp.contains("id")) {
-            spdlog::error("component missing required 'id' field: {}", comp.dump());
+        if (!comp.contains("id") || !comp["id"].is_string()) {
+            spdlog::error("component missing required string 'id' field: {}", comp.dump());
             shutdown_dpdk();
             return EXIT_FAILURE;
         }
-        if (!comp.contains("library")) {
-            spdlog::error("component missing required 'library' field: {}", comp.dump());
+        if (!comp.contains("library") || !comp["library"].is_string()) {
+            spdlog::error("component missing required string 'library' field: {}", comp.dump());
             shutdown_dpdk();
             return EXIT_FAILURE;
         }
@@ -431,9 +448,13 @@ auto main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
     };
 
+    // All config-driven graph construction below can raise nlohmann type/parse
+    // errors and component-supplied exceptions; route every one through
+    // cleanup_and_exit instead of letting it escape main to std::terminate.
+    try {
     for (const auto& comp : app_json["components"]) {
-        // Load component from library
-        auto comp_ptr = composite::make_component(comp, comp_handles);
+        // Load component from library (self-owning: dlopen handle rides in its deleter)
+        auto comp_ptr = composite::make_component(comp);
         if (comp_ptr == nullptr) {
             return cleanup_and_exit("failed to load component");
         }
@@ -483,55 +504,19 @@ auto main(int argc, char** argv) -> int {
                 props_json.merge_patch(comp["properties"]);
             }
 
-            // Parse property changeset
-            auto changeset = composite::property_changeset::from_json(props_json);
-
-            // Apply changes if there are any
-            if (changeset.has_updates()) {
+            // Apply the merged (app-level + component-level) properties as one batch.
+            if (!props_json.empty()) {
                 spdlog::trace("setting properties on component {}", comp_ptr->id());
-                comp_ptr->set_properties(changeset.properties(), composite::properties::config_type::INITIALIZE, true);
-                comp_ptr->property_change_handler();
+                comp_ptr->set_properties(props_json, composite::properties::config_type::INITIALIZE, true);
             }
         } catch (const std::runtime_error& err) {
             return cleanup_and_exit(std::format("property error for component '{}': {}", comp_ptr->id(), err.what()));
         }
-        // Add to application
+        // Add to application (check the return: a duplicate effective id — e.g. a
+        // library that hardcodes its id — would otherwise be silently dropped).
         spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
-        app.add_component(comp_ptr);
-    }
-
-    // ========================================
-    // Transport Registry Setup
-    // ========================================
-    auto transport_registry = composite::transport_registry{};
-    if (app_json.contains("transports")) {
-        spdlog::trace("parsing transport definitions");
-        auto [registry, error] = composite::parse_transports(app_json["transports"]);
-        if (!error.empty()) {
-            return cleanup_and_exit(std::format("failed to parse transports: {}", error));
-        }
-        transport_registry = std::move(registry);
-        spdlog::debug("parsed {} transport definition(s)", transport_registry.size());
-    }
-
-    // ========================================
-    // Transport Attachment
-    // ========================================
-    for (const auto& comp : app_json["components"]) {
-        if (!comp.contains("transports")) {
-            continue;
-        }
-
-        auto comp_id = comp["id"].get<std::string>();
-        auto comp_ptr = app.get_component(comp_id);
-        if (comp_ptr == nullptr) {
-            return cleanup_and_exit(std::format("component '{}' not found when attaching transports", comp_id));
-        }
-
-        spdlog::trace("attaching transports to component '{}'", comp_id);
-        auto error = composite::attach_component_transports(comp_ptr, comp["transports"], transport_registry);
-        if (!error.empty()) {
-            return cleanup_and_exit(std::format("failed to attach transports to '{}': {}", comp_id, error));
+        if (!app.add_component(comp_ptr)) {
+            return cleanup_and_exit(std::format("component id '{}' already exists in application", comp_ptr->id()));
         }
     }
 
@@ -586,65 +571,116 @@ auto main(int argc, char** argv) -> int {
         }
     }
 
+    } catch (const std::exception& e) {
+        return cleanup_and_exit(std::format("configuration error: {}", e.what()));
+    }
+
     // ========================================
     // REST Server Setup
     // ========================================
     auto server_addr = program.get<std::string>("--server");
     auto server_port = program.get<int>("--port");
 #ifdef COMPOSITE_USE_OPENSSL
-    auto server = composite::make_server(app, comp_handles, cert_path, key_path, ca_path);
+    auto server = composite::make_server(app, cert_path, key_path, ca_path);
 #else
-    auto server = composite::make_server(app, comp_handles);
+    auto server = composite::make_server(app);
 #endif
+
+    // Bind on THIS thread first. A bind failure (port in use, bad address, invalid
+    // TLS context) is then detected synchronously and reported, instead of the
+    // listen thread silently exiting and leaving the app running with no control
+    // plane. It also guarantees the server is ready before app.start(), so a SIGINT
+    // arriving early cannot race an unbound server into a stop()-is-a-no-op hang.
+    if (!server->bind_to_port(server_addr, server_port)) {
+        return cleanup_and_exit(std::format("failed to bind REST server to {}:{}", server_addr, server_port));
+    }
+    spdlog::info("REST server listening at {}:{}", server_addr, server_port);
 
     // ========================================
     // Signal Handler Thread
     // ========================================
-    auto signal_future = std::async(std::launch::async, [sigset]() mutable -> int {
-        auto signum = int{};
-        if (auto rc = sigwait(&sigset, &signum); rc != 0) {
-            spdlog::error("sigwait failed: {}", strerror(rc));
-            return -1;
+    // A jthread (not std::async) so its destructor ALWAYS terminates it: it polls
+    // sigtimedwait and re-checks its stop_token, so on an error/unwind path where no
+    // signal arrives it still exits within the poll interval. (std::async's future
+    // destructor would block forever joining a thread stuck in sigwait().)
+    std::promise<int> sig_promise;
+    auto sig_future = sig_promise.get_future();
+    std::jthread sig_thread([sigset, &sig_promise](std::stop_token stoken) mutable {
+        while (!stoken.stop_requested()) {
+            timespec timeout{.tv_sec = 0, .tv_nsec = 200'000'000};  // 200 ms poll
+            int signum = sigtimedwait(&sigset, nullptr, &timeout);
+            if (signum > 0) {
+                spdlog::trace("signal {} received, initiating shutdown...", signum);
+                sig_promise.set_value(signum);
+                return;
+            }
+            // EAGAIN (timeout) / EINTR: re-check the stop token and wait again.
         }
-        spdlog::trace("signal {} received, initiating shutdown...", signum);
-        return signum;
     });
 
     // ========================================
     // Application Lifecycle
     // ========================================
     try {
-        // Initialize the application
         spdlog::trace("initializing application '{}'", app.name());
         app.initialize();
 
-        // Start REST server
-        spdlog::trace("listening at {}:{}", server_addr, server_port);
-        auto server_thread = std::jthread([&]() {
-            server->listen(server_addr, server_port);
-        });
+        // Serve on a worker thread (the socket is already bound above).
+        auto server_thread = std::jthread([&]() { server->listen_after_bind(); });
+        // Barrier: wait until the listen loop is actually running before relying on
+        // stop(). httplib's stop() only closes the socket once is_running_ is set
+        // INSIDE the listen thread; without this, a stop() during an early
+        // app.start() throw (below) would be a no-op and the server_thread join
+        // would then deadlock in accept(). wait_until_ready() returns promptly once
+        // the just-launched worker enters its loop (the socket is already bound).
+        server->wait_until_ready();
 
-        // Start the application
+        // httplib's Server::stop() is NOT idempotent (it asserts
+        // svr_sock_ != INVALID_SOCKET while is_running_ is still set), so it must be
+        // called EXACTLY once. The atomic flag lets both the normal-path stop and
+        // the unwind guard attempt it, with only the first taking effect. The guard
+        // (declared after server_thread, so it runs first on scope exit) guarantees
+        // the server is stopped — so listen_after_bind() returns and server_thread
+        // joins without deadlock — even if app.start() throws below.
+        std::atomic<bool> server_stopped{false};
+        struct stop_guard_t {
+            httplib::Server* srv;
+            std::atomic<bool>* stopped;
+            ~stop_guard_t() { if (!stopped->exchange(true)) { srv->stop(); } }
+        } stop_guard{server.get(), &server_stopped};
+
         spdlog::trace("starting application '{}'", app.name());
         app.start();
 
-        // Wait for signal to stop
         spdlog::trace("waiting for signal...");
-        signal_future.wait();
+        sig_future.wait();
 
-        // Stop server
+        // Stop accepting requests BEFORE tearing down the app (on the normal path;
+        // the guard handles the exception path). Exactly-once via the flag.
         spdlog::trace("stopping server...");
-        server->stop();
-
-        // Stop the application
+        if (!server_stopped.exchange(true)) { server->stop(); }
         spdlog::trace("stopping application '{}'", app.name());
         app.stop();
-
-        // Clean up the application resources
         spdlog::trace("clearing application '{}'", app.name());
         app.clear();
     } catch (const std::exception& e) {
         spdlog::critical("unhandled exception in main: {}", e.what());
+        // Quiesce the app BEFORE tearing down DPDK/telemetry. application::start() reconciles every
+        // component and only throws its aggregate AFTER attempting them all, so on this path components
+        // — including DPDK RX/TX workers — are LIVE. shutdown_dpdk() frees mempools/closes ports/EAL;
+        // running it under a still-live DPDK worker is a use-after-free (manager.hpp: DPDK must be shut
+        // down AFTER components stop). app.stop()/clear() join every worker first (both idempotent).
+        // The REST server is already stopped by the stop_guard during unwind.
+        // Best-effort: a throwing component::stop() (e.g. a staged config<T> on_apply) must not escape
+        // this catch to std::terminate and skip the DPDK/telemetry teardown below.
+        try {
+            app.stop();
+            app.clear();
+        } catch (const std::exception& e2) {
+            spdlog::critical("exception during error-path application teardown: {}", e2.what());
+        } catch (...) {
+            spdlog::critical("unknown exception during error-path application teardown");
+        }
         shutdown_telemetry();
         shutdown_dpdk();
         return EXIT_FAILURE;

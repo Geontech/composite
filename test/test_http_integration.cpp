@@ -1,1596 +1,555 @@
 /*
- * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * Copyright (C) 2024-2026 Geon Technologies, LLC
  * SPDX-License-Identifier: LGPL-3.0-or-later
+ *
+ * REST integration tests against the production make_server (server.cpp) using
+ * the new JSON property routes: GET state, PATCH component, PUT/DELETE property,
+ * RFC-7396 nested + keyed updates, validation -> 4xx.
  */
 
 #include "composite/core/application.hpp"
 #include "composite/core/component.hpp"
-#include "composite/metrics/metrics.hpp"
-#include "property_handlers.hpp"
+#include "helpers.hpp"  // make_server consumes the production helpers
 
 #include <catch2/catch_test_macros.hpp>
-#include <catch2/catch_approx.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
-#include <thread>
-#include <ctime>
+
+#include <atomic>
 #include <chrono>
-#include <variant>
+#include <map>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace composite;
 using namespace std::chrono_literals;
-
 using composite::properties::config_type;
+using json = composite::properties::json;
+
+// make_server is defined in server.cpp (compiled into this test target).
+namespace composite {
+auto make_server(application&) -> std::unique_ptr<httplib::Server>;
+}
+
+namespace {
+enum class Win { hann, hamming };
+struct Chan { double cf{}; double bw{}; Win win{Win::hann}; };
+struct Net  { std::string host{"localhost"}; std::uint16_t port{8080}; };
+} // namespace
+
+COMPOSITE_ENUM(Win, hann, hamming);
+COMPOSITE_STRUCT(Chan, cf, bw, win);
+COMPOSITE_STRUCT(Net, host, port);
 
 namespace {
 
-// ============================================================================
-// Test Configuration Structures with property_traits
-// ============================================================================
-
-struct network_config {
-    std::string host{"localhost"};
-    uint16_t port{8080};
-};
-
-} // anonymous namespace
-
-// property_traits specialization for network_config
-template<>
-struct composite::properties::property_traits<network_config> {
-    static void register_fields(property_set& ps, network_config& cfg) {
-        ps.add("host", cfg.host, config_type::RUNTIME);
-        ps.add("port", cfg.port, config_type::RUNTIME);
+class rest_component : public component {
+public:
+    explicit rest_component(std::string_view id) : component(id) {
+        add_port(&m_in);
+        add_port(&m_out);
+        add_property("gain", m_gain, config_type::RUNTIME).validate([](const double& g) { return g > 0.0; });
+        add_property("buf_size", m_buf, config_type::INITIALIZE);
+        add_property("net", m_net, config_type::RUNTIME);
+        add_keyed("channels", m_channels, config_type::RUNTIME)
+            .validate_element([](const std::string&, const Chan& c) { return c.bw > 0.0; });
     }
+    auto process() -> retval override { return retval::NOOP; }
+    input_port<mutable_buffer<float>>  m_in{"data_in"};
+    output_port<mutable_buffer<float>> m_out{"data_out"};
+    double m_gain{1.0};
+    std::int32_t m_buf{1024};
+    Net m_net;
+    std::map<std::string, Chan> m_channels;
+    component::auto_stop m_auto_stop{*this};  // MUST be last
 };
 
-namespace {
+class rest_fixture {
+public:
+    rest_fixture() {
+        m_app.add_component(std::make_shared<rest_component>("c1"));
+        m_app.add_component(std::make_shared<rest_component>("c2"));  // for batch-PATCH tests
+        m_server = composite::make_server(m_app);
+        // Bind to an ephemeral port (0) so concurrent runs / a busy 18091 can't make
+        // listen() silently fail and leave every request returning a null Result
+        // (which the assertions would then dereference -> segfault).
+        m_port = m_server->bind_to_any_port("localhost");
+        REQUIRE(m_port > 0);  // bind must succeed before any request is issued
+        m_thread = std::thread([this] { m_server->listen_after_bind(); });
+        for (int i = 0; i < 400 && !m_server->is_running(); ++i) { std::this_thread::sleep_for(5ms); }
+        REQUIRE(m_server->is_running());  // fail fast instead of deref-ing null responses later
+    }
+    ~rest_fixture() {
+        m_server->stop();
+        if (m_thread.joinable()) { m_thread.join(); }
+    }
+    auto client() -> httplib::Client { return httplib::Client("localhost", m_port); }
 
-struct test_config {
-    int32_t sample_rate{48000};
-    int32_t buffer_size{1024};
-    bool enabled{true};
-    std::string name{"test_component"};
-    std::vector<std::string> channels{"left", "right"};
-    network_config network;
-    std::vector<network_config> connections{
-        {"host1", 9001},
-        {"host2", 9002}
+    application m_app{"testapp"};
+    int m_port{0};  // assigned by bind_to_any_port() in the constructor
+    std::unique_ptr<httplib::Server> m_server;
+    std::thread m_thread;
+};
+
+} // namespace
+
+TEST_CASE_METHOD(rest_fixture, "GET components + properties", "[http]") {
+    auto cli = client();
+    auto comps = cli.Get("/app/components");
+    REQUIRE(comps);
+    REQUIRE(comps->status == 200);
+    REQUIRE(comps->body.find("c1") != std::string::npos);
+
+    auto props = cli.Get("/app/components/c1/properties");
+    REQUIRE(props);
+    REQUIRE(props->status == 200);
+    auto state = json::parse(props->body);
+    REQUIRE(state["gain"] == 1.0);
+    REQUIRE(state.contains("channels"));
+    REQUIRE(state["net"]["host"] == "localhost");
+}
+
+// Batch PATCH /app/components must NOT mask a per-component failure behind a later success
+// (the old handler overwrote the response each iteration). It aggregates outcomes and returns
+// 207 Multi-Status when any component fails.
+TEST_CASE_METHOD(rest_fixture, "PATCH components (batch) surfaces failures, no masking", "[http]") {
+    auto cli = client();
+
+    // All-success batch -> 200.
+    auto ok = cli.Patch("/app/components",
+        R"({"components":[{"id":"c1","properties":{"gain":2.0}}]})", "application/json");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 2.0);
+
+    // A NOT-FOUND component FOLLOWED BY a valid one. Old code returned the trailing 200,
+    // masking the 404; now the 404 must surface as 207 and the valid one still applies.
+    auto mixed = cli.Patch("/app/components",
+        R"({"components":[{"id":"ghost","properties":{"gain":2.0}},{"id":"c1","properties":{"gain":3.0}}]})",
+        "application/json");
+    REQUIRE(mixed);
+    REQUIRE(mixed->status == 207);                  // NOT 200 — failure is not masked
+    auto body = json::parse(mixed->body);
+    REQUIRE(body["failed"] == 1);
+    REQUIRE(body["applied"] == 1);
+    bool ghost_404 = false;
+    bool c1_ok = false;
+    for (const auto& r : body["results"]) {
+        if (r.value("id", std::string{}) == "ghost") { ghost_404 = (r["status"] == 404); }
+        if (r.value("id", std::string{}) == "c1")    { c1_ok = (r["status"] == 200); }
+    }
+    REQUIRE(ghost_404);
+    REQUIRE(c1_ok);
+    // Best-effort: the valid component DID apply (committed live).
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 3.0);
+
+    // A rejected value reports the component as failed (207) and per-component atomicity holds
+    // (the bad value did not apply).
+    auto badval = cli.Patch("/app/components",
+        R"({"components":[{"id":"c1","properties":{"gain":-5.0}}]})", "application/json");
+    REQUIRE(badval);
+    REQUIRE(badval->status == 207);
+    REQUIRE(json::parse(badval->body)["failed"] == 1);
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 3.0);
+
+    // THE masking scenario: a VALIDATION failure (c2) FOLLOWED BY a success (c1). The old
+    // handler caught c2's error, then overwrote the response with c1's 200 — reporting overall
+    // success and hiding c2's failure. Now it must be 207 with c2 flagged failed and c1 applied.
+    auto mask = cli.Patch("/app/components",
+        R"({"components":[{"id":"c2","properties":{"gain":-1.0}},{"id":"c1","properties":{"gain":5.0}}]})",
+        "application/json");
+    REQUIRE(mask);
+    REQUIRE(mask->status == 207);                   // old code would have returned 200 here
+    auto mb = json::parse(mask->body);
+    REQUIRE(mb["failed"] == 1);
+    REQUIRE(mb["applied"] == 1);
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 5.0);   // applied
+    REQUIRE(json::parse(cli.Get("/app/components/c2/properties")->body)["gain"] == 1.0);   // rejected -> default
+}
+
+TEST_CASE_METHOD(rest_fixture, "PATCH component sets a scalar", "[http]") {
+    auto cli = client();
+    auto r = cli.Patch("/app/components/c1", R"({"properties": {"gain": 2.5}})", "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    auto state = json::parse(cli.Get("/app/components/c1/properties")->body);
+    REQUIRE(state["gain"] == 2.5);
+}
+
+TEST_CASE_METHOD(rest_fixture, "PUT single property", "[http]") {
+    auto cli = client();
+    auto r = cli.Put("/app/components/c1/properties/gain", R"({"value": 3.0})", "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    auto one = json::parse(cli.Get("/app/components/c1/properties/gain")->body);
+    REQUIRE(one["gain"] == 3.0);
+}
+
+TEST_CASE_METHOD(rest_fixture, "validation -> 400, config -> 403", "[http]") {
+    auto cli = client();
+    auto bad = cli.Patch("/app/components/c1", R"({"properties": {"gain": -1.0}})", "application/json");
+    REQUIRE(bad);
+    REQUIRE(bad->status == 400);
+    // unchanged
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 1.0);
+
+    auto init = cli.Patch("/app/components/c1", R"({"properties": {"buf_size": 4096}})", "application/json");
+    REQUIRE(init);
+    REQUIRE(init->status == 403);  // INITIALIZE-only at runtime
+}
+
+TEST_CASE_METHOD(rest_fixture, "nested struct + keyed collection via JSON", "[http]") {
+    auto cli = client();
+    // nested 7396 merge
+    REQUIRE(cli.Patch("/app/components/c1", R"({"properties": {"net": {"port": 9000}}})", "application/json")->status == 200);
+    auto st = json::parse(cli.Get("/app/components/c1/properties")->body);
+    REQUIRE(st["net"]["port"] == 9000);
+    REQUIRE(st["net"]["host"] == "localhost");  // preserved
+
+    // keyed add
+    REQUIRE(cli.Patch("/app/components/c1",
+                      R"({"properties": {"channels": {"L": {"bw": 10e6, "cf": 1e9}}}})", "application/json")->status == 200);
+    st = json::parse(cli.Get("/app/components/c1/properties")->body);
+    REQUIRE(st["channels"].contains("L"));
+    REQUIRE(st["channels"]["L"]["bw"] == 10e6);
+
+    // keyed remove via nested null
+    REQUIRE(cli.Patch("/app/components/c1", R"({"properties": {"channels": {"L": null}}})", "application/json")->status == 200);
+    st = json::parse(cli.Get("/app/components/c1/properties")->body);
+    REQUIRE(st["channels"].empty());
+}
+
+TEST_CASE_METHOD(rest_fixture, "DELETE resets a property to default", "[http]") {
+    auto cli = client();
+    cli.Patch("/app/components/c1", R"({"properties": {"net": {"port": 7777}}})", "application/json");
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["net"]["port"] == 7777);
+    auto del = cli.Delete("/app/components/c1/properties/net");
+    REQUIRE(del);
+    REQUIRE(del->status == 200);
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["net"]["port"] == 8080);  // default
+}
+
+// GET /app/components/:id/schema returns a property descriptor array incl. the `enabled` virtual.
+TEST_CASE_METHOD(rest_fixture, "GET component schema", "[http]") {
+    auto cli = client();
+    auto r = cli.Get("/app/components/c1/schema");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    auto schema = json::parse(r->body);
+    REQUIRE(schema.is_array());
+    auto has = [&](std::string_view name) {
+        return std::any_of(schema.begin(), schema.end(),
+                           [&](const json& e) { return e.value("name", "") == name; });
     };
-};
+    REQUIRE(has("gain"));        // a registered property
+    REQUIRE(has("enabled"));     // the spec/status virtual is advertised for UIs
+    // Unknown component -> 404.
+    REQUIRE(cli.Get("/app/components/nope/schema")->status == 404);
+}
 
-} // anonymous namespace
+// DELETE /app/components/:id stops + unloads the component; it then 404s and drops from the list.
+TEST_CASE_METHOD(rest_fixture, "DELETE component removes it", "[http]") {
+    auto cli = client();
+    REQUIRE(cli.Get("/app/components/c2")->status == 200);    // present to start
+    auto del = cli.Delete("/app/components/c2");
+    REQUIRE(del);
+    REQUIRE(del->status == 200);
+    REQUIRE(cli.Get("/app/components/c2")->status == 404);    // gone
+    REQUIRE(cli.Get("/app/components/c1")->status == 200);    // sibling untouched
+    auto comps = json::parse(cli.Get("/app/components")->body);
+    REQUIRE(comps.size() == 1);
+    // Deleting an unknown component -> 404.
+    REQUIRE(cli.Delete("/app/components/nope")->status == 404);
+}
 
-// property_traits specialization for test_config
-template<>
-struct composite::properties::property_traits<test_config> {
-    static void register_fields(composite::properties::property_set& ps, test_config& cfg) {
-        ps.add("sample_rate", cfg.sample_rate, config_type::RUNTIME, "Hz");
-        ps.add("buffer_size", cfg.buffer_size, config_type::INITIALIZE, "samples");
-        ps.add("enabled", cfg.enabled, config_type::RUNTIME);
-        ps.add("name", cfg.name, config_type::RUNTIME);
-        ps.add("channels", cfg.channels, config_type::RUNTIME);
-        ps.add("network", cfg.network, config_type::RUNTIME);
-        ps.add("connections", cfg.connections, config_type::RUNTIME);
+// DELETE is connection-safe: removing a connected consumer leaves the producer intact.
+TEST_CASE_METHOD(rest_fixture, "DELETE a connected component is safe", "[http]") {
+    auto cli = client();
+    // Wire c1:data_out -> c2:data_in via REST, then delete the consumer c2.
+    auto conn = cli.Post("/app/connections",
+        R"({"output":{"component":"c1","port":"data_out"},"input":{"component":"c2","port":"data_in"}})",
+        "application/json");
+    REQUIRE(conn);
+    if (conn->status == 201) {  // only if rest_component actually exposes those ports
+        REQUIRE(cli.Delete("/app/components/c2")->status == 200);
+        REQUIRE(cli.Get("/app/components/c2")->status == 404);
+        REQUIRE(cli.Get("/app/components/c1")->status == 200);  // producer survives, no dangling edge
     }
-};
+}
+
+// POST /app/start and /app/stop drive lifecycle across all components.
+TEST_CASE_METHOD(rest_fixture, "POST app start/stop", "[http]") {
+    auto cli = client();
+    auto stop = cli.Post("/app/stop");
+    REQUIRE(stop);
+    REQUIRE(stop->status == 200);
+    auto start = cli.Post("/app/start");
+    REQUIRE(start);
+    REQUIRE(start->status == 200);
+}
+
+// GET /app/openapi.json serves a well-formed OpenAPI 3.1 doc whose path+method set exactly
+// matches the expected REST surface — a drift guard so a route added/removed without updating
+// rest_catalog() (or this list) fails CI.
+TEST_CASE_METHOD(rest_fixture, "OpenAPI spec is well-formed and matches the route surface", "[http]") {
+    auto cli = client();
+    auto r = cli.Get("/app/openapi.json");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    auto spec = json::parse(r->body);
+    REQUIRE(spec.at("openapi") == "3.1.0");
+    REQUIRE(spec.at("info").contains("title"));
+    REQUIRE(spec.at("info").contains("version"));
+    REQUIRE(spec.at("paths").is_object());
+
+    std::vector<std::string> actual;
+    for (auto& [path, methods] : spec["paths"].items()) {
+        for (auto& [method, op] : methods.items()) { actual.push_back(method + " " + path); }
+    }
+    std::vector<std::string> expected = {
+        "get /app/healthz", "get /app/openapi.json", "get /app/metrics", "get /app/metrics/stream",
+        "get /app", "post /app/start", "post /app/stop",
+        "get /app/components", "post /app/components", "patch /app/components",
+        "get /app/components/{id}", "delete /app/components/{id}", "patch /app/components/{id}",
+        "get /app/components/{id}/schema",
+        "get /app/components/{id}/properties", "get /app/components/{id}/properties/{name}",
+        "put /app/components/{id}/properties/{name}", "patch /app/components/{id}/properties/{name}",
+        "delete /app/components/{id}/properties/{name}",
+        "get /app/components/{id}/ports", "get /app/components/{id}/ports/{port_name}",
+        "delete /app/components/{id}/ports/{port_name}/connections",
+        "post /app/connections", "delete /app/connections",
+    };
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    REQUIRE(actual == expected);
+}
+
+// Route-diff: every GET route the spec advertises must actually be REGISTERED on the server.
+// An unregistered path returns httplib's default 404 with a non-JSON (empty) body; every real
+// handler returns a JSON body (200 or {"error":...}). So "body parses as JSON" == "route exists".
+TEST_CASE_METHOD(rest_fixture, "every advertised GET route is registered", "[http]") {
+    auto cli = client();
+    auto spec = json::parse(cli.Get("/app/openapi.json")->body);
+    for (auto& [path, methods] : spec["paths"].items()) {
+        if (!methods.contains("get")) { continue; }
+        if (path == "/app/metrics/stream") { continue; }  // SSE stream: body is text/event-stream, not JSON
+        std::string probe = path;
+        for (auto ph : {"{id}", "{name}", "{port_name}"}) {
+            std::size_t pos;
+            while ((pos = probe.find(ph)) != std::string::npos) { probe.replace(pos, std::string(ph).size(), "c1"); }
+        }
+        auto resp = cli.Get(probe);
+        INFO("probing GET " << probe);
+        REQUIRE(resp);
+        bool is_json = false;
+        try { auto parsed = json::parse(resp->body); (void)parsed; is_json = true; }  // parsed used -> no warn_unused_result
+        catch (...) { is_json = false; }
+        REQUIRE(is_json);  // a non-JSON body would mean the route is not registered
+    }
+}
+
+// ===========================================================================
+// Control-plane hardening
+// ===========================================================================
 
 namespace {
-
-// Test component with various property types
-class test_component : public component {
+// A producer whose worker actively sends into its output every iteration — so a removal
+// of its downstream consumer overlaps an in-flight send (the UAF window the topology lock closes).
+class stress_producer : public component {
 public:
-    test_component(std::string_view id) : component(id) {
-        // Register all properties using the property_traits system
-        add_property("sample_rate", m_config.sample_rate, config_type::RUNTIME, "Hz");
-        add_property("buffer_size", m_config.buffer_size, config_type::INITIALIZE, "samples");
-        add_property("enabled", m_config.enabled, config_type::RUNTIME);
-        add_property("name", m_config.name, config_type::RUNTIME);
-        add_property("channels", m_config.channels, config_type::RUNTIME);
-        add_property("network", m_config.network, config_type::RUNTIME);
-        add_property("connections", m_config.connections, config_type::RUNTIME);
-    }
-
+    explicit stress_producer(std::string_view id) : component(id) { add_port(&m_out); }
     auto process() -> retval override {
-        return retval::FINISH;
+        m_out.send_data(make_mutable<float>(8), timestamp{}, std::nullopt);
+        return retval::NORMAL;
     }
-
-    auto get_config() -> test_config& {
-        return m_config;
-    }
-
-private:
-    test_config m_config;
+    output_port<mutable_buffer<float>> m_out{"data_out"};
+    component::auto_stop m_auto_stop{*this};
 };
-
-// Server fixture that starts an HTTP server with a test component
-class test_server {
+class stress_consumer : public component {
 public:
-    test_server() : m_port(18080), m_server(std::make_unique<httplib::Server>()) {
-        // Create test application with one component
-        auto comp = std::make_shared<test_component>("test_comp");
-        m_app.add_component(comp);
-
-        // Register property REST API endpoints
-        setup_property_endpoints();
-
-        // Start server in background thread
-        m_server_thread = std::thread([this]() {
-            m_server->listen("localhost", m_port);
-        });
-
-        // Wait for server to be ready
-        std::this_thread::sleep_for(100ms);
+    explicit stress_consumer(std::string_view id) : component(id) { add_port(&m_in); }
+    auto process() -> retval override {
+        auto [b, ts, md] = m_in.get_data();
+        return b.empty() ? retval::NOOP : retval::NORMAL;
     }
+    input_port<mutable_buffer<float>> m_in{"data_in"};
+    component::auto_stop m_auto_stop{*this};
+};
+} // namespace
 
-    ~test_server() {
-        m_server->stop();
-        if (m_server_thread.joinable()) {
-            m_server_thread.join();
+// remove_component must be race-free against a concurrent connect AND a still-running producer
+// sending into the consumer being torn down. The topology lock serializes connect vs remove, and
+// remove parks the producer before releasing the consumer's input claim — so no send hits a freed
+// ring. Run under TSan/ASan to catch a regression of the HIGH finding this guards.
+TEST_CASE("remove_component is race-free vs a live sender + concurrent connect", "[application][hardening]") {
+    application app{"stress"};
+    auto p = std::make_shared<stress_producer>("P");
+    app.add_component(p);
+    app.add_component(std::make_shared<stress_consumer>("C"));
+    {
+        auto topo = app.topology_lock();
+        p->connect("data_out", app.get_component("C"), "data_in");
+    }
+    p->start();  // producer worker is now actively sending into C's input ring
+
+    // Churn the consumer: remove it (tears down its ring while P sends) then re-add + reconnect.
+    std::atomic<bool> go{false};
+    std::thread churn([&] {
+        go.store(true, std::memory_order_release);
+        for (int i = 0; i < 150; ++i) {
+            app.remove_component("C");                              // parks P, disconnects, destroys old C
+            auto c = std::make_shared<stress_consumer>("C");
+            app.add_component(c);
+            auto topo = app.topology_lock();                       // serialize the reconnect vs any remove
+            p->connect("data_out", c, "data_in");
         }
-    }
-
-    auto port() const -> int { return m_port; }
-    auto base_url() const -> std::string {
-        return std::format("http://localhost:{}", m_port);
-    }
-
-    // Return paths only (not full URLs) for use with httplib::Client
-    auto component_path(std::string_view comp_id) const -> std::string {
-        return std::format("/app/components/{}", comp_id);
-    }
-
-    auto property_path(std::string_view comp_id, std::string_view prop_name) const -> std::string {
-        return std::format("/app/components/{}/properties/{}", comp_id, prop_name);
-    }
-
-private:
-    void setup_property_endpoints() {
-        const std::string APP = "app";
-        const std::string COMPONENTS = "components";
-
-        // GET /app/components/:id/properties
-        auto endpoint = std::format("/{}/{}/:id/properties", APP, COMPONENTS);
-        m_server->Get(endpoint, [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-            property_handlers::get_properties(comp.get(), res);
-        });
-
-        // GET /app/components/:id/properties/:name
-        endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
-        m_server->Get(endpoint, [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-            property_handlers::get_property(comp.get(), prop_name, res);
-        });
-
-        // PUT /app/components/:id/properties/:name
-        endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
-        m_server->Put(endpoint, [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
-            if (request_body.is_discarded()) {
-                property_handlers::error(res, "Invalid JSON", 400);
-                return;
-            }
-
-            property_handlers::put_property(comp.get(), prop_name, request_body, res);
-        });
-
-        // DELETE /app/components/:id/properties/:name
-        endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
-        m_server->Delete(endpoint, [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            property_handlers::delete_property(comp.get(), prop_name, res);
-        });
-
-        // List operations
-        // GET /app/components/:id/properties/:name/items
-        endpoint = std::format("/{}/{}/:id/properties/:name/items", APP, COMPONENTS);
-        m_server->Get(endpoint, [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto base_href = std::format("/{}/{}/{}/properties/{}/items", APP, COMPONENTS, comp_id, prop_name);
-            property_handlers::get_list_items(comp.get(), prop_name, base_href, res);
-        });
-
-        // GET /app/components/:id/properties/:name/items/:index
-        endpoint = std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS);
-        m_server->Get(endpoint, [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto index_str = req.path_params.at("index");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            size_t index = std::stoull(index_str);
-            property_handlers::get_list_item(comp.get(), prop_name, index, res);
-        });
-
-        // POST /app/components/:id/properties/:name/items
-        m_server->Post(std::format("/{}/{}/:id/properties/:name/items", APP, COMPONENTS),
-            [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
-            if (request_body.is_discarded()) {
-                property_handlers::error(res, "Invalid JSON", 400);
-                return;
-            }
-
-            property_handlers::post_list_item(comp.get(), prop_name, request_body, res);
-        });
-
-        // PUT /app/components/:id/properties/:name/items/:index
-        m_server->Put(std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS),
-            [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto index_str = req.path_params.at("index");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
-            if (request_body.is_discarded()) {
-                property_handlers::error(res, "Invalid JSON", 400);
-                return;
-            }
-
-            size_t index = std::stoull(index_str);
-            property_handlers::put_list_item(comp.get(), prop_name, index, request_body, res);
-        });
-
-        // DELETE /app/components/:id/properties/:name/items/:index
-        m_server->Delete(std::format("/{}/{}/:id/properties/:name/items/:index", APP, COMPONENTS),
-            [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto index_str = req.path_params.at("index");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            size_t index = std::stoull(index_str);
-            property_handlers::delete_list_item(comp.get(), prop_name, index, res);
-        });
-
-        // Struct operations
-        // GET /app/components/:id/properties/:name/fields
-        m_server->Get(std::format("/{}/{}/:id/properties/:name/fields", APP, COMPONENTS),
-            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto base_href = std::format("/{}/{}/{}/properties/{}/fields", APP, COMPONENTS, comp_id, prop_name);
-            property_handlers::get_struct_fields(comp.get(), prop_name, base_href, res);
-        });
-
-        // GET /app/components/:id/properties/:name/fields/:field
-        m_server->Get(std::format("/{}/{}/:id/properties/:name/fields/:field", APP, COMPONENTS),
-            [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto field_name = req.path_params.at("field");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            property_handlers::get_struct_field(comp.get(), prop_name, field_name, res);
-        });
-
-        // PATCH /app/components/:id/properties/:name/fields/:field
-        m_server->Patch(std::format("/{}/{}/:id/properties/:name/fields/:field", APP, COMPONENTS),
-            [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto field_name = req.path_params.at("field");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
-            if (request_body.is_discarded()) {
-                property_handlers::error(res, "Invalid JSON", 400);
-                return;
-            }
-
-            property_handlers::patch_struct_field(comp.get(), prop_name, field_name, request_body, res);
-        });
-
-        // Struct list operations
-        // GET /app/components/:id/properties/:name/items/:index/fields
-        m_server->Get(std::format("/{}/{}/:id/properties/:name/items/:index/fields", APP, COMPONENTS),
-            [this, APP, COMPONENTS](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto index_str = req.path_params.at("index");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            size_t index = std::stoull(index_str);
-            auto base_href = std::format("/{}/{}/{}/properties/{}/items/{}/fields", APP, COMPONENTS, comp_id, prop_name, index);
-            property_handlers::get_struct_list_item_fields(comp.get(), prop_name, index, base_href, res);
-        });
-
-        // PATCH /app/components/:id/properties/:name/items/:index/fields/:field
-        m_server->Patch(std::format("/{}/{}/:id/properties/:name/items/:index/fields/:field", APP, COMPONENTS),
-            [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto prop_name = req.path_params.at("name");
-            auto index_str = req.path_params.at("index");
-            auto field_name = req.path_params.at("field");
-            auto comp = m_app.get_component(comp_id);
-            if (!comp) {
-                property_handlers::error(res, "Component not found", 404);
-                return;
-            }
-
-            auto request_body = nlohmann::json::parse(req.body, nullptr, false);
-            if (request_body.is_discarded()) {
-                property_handlers::error(res, "Invalid JSON", 400);
-                return;
-            }
-
-            size_t index = std::stoull(index_str);
-            property_handlers::patch_struct_list_item_field(comp.get(), prop_name, index, field_name, request_body, res);
-        });
-    }
-
-    int m_port;
-    application m_app{"test_app"};
-    std::unique_ptr<httplib::Server> m_server;
-    std::thread m_server_thread;
-};
-
-} // anonymous namespace
-
-TEST_CASE("HTTP Integration - Server Health Check") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Verify server is running") {
-        // Try a simple root path that should 404 but prove server is responding
-        auto result = client.Get("/");
-        REQUIRE(result); // Connection successful
-        INFO("Server is responding on " << server.base_url());
-    }
-}
-
-TEST_CASE("HTTP Integration - Property GET") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Get single property via HTTP") {
-        auto path = server.property_path("test_comp", "sample_rate");
-        INFO("Requesting: " << path);
-
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        if (result->status != httplib::OK_200) {
-            INFO("Response status: " << result->status);
-            INFO("Response body: " << result->body);
+    });
+    // A second thread races connects against the churn (the exact connect-vs-remove window).
+    std::thread racer([&] {
+        while (!go.load(std::memory_order_acquire)) {}
+        for (int i = 0; i < 150; ++i) {
+            auto topo = app.topology_lock();
+            if (auto c = app.get_component("C")) { (void)p->connect("data_out", c, "data_in"); }
         }
-        REQUIRE(result->status == httplib::OK_200);
-        REQUIRE(result->get_header_value("Content-Type") == "application/json");
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json["name"].get<std::string>() == "sample_rate");
-        REQUIRE(json["type"].get<std::string>() == "int32");
-    }
-
-    SECTION("Get non-existent property returns 404") {
-        auto result = client.Get(server.property_path("test_comp", "does_not_exist"));
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::NotFound_404);
-    }
+    });
+    churn.join();
+    racer.join();
+    p->stop();
+    SUCCEED();  // no crash and (under TSan/ASan) no data race / use-after-free
 }
 
-TEST_CASE("HTTP Integration - Property PUT") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Update property via HTTP PUT") {
-        auto body = nlohmann::json{{"value", 96000}}.dump();
-        auto result = client.Put(
-            server.property_path("test_comp", "sample_rate"),
-            body,
-            "application/json"
-        );
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        // Verify change persisted with GET
-        auto get_result = client.Get(server.property_path("test_comp", "sample_rate"));
-        REQUIRE(get_result);
-        auto get_json = nlohmann::json::parse(get_result->body);
-        REQUIRE(get_json.contains("value"));
-    }
-
-    SECTION("Cannot update non-runtime-configurable property") {
-        auto body = nlohmann::json{{"value", 2048}}.dump();
-        auto result = client.Put(
-            server.property_path("test_comp", "buffer_size"),
-            body,
-            "application/json"
-        );
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::Forbidden_403);
-    }
+// The registry rejects a second component with an existing id atomically, so two
+// concurrent POSTs of the same id cannot both win (no check-then-add TOCTOU).
+TEST_CASE("application rejects duplicate component ids", "[application][hardening]") {
+    application app{"a"};
+    REQUIRE(app.add_component(std::make_shared<rest_component>("dup")));
+    REQUIRE_FALSE(app.add_component(std::make_shared<rest_component>("dup")));
+    REQUIRE_FALSE(app.add_component(nullptr));
+    REQUIRE(app.add_component(std::make_shared<rest_component>("other")));
+    REQUIRE(app.components().size() == 2);
 }
 
-TEST_CASE("HTTP Integration - Property DELETE") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Reset property via HTTP DELETE") {
-        // First change the value
-        auto put_body = nlohmann::json{{"value", 96000}}.dump();
-        client.Put(
-            server.property_path("test_comp", "sample_rate"),
-            put_body,
-            "application/json"
-        );
-
-        // Then delete (reset)
-        auto result = client.Delete(server.property_path("test_comp", "sample_rate"));
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-    }
+TEST_CASE_METHOD(rest_fixture, "POST duplicate component id -> 409", "[http][hardening]") {
+    auto cli = client();
+    auto r = cli.Post("/app/components", R"({"id": "c1", "library": "anything"})", "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 409);
 }
 
-TEST_CASE("HTTP Integration - Error Handling") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Invalid JSON returns 400") {
-        auto result = client.Put(
-            server.property_path("test_comp", "sample_rate"),
-            "{invalid json}",
-            "application/json"
-        );
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::BadRequest_400);
-    }
-
-    SECTION("Non-existent component returns 404") {
-        auto result = client.Get("/app/components/fake_comp/properties/sample_rate");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::NotFound_404);
-    }
+TEST_CASE_METHOD(rest_fixture, "malformed JSON body -> 400 (no connection drop)", "[http][hardening]") {
+    auto cli = client();
+    auto r = cli.Patch("/app/components/c1", "{ this is not json", "application/json");
+    REQUIRE(r);  // connection served, not dropped
+    REQUIRE(r->status == 400);
 }
 
-TEST_CASE("HTTP Integration - List Operations") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Get list items") {
-        auto path = "/app/components/test_comp/properties/channels/items";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("items"));
-        REQUIRE(json.contains("count"));
-        REQUIRE(json["count"].get<size_t>() == 2);
-        REQUIRE(json["items"].is_array());
-    }
-
-    SECTION("Get single list item") {
-        auto path = "/app/components/test_comp/properties/channels/items/0";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("index"));
-        REQUIRE(json.contains("value"));
-        REQUIRE(json["index"].get<size_t>() == 0);
-    }
-
-    SECTION("Append to list via POST") {
-        auto path = "/app/components/test_comp/properties/channels/items";
-        auto body = nlohmann::json{{"value", "center"}}.dump();
-        auto result = client.Post(path, body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::Created_201);
-    }
-
-    SECTION("Update list item via PUT") {
-        auto path = "/app/components/test_comp/properties/channels/items/0";
-        auto body = nlohmann::json{{"value", "front_left"}}.dump();
-        auto result = client.Put(path, body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-    }
-
-    SECTION("Delete list item") {
-        auto path = "/app/components/test_comp/properties/channels/items/1";
-        auto result = client.Delete(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-    }
+TEST_CASE_METHOD(rest_fixture, "PUT unknown property -> 404", "[http][hardening]") {
+    auto cli = client();
+    auto r = cli.Put("/app/components/c1/properties/does_not_exist", R"({"value": 1})", "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 404);
 }
 
-TEST_CASE("HTTP Integration - Struct Operations") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Get struct fields") {
-        auto path = "/app/components/test_comp/properties/network/fields";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("fields"));
-        REQUIRE(json["fields"].contains("host"));
-        REQUIRE(json["fields"].contains("port"));
-    }
-
-    SECTION("Get single struct field") {
-        auto path = "/app/components/test_comp/properties/network/fields/host";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("value"));
-    }
-
-    SECTION("Update struct field via PATCH") {
-        auto path = "/app/components/test_comp/properties/network/fields/host";
-        auto body = nlohmann::json{{"value", "192.168.1.1"}}.dump();
-        auto result = client.Patch(path, body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-    }
+TEST_CASE_METHOD(rest_fixture, "oversized payload -> 413", "[http][hardening]") {
+    auto cli = client();
+    // Exceed the 8 MiB cap; httplib rejects before invoking the handler.
+    std::string big = R"({"properties": {"gain": )" + std::string(9 * 1024 * 1024, '1') + "}}";
+    auto r = cli.Patch("/app/components/c1", big, "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 413);
 }
 
-TEST_CASE("HTTP Integration - Struct List Operations") {
-    test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Get struct list item fields") {
-        auto path = "/app/components/test_comp/properties/connections/items/0/fields";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("fields"));
-        REQUIRE(json["fields"].contains("host"));
-        REQUIRE(json["fields"].contains("port"));
-    }
-
-    SECTION("Update struct list item field") {
-        auto path = "/app/components/test_comp/properties/connections/items/0/fields/host";
-        auto body = nlohmann::json{{"value", "10.0.0.1"}}.dump();
-        auto result = client.Patch(path, body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-    }
-}
-
-// Test components with ports for connection tests
-class source_component : public component {
-public:
-    source_component(std::string_view id) : component(id) {
-        add_port(output);
-    }
-    auto process() -> retval override { return retval::FINISH; }
-    output_port<mutable_buffer<float>> output{"data_out"};
-};
-
-class sink_component : public component {
-public:
-    sink_component(std::string_view id) : component(id) {
-        add_port(input);
-    }
-    auto process() -> retval override { return retval::FINISH; }
-    input_port<mutable_buffer<float>> input{"data_in"};
-};
-
-// Test server with port components
-class port_test_server {
-public:
-    port_test_server() : m_port(18081), m_app("port_test_app"), m_server(std::make_unique<httplib::Server>()) {
-        // Create test application with components that have ports
-        auto source = std::make_shared<source_component>("source");
-        auto sink = std::make_shared<sink_component>("sink");
-        m_app.add_component(source);
-        m_app.add_component(sink);
-
-        // Setup REST API endpoints
-        setup_port_endpoints();
-
-        // Start server in background thread
-        m_server_thread = std::thread([this]() {
-            m_server->listen("localhost", m_port);
-        });
-
-        // Wait for server to be ready
-        std::this_thread::sleep_for(100ms);
-    }
-
-    ~port_test_server() {
-        m_server->stop();
-        if (m_server_thread.joinable()) {
-            m_server_thread.join();
-        }
-    }
-
-    auto port() const -> int { return m_port; }
-    auto base_url() const -> std::string {
-        return std::format("http://localhost:{}", m_port);
-    }
-
-    auto get_application() -> composite::application& { return m_app; }
-
-private:
-    void setup_port_endpoints() {
-        // GET /app/components/:id/ports
-        m_server->Get("/app/components/:id/ports", [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto content = nlohmann::json();
-
-            if (auto comp = m_app.get_component(comp_id); comp != nullptr) {
-                auto ports_json = nlohmann::json::array();
-
-                for (const auto& [port_name, port_ptr] : comp->ports()) {
-                    if (port_ptr == nullptr) { continue; }
-
-                    auto port_obj = nlohmann::json::object();
-                    port_obj["name"] = port_name;
-
-                    if (auto* output_port = dynamic_cast<output_port_base*>(port_ptr)) {
-                        port_obj["type"] = "output";
-                        port_obj["is_connected"] = output_port->is_connected();
-                        port_obj["connection_count"] = output_port->connection_count();
-                        port_obj["connected_ports"] = output_port->connected_ports();
-                    } else if (dynamic_cast<input_port_base*>(port_ptr)) {
-                        port_obj["type"] = "input";
-                    }
-
-                    ports_json.push_back(port_obj);
-                }
-
-                content["component_id"] = comp_id;
-                content["ports"] = ports_json;
-                res.set_content(content.dump(2), "application/json");
-                res.status = httplib::OK_200;
-            } else {
-                content["error"] = std::format("component not found: {}", comp_id);
-                res.set_content(content.dump(), "application/json");
-                res.status = httplib::NotFound_404;
-            }
-        });
-
-        // POST /app/connections
-        m_server->Post("/app/connections", [this](const httplib::Request& req, httplib::Response& res) {
-            auto content = nlohmann::json();
-
-            try {
-                auto conn_json = nlohmann::json::parse(req.body);
-
-                if (!conn_json.contains("output") || !conn_json.contains("input")) {
-                    content["error"] = "connection must specify both 'output' and 'input'";
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                auto& output = conn_json["output"];
-                auto& input = conn_json["input"];
-
-                if (!output.contains("component") || !output.contains("port")) {
-                    content["error"] = "output must specify 'component' and 'port'";
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                if (!input.contains("component") || !input.contains("port")) {
-                    content["error"] = "input must specify 'component' and 'port'";
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                auto source_comp_id = output["component"].get<std::string>();
-                auto source_port_name = output["port"].get<std::string>();
-                auto target_comp_id = input["component"].get<std::string>();
-                auto target_port_name = input["port"].get<std::string>();
-
-                auto source_comp = m_app.get_component(source_comp_id);
-                if (!source_comp) {
-                    content["error"] = std::format("source component not found: {}", source_comp_id);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                    return;
-                }
-
-                auto target_comp = m_app.get_component(target_comp_id);
-                if (!target_comp) {
-                    content["error"] = std::format("target component not found: {}", target_comp_id);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                    return;
-                }
-
-                bool success = source_comp->connect(source_port_name, target_comp, target_port_name);
-
-                if (success) {
-                    content["success"] = std::format("connected {}:{} to {}:{}",
-                                                     source_comp_id, source_port_name,
-                                                     target_comp_id, target_port_name);
-                    content["connection"] = {
-                        {"output", {{"component", source_comp_id}, {"port", source_port_name}}},
-                        {"input", {{"component", target_comp_id}, {"port", target_port_name}}}
-                    };
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::Created_201;
+// Hammer property reads while a writer mutates the same component: the GET path
+// takes the shared read lock (property_state) and the PATCH path parks the worker
+// under the unique write lock, so reads stay consistent and nothing tears.
+TEST_CASE_METHOD(rest_fixture, "concurrent property GET during PATCH", "[http][hardening]") {
+    std::atomic<bool> stop{false};
+    std::atomic<int> reads{0};
+    std::atomic<int> bad{0};
+    // NOTE: Catch2 assertion macros are NOT thread-safe — reader threads must only
+    // touch atomics; all REQUIREs run on the main thread after join.
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&] {
+            httplib::Client c("localhost", m_port);
+            while (!stop.load()) {
+                auto g = c.Get("/app/components/c1/properties");
+                if (g && g->status == 200) {
+                    auto st = json::parse(g->body);     // GET must always return well-formed state
+                    if (st.contains("gain")) { reads.fetch_add(1); }
+                    else { bad.fetch_add(1); }
                 } else {
-                    content["error"] = std::format("failed to connect {}:{} to {}:{}",
-                                                   source_comp_id, source_port_name,
-                                                   target_comp_id, target_port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
+                    bad.fetch_add(1);
                 }
-            } catch (const std::exception& ex) {
-                content["error"] = ex.what();
-                res.set_content(content.dump(), "application/json");
-                res.status = httplib::BadRequest_400;
-            }
-        });
-
-        // DELETE /app/components/:id/ports/:port_name/connections
-        m_server->Delete("/app/components/:id/ports/:port_name/connections",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-            auto comp_id = req.path_params.at("id");
-            auto port_name = req.path_params.at("port_name");
-            auto content = nlohmann::json();
-
-            if (auto comp = m_app.get_component(comp_id); comp != nullptr) {
-                const auto& ports = comp->ports();
-                auto port_it = ports.find(port_name);
-
-                if (port_it != ports.end() && port_it->second != nullptr) {
-                    if (auto* output_port = dynamic_cast<output_port_base*>(port_it->second)) {
-                        auto disconnected_count = output_port->disconnect();
-                        content["success"] = std::format("disconnected {} connections from port '{}'",
-                                                         disconnected_count, port_name);
-                        content["disconnected_count"] = disconnected_count;
-                        res.set_content(content.dump(), "application/json");
-                        res.status = httplib::OK_200;
-                    } else {
-                        content["error"] = std::format("port '{}' is not an output port", port_name);
-                        res.set_content(content.dump(), "application/json");
-                        res.status = httplib::BadRequest_400;
-                    }
-                } else {
-                    content["error"] = std::format("port not found: {}", port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                }
-            } else {
-                content["error"] = std::format("component not found: {}", comp_id);
-                res.set_content(content.dump(), "application/json");
-                res.status = httplib::NotFound_404;
-            }
-        });
-
-        // DELETE /app/connections
-        m_server->Delete("/app/connections",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-            auto content = nlohmann::json();
-
-            try {
-                // Parse JSON body
-                auto conn_json = nlohmann::json::parse(req.body);
-
-                // Validate required fields
-                if (!conn_json.contains("output") || !conn_json.contains("input")) {
-                    content["error"] = "connection must specify both 'output' and 'input'";
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                auto& output = conn_json["output"];
-                auto& input = conn_json["input"];
-
-                // Validate output structure
-                if (!output.contains("component") || !output.contains("port")) {
-                    content["error"] = "output must specify 'component' and 'port'";
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                // Validate input structure
-                if (!input.contains("component") || !input.contains("port")) {
-                    content["error"] = "input must specify 'component' and 'port'";
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                auto source_comp_id = output["component"].get<std::string>();
-                auto source_port_name = output["port"].get<std::string>();
-                auto target_comp_id = input["component"].get<std::string>();
-                auto target_port_name = input["port"].get<std::string>();
-
-                auto source_comp = m_app.get_component(source_comp_id);
-                if (!source_comp) {
-                    content["error"] = std::format("source component not found: {}", source_comp_id);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                    return;
-                }
-
-                auto target_comp = m_app.get_component(target_comp_id);
-                if (!target_comp) {
-                    content["error"] = std::format("target component not found: {}", target_comp_id);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                    return;
-                }
-
-                const auto& source_ports = source_comp->ports();
-                auto source_port_it = source_ports.find(source_port_name);
-                if (source_port_it == source_ports.end() || source_port_it->second == nullptr) {
-                    content["error"] = std::format("source port not found: {}", source_port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                    return;
-                }
-
-                auto* output_port = dynamic_cast<output_port_base*>(source_port_it->second);
-                if (!output_port) {
-                    content["error"] = std::format("source port '{}' is not an output port", source_port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                const auto& target_ports = target_comp->ports();
-                auto target_port_it = target_ports.find(target_port_name);
-                if (target_port_it == target_ports.end() || target_port_it->second == nullptr) {
-                    content["error"] = std::format("target port not found: {}", target_port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::NotFound_404;
-                    return;
-                }
-
-                auto* input_port = dynamic_cast<input_port_base*>(target_port_it->second);
-                if (!input_port) {
-                    content["error"] = std::format("target port '{}' is not an input port", target_port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                    return;
-                }
-
-                bool was_connected = output_port->disconnect(input_port);
-                if (was_connected) {
-                    content["success"] = std::format("disconnected {}:{} from {}:{}",
-                                                     source_comp_id, source_port_name,
-                                                     target_comp_id, target_port_name);
-                    content["connection"] = {
-                        {"output", {{"component", source_comp_id}, {"port", source_port_name}}},
-                        {"input", {{"component", target_comp_id}, {"port", target_port_name}}}
-                    };
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::OK_200;
-                } else {
-                    content["error"] = std::format("ports were not connected: {}:{} -> {}:{}",
-                                                   source_comp_id, source_port_name,
-                                                   target_comp_id, target_port_name);
-                    res.set_content(content.dump(), "application/json");
-                    res.status = httplib::BadRequest_400;
-                }
-            } catch (const nlohmann::json::exception& e) {
-                content["error"] = std::format("invalid JSON in request body: {}", e.what());
-                res.set_content(content.dump(), "application/json");
-                res.status = httplib::BadRequest_400;
             }
         });
     }
-
-    int m_port;
-    composite::application m_app;
-    std::unique_ptr<httplib::Server> m_server;
-    std::thread m_server_thread;
-};
-
-TEST_CASE("HTTP Integration - Port Information") {
-    port_test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Get all ports for component") {
-        auto path = "/app/components/source/ports";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("component_id"));
-        REQUIRE(json["component_id"].get<std::string>() == "source");
-        REQUIRE(json.contains("ports"));
-        REQUIRE(json["ports"].is_array());
-        REQUIRE(json["ports"].size() == 1);
-        REQUIRE(json["ports"][0]["name"].get<std::string>() == "data_out");
-        REQUIRE(json["ports"][0]["type"].get<std::string>() == "output");
-        REQUIRE(json["ports"][0]["is_connected"].get<bool>() == false);
-        REQUIRE(json["ports"][0]["connection_count"].get<int>() == 0);
+    auto cli = client();
+    for (int i = 1; i <= 50; ++i) {
+        auto body = std::string(R"({"properties": {"gain": )") + std::to_string(i) + "}}";
+        REQUIRE(cli.Patch("/app/components/c1", body, "application/json")->status == 200);
     }
-
-    SECTION("Get ports for non-existent component") {
-        auto path = "/app/components/invalid/ports";
-        auto result = client.Get(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::NotFound_404);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("error"));
-    }
+    stop = true;
+    for (auto& t : readers) { t.join(); }
+    REQUIRE(bad.load() == 0);     // every concurrent GET returned consistent, well-formed state
+    REQUIRE(reads.load() > 0);
+    REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["gain"] == 50.0);
 }
 
-TEST_CASE("HTTP Integration - Port Connections") {
-    port_test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Create connection between components") {
-        auto body = nlohmann::json{
-            {"output", {{"component", "source"}, {"port", "data_out"}}},
-            {"input", {{"component", "sink"}, {"port", "data_in"}}}
-        }.dump();
-
-        auto result = client.Post("/app/connections", body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::Created_201);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("success"));
-        REQUIRE(json.contains("connection"));
-        REQUIRE(json["connection"]["output"]["component"].get<std::string>() == "source");
-        REQUIRE(json["connection"]["output"]["port"].get<std::string>() == "data_out");
-        REQUIRE(json["connection"]["input"]["component"].get<std::string>() == "sink");
-        REQUIRE(json["connection"]["input"]["port"].get<std::string>() == "data_in");
-
-        // Verify connection was made
-        auto ports_result = client.Get("/app/components/source/ports");
-        REQUIRE(ports_result);
-        auto ports_json = nlohmann::json::parse(ports_result->body);
-        REQUIRE(ports_json["ports"][0]["is_connected"].get<bool>() == true);
-        REQUIRE(ports_json["ports"][0]["connection_count"].get<int>() == 1);
-    }
-
-    SECTION("Create connection with invalid component") {
-        auto body = nlohmann::json{
-            {"output", {{"component", "invalid"}, {"port", "data_out"}}},
-            {"input", {{"component", "sink"}, {"port", "data_in"}}}
-        }.dump();
-
-        auto result = client.Post("/app/connections", body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::NotFound_404);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("error"));
-    }
-
-    SECTION("Create connection with missing fields") {
-        auto body = nlohmann::json{
-            {"output", {{"component", "source"}}}
-        }.dump();
-
-        auto result = client.Post("/app/connections", body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::BadRequest_400);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("error"));
-    }
-}
-
-TEST_CASE("HTTP Integration - Port Disconnections") {
-    port_test_server server;
-    httplib::Client client(server.base_url());
-
-    // First create a connection
-    auto conn_body = nlohmann::json{
-        {"output", {{"component", "source"}, {"port", "data_out"}}},
-        {"input", {{"component", "sink"}, {"port", "data_in"}}}
-    }.dump();
-    auto conn_result = client.Post("/app/connections", conn_body, "application/json");
-    REQUIRE(conn_result);
-    REQUIRE(conn_result->status == httplib::Created_201);
-
-    SECTION("Disconnect specific connection") {
-        auto body = nlohmann::json{
-            {"output", {{"component", "source"}, {"port", "data_out"}}},
-            {"input", {{"component", "sink"}, {"port", "data_in"}}}
-        }.dump();
-
-        auto result = client.Delete("/app/connections", body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("success"));
-        REQUIRE(json.contains("connection"));
-
-        // Verify disconnection
-        auto ports_result = client.Get("/app/components/source/ports");
-        REQUIRE(ports_result);
-        auto ports_json = nlohmann::json::parse(ports_result->body);
-        REQUIRE(ports_json["ports"][0]["is_connected"].get<bool>() == false);
-        REQUIRE(ports_json["ports"][0]["connection_count"].get<int>() == 0);
-    }
-
-    SECTION("Disconnect all connections from port") {
-        auto path = "/app/components/source/ports/data_out/connections";
-        auto result = client.Delete(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("success"));
-        REQUIRE(json.contains("disconnected_count"));
-        REQUIRE(json["disconnected_count"].get<int>() == 1);
-
-        // Verify disconnection
-        auto ports_result = client.Get("/app/components/source/ports");
-        REQUIRE(ports_result);
-        auto ports_json = nlohmann::json::parse(ports_result->body);
-        REQUIRE(ports_json["ports"][0]["is_connected"].get<bool>() == false);
-    }
-
-    SECTION("Disconnect non-existent connection") {
-        // First disconnect the actual connection
-        client.Delete("/app/components/source/ports/data_out/connections");
-
-        // Try to disconnect again using body-based DELETE
-        auto body = nlohmann::json{
-            {"output", {{"component", "source"}, {"port", "data_out"}}},
-            {"input", {{"component", "sink"}, {"port", "data_in"}}}
-        }.dump();
-
-        auto result = client.Delete("/app/connections", body, "application/json");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::BadRequest_400);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("error"));
-    }
-
-    SECTION("Disconnect from invalid port") {
-        auto path = "/app/components/source/ports/invalid/connections";
-        auto result = client.Delete(path);
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::NotFound_404);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("error"));
-    }
-}
-
-// ============================================================================
-// Metrics HTTP Endpoint Tests
-// ============================================================================
-
-// Helper function to convert metric_snapshot to JSON (mirrors server.cpp)
-auto metric_snapshot_to_json(const metrics::metric_snapshot& snap) -> nlohmann::json {
-    auto json_obj = nlohmann::json::object();
-    json_obj["name"] = snap.name;
-    json_obj["description"] = snap.description;
-    json_obj["unit"] = snap.unit;
-    json_obj["type"] = std::string{metrics::to_string(snap.type)};
-
-    auto labels_obj = nlohmann::json::object();
-    for (const auto& [k, v] : snap.labels) {
-        labels_obj[k] = v;
-    }
-    json_obj["labels"] = labels_obj;
-
-    std::visit([&json_obj](auto&& val) {
-        using T = std::decay_t<decltype(val)>;
-        if constexpr (std::is_same_v<T, uint64_t>) {
-            json_obj["value"] = val;
-        } else if constexpr (std::is_same_v<T, int64_t>) {
-            json_obj["value"] = val;
-        } else if constexpr (std::is_same_v<T, double>) {
-            json_obj["value"] = val;
-        } else if constexpr (std::is_same_v<T, metrics::histogram_snapshot>) {
-            auto hist_obj = nlohmann::json::object();
-            hist_obj["count"] = val.count;
-            hist_obj["sum"] = val.sum;
-            hist_obj["boundaries"] = val.boundaries;
-            hist_obj["bucket_counts"] = val.bucket_counts;
-            json_obj["value"] = hist_obj;
-        }
-    }, snap.value);
-
-    // Add timestamp (matches server.cpp)
-    auto time_t = std::chrono::system_clock::to_time_t(snap.timestamp);
-    std::tm tm{};
-    gmtime_r(&time_t, &tm);
-    char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    json_obj["timestamp"] = buf;
-
-    return json_obj;
-}
-
-auto metrics_to_json(const std::vector<metrics::metric_snapshot>& snapshots) -> nlohmann::json {
-    auto result = nlohmann::json::object();
-
-    auto time_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm tm{};
-    gmtime_r(&time_t, &tm);
-    char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    result["timestamp"] = buf;
-
-    auto metrics_arr = nlohmann::json::array();
-    for (const auto& snap : snapshots) {
-        metrics_arr.push_back(metric_snapshot_to_json(snap));
-    }
-    result["metrics"] = metrics_arr;
-    result["count"] = snapshots.size();
-
-    return result;
-}
-
-// Test server with metrics endpoints
-class metrics_test_server {
-public:
-    metrics_test_server() : m_port(18082), m_server(std::make_unique<httplib::Server>()) {
-        // Clear existing metrics from previous tests
-        clear_test_metrics();
-
-        // Setup metrics REST API endpoints
-        setup_metrics_endpoints();
-
-        // Start server in background thread
-        m_server_thread = std::thread([this]() {
-            m_server->listen("localhost", m_port);
-        });
-
-        // Wait for server to be ready
-        std::this_thread::sleep_for(100ms);
-    }
-
-    ~metrics_test_server() {
-        m_server->stop();
-        if (m_server_thread.joinable()) {
-            m_server_thread.join();
-        }
-        // Clear test metrics
-        clear_test_metrics();
-    }
-
-    auto port() const -> int { return m_port; }
-    auto base_url() const -> std::string {
-        return std::format("http://localhost:{}", m_port);
-    }
-
-    // Create test metrics for the tests to use
-    auto create_test_counter(const std::string& name, const std::string& desc = "",
-                             metrics::labels_t labels = {}) -> metrics::counter<uint64_t>& {
-        return metrics::registry::instance().create_counter(name, desc, "1", labels);
-    }
-
-    auto create_test_gauge(const std::string& name, const std::string& desc = "",
-                           metrics::labels_t labels = {}) -> metrics::gauge<double>& {
-        return metrics::registry::instance().create_gauge(name, desc, "1", labels);
-    }
-
-    auto create_test_histogram(const std::string& name, const std::string& desc = "",
-                               metrics::labels_t labels = {}) -> metrics::histogram& {
-        return metrics::registry::instance().create_histogram_pow2(name, desc, "ms", 10, labels);
-    }
-
-private:
-    void clear_test_metrics() {
-        // Remove all test metrics by prefix
-        metrics::registry::instance().remove_by_prefix("test.");
-        metrics::registry::instance().remove_by_prefix("http_test.");
-    }
-
-    void setup_metrics_endpoints() {
-        // GET /app/metrics - Snapshot of all metrics
-        m_server->Get("/app/metrics", [](const httplib::Request& req, httplib::Response& res) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-
-            auto& registry = metrics::registry::instance();
-            std::vector<metrics::metric_snapshot> snapshots;
-
-            // Check for prefix filter
-            if (req.has_param("prefix")) {
-                snapshots = registry.snapshot_by_prefix(req.get_param_value("prefix"));
-            }
-            // Check for label filter
-            else if (req.has_param("label_key") && req.has_param("label_value")) {
-                snapshots = registry.snapshot_by_label(
-                    req.get_param_value("label_key"),
-                    req.get_param_value("label_value"));
-            }
-            // All metrics
-            else {
-                snapshots = registry.snapshot_all();
-            }
-
-            auto result = metrics_to_json(snapshots);
-            res.set_content(result.dump(2), "application/json");
-            res.status = httplib::OK_200;
-        });
-
-        // GET /app/metrics/stream - SSE endpoint for metrics streaming
-        m_server->Get("/app/metrics/stream", [](const httplib::Request& req, httplib::Response& res) {
-            // Parse interval from query params (default 1000ms)
-            int interval_ms = 1000;
-            if (req.has_param("interval")) {
-                try {
-                    interval_ms = std::stoi(req.get_param_value("interval"));
-                    if (interval_ms < 100) interval_ms = 100;
-                    if (interval_ms > 60000) interval_ms = 60000;
-                } catch (...) {
-                    // Use default
-                }
-            }
-
-            // Optional prefix filter
-            std::string prefix_filter;
-            if (req.has_param("prefix")) {
-                prefix_filter = req.get_param_value("prefix");
-            }
-
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("Connection", "keep-alive");
-
-            res.set_chunked_content_provider(
-                "text/event-stream",
-                [interval_ms, prefix_filter](
-                    std::size_t /*offset*/,
-                    httplib::DataSink& sink
-                ) -> bool {
-                    if (sink.is_writable != nullptr && !sink.is_writable()) {
-                        return false;
-                    }
-
-                    auto& registry = metrics::registry::instance();
-                    std::vector<metrics::metric_snapshot> snapshots;
-                    if (!prefix_filter.empty()) {
-                        snapshots = registry.snapshot_by_prefix(prefix_filter);
-                    } else {
-                        snapshots = registry.snapshot_all();
-                    }
-
-                    auto data = metrics_to_json(snapshots).dump();
-                    auto event = std::format("event: metrics\ndata: {}\n\n", data);
-
-                    if (!sink.write(event.c_str(), event.size())) {
-                        return false;
-                    }
-
-                    // For testing, just send one event and stop
-                    // (to avoid infinite streaming in tests)
-                    return false;
-                }
-            );
+// The SSE stream cap (8) bounds concurrent streams; a 9th is rejected with 503,
+// and a slot frees once a stream ends (RAII release).
+TEST_CASE_METHOD(rest_fixture, "SSE metric stream cap -> 503, then frees", "[http][hardening]") {
+    constexpr int cap = 8;
+    std::atomic<int> established{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> streams;
+
+    for (int i = 0; i < cap; ++i) {
+        streams.emplace_back([&] {
+            httplib::Client c("localhost", m_port);
+            c.set_read_timeout(10, 0);
+            bool counted = false;
+            c.Get("/app/metrics/stream?interval=100",
+                  [&](const char* /*data*/, size_t /*len*/) -> bool {
+                      if (!counted) { counted = true; established.fetch_add(1); }
+                      while (!stop.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+                      return false;  // end this stream
+                  });
         });
     }
 
-    int m_port;
-    std::unique_ptr<httplib::Server> m_server;
-    std::thread m_server_thread;
-};
+    // Wait until all cap streams have produced data (slots are held).
+    for (int i = 0; i < 500 && established.load() < cap; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(established.load() == cap);
 
-TEST_CASE("HTTP Integration - Metrics Snapshot", "[http][metrics]") {
-    metrics_test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Get empty metrics returns valid JSON") {
-        auto result = client.Get("/app/metrics");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-        REQUIRE(result->get_header_value("Content-Type") == "application/json");
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json.contains("timestamp"));
-        REQUIRE(json.contains("count"));
-        REQUIRE(json.contains("metrics"));
-        REQUIRE(json["metrics"].is_array());
+    // The (cap+1)-th stream is rejected immediately with 503.
+    {
+        httplib::Client c("localhost", m_port);
+        c.set_read_timeout(5, 0);
+        auto r = c.Get("/app/metrics/stream?interval=100");
+        REQUIRE(r);
+        REQUIRE(r->status == 503);
     }
 
-    SECTION("Get metrics with counter") {
-        auto& counter = server.create_test_counter("http_test.packets", "Packets processed",
-                                                    {{"component", "test"}});
-        counter.add(42);
+    // Release all held streams; the server frees each slot when it next notices
+    // the closed connection (within ~one interval). Poll until a new stream is
+    // admitted again, proving the RAII slot release works.
+    stop = true;
+    for (auto& t : streams) { t.join(); }
 
-        auto result = client.Get("/app/metrics?prefix=http_test.");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json["count"].get<size_t>() >= 1);
-
-        // Find our counter in the response
-        bool found = false;
-        for (const auto& metric : json["metrics"]) {
-            if (metric["name"].get<std::string>() == "http_test.packets") {
-                found = true;
-                REQUIRE(metric["type"].get<std::string>() == "counter");
-                REQUIRE(metric["value"].get<uint64_t>() == 42);
-                REQUIRE(metric["description"].get<std::string>() == "Packets processed");
-                REQUIRE(metric["labels"]["component"].get<std::string>() == "test");
-                break;
-            }
-        }
-        REQUIRE(found);
+    bool admitted_again = false;
+    for (int attempt = 0; attempt < 30 && !admitted_again; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        httplib::Client c("localhost", m_port);
+        c.set_read_timeout(2, 0);
+        bool got_chunk = false;
+        c.Get("/app/metrics/stream?interval=100",
+              [&](const char*, size_t) -> bool { got_chunk = true; return false; });
+        admitted_again = got_chunk;
     }
-
-    SECTION("Get metrics with gauge") {
-        auto& gauge = server.create_test_gauge("http_test.cpu_percent", "CPU usage",
-                                                {{"host", "localhost"}});
-        gauge.set(75.5);
-
-        auto result = client.Get("/app/metrics?prefix=http_test.");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-
-        // Find our gauge in the response
-        bool found = false;
-        for (const auto& metric : json["metrics"]) {
-            if (metric["name"].get<std::string>() == "http_test.cpu_percent") {
-                found = true;
-                REQUIRE(metric["type"].get<std::string>() == "gauge");
-                REQUIRE(metric["value"].get<double>() == Catch::Approx(75.5));
-                REQUIRE(metric["labels"]["host"].get<std::string>() == "localhost");
-                break;
-            }
-        }
-        REQUIRE(found);
-    }
-
-    SECTION("Get metrics with histogram") {
-        auto& histogram = server.create_test_histogram("http_test.latency", "Request latency",
-                                                        {{"endpoint", "/api"}});
-        histogram.record(10);
-        histogram.record(50);
-        histogram.record(100);
-
-        auto result = client.Get("/app/metrics?prefix=http_test.");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-
-        // Find our histogram in the response
-        bool found = false;
-        for (const auto& metric : json["metrics"]) {
-            if (metric["name"].get<std::string>() == "http_test.latency") {
-                found = true;
-                REQUIRE(metric["type"].get<std::string>() == "histogram");
-                REQUIRE(metric["value"].is_object());
-                REQUIRE(metric["value"]["count"].get<uint64_t>() == 3);
-                REQUIRE(metric["value"]["sum"].get<double>() == Catch::Approx(160.0));
-                REQUIRE(metric["value"]["boundaries"].is_array());
-                REQUIRE(metric["value"]["bucket_counts"].is_array());
-                REQUIRE(metric["labels"]["endpoint"].get<std::string>() == "/api");
-                break;
-            }
-        }
-        REQUIRE(found);
-    }
-
-    SECTION("CORS header is set") {
-        auto result = client.Get("/app/metrics");
-
-        REQUIRE(result);
-        REQUIRE(result->get_header_value("Access-Control-Allow-Origin") == "*");
-    }
-}
-
-TEST_CASE("HTTP Integration - Metrics Filtering", "[http][metrics]") {
-    metrics_test_server server;
-    httplib::Client client(server.base_url());
-
-    // Create metrics with different prefixes and labels
-    auto& counter1 = server.create_test_counter("http_test.app.requests", "", {{"env", "prod"}});
-    auto& counter2 = server.create_test_counter("http_test.app.errors", "", {{"env", "prod"}});
-    auto& counter3 = server.create_test_counter("http_test.db.queries", "", {{"env", "dev"}});
-
-    counter1.add(100);
-    counter2.add(5);
-    counter3.add(50);
-
-    SECTION("Filter by prefix") {
-        auto result = client.Get("/app/metrics?prefix=http_test.app");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json["count"].get<size_t>() == 2);
-
-        // All returned metrics should start with http_test.app
-        for (const auto& metric : json["metrics"]) {
-            auto name = metric["name"].get<std::string>();
-            REQUIRE(name.starts_with("http_test.app"));
-        }
-    }
-
-    SECTION("Filter by label") {
-        auto result = client.Get("/app/metrics?label_key=env&label_value=prod");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-
-        // All returned metrics should have env=prod label
-        for (const auto& metric : json["metrics"]) {
-            if (metric["name"].get<std::string>().starts_with("http_test.")) {
-                REQUIRE(metric["labels"]["env"].get<std::string>() == "prod");
-            }
-        }
-    }
-
-    SECTION("Prefix filter returns empty for non-matching prefix") {
-        auto result = client.Get("/app/metrics?prefix=nonexistent.prefix");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json["count"].get<size_t>() == 0);
-        REQUIRE(json["metrics"].empty());
-    }
-}
-
-// Note: SSE streaming tests are omitted because httplib's client has compatibility
-// issues with chunked streaming responses. The /app/metrics/stream endpoint should
-// be tested manually or with a different HTTP client library that supports SSE.
-
-TEST_CASE("HTTP Integration - Metrics Response Format", "[http][metrics]") {
-    metrics_test_server server;
-    httplib::Client client(server.base_url());
-
-    SECTION("Timestamp is ISO 8601 format") {
-        auto result = client.Get("/app/metrics");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        auto timestamp = json["timestamp"].get<std::string>();
-
-        // ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ
-        REQUIRE(timestamp.length() == 20);
-        REQUIRE(timestamp[4] == '-');
-        REQUIRE(timestamp[7] == '-');
-        REQUIRE(timestamp[10] == 'T');
-        REQUIRE(timestamp[13] == ':');
-        REQUIRE(timestamp[16] == ':');
-        REQUIRE(timestamp[19] == 'Z');
-    }
-
-    SECTION("Multiple metrics have correct structure") {
-        server.create_test_counter("http_test.multi.counter", "Counter metric");
-        server.create_test_gauge("http_test.multi.gauge", "Gauge metric");
-
-        auto result = client.Get("/app/metrics?prefix=http_test.multi");
-
-        REQUIRE(result);
-        REQUIRE(result->status == httplib::OK_200);
-
-        auto json = nlohmann::json::parse(result->body);
-        REQUIRE(json["count"].get<size_t>() == 2);
-
-        for (const auto& metric : json["metrics"]) {
-            // Every metric should have these fields
-            REQUIRE(metric.contains("name"));
-            REQUIRE(metric.contains("description"));
-            REQUIRE(metric.contains("unit"));
-            REQUIRE(metric.contains("type"));
-            REQUIRE(metric.contains("labels"));
-            REQUIRE(metric.contains("value"));
-            REQUIRE(metric.contains("timestamp"));
-
-            // Labels should be an object
-            REQUIRE(metric["labels"].is_object());
-        }
-    }
+    REQUIRE(admitted_again);
 }

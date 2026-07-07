@@ -4,13 +4,10 @@
  */
 
 #include "composite/core/application.hpp"
+#include "composite/core/register.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
 #include "helpers.hpp"
-
-#ifdef COMPOSITE_USE_NATS
-#include "composite/transports/nats/transport.hpp"
-#endif
 
 #include <format>
 #include <iostream>
@@ -19,9 +16,11 @@
 
 namespace composite {
 
+namespace {
 auto close_func(void* p) -> void {
-    dlclose(p);
-};
+    if (p != nullptr) { dlclose(p); }
+}
+} // namespace
 
 auto generate_app_name() -> std::string {
     auto app_name = std::string{"composite-"};
@@ -35,7 +34,19 @@ auto generate_app_name() -> std::string {
     return app_name;
 }
 
-auto make_component(const nlohmann::json& comp_json, component_handles_type& handles) -> std::shared_ptr<composite::component> {
+auto make_component(const nlohmann::json& comp_json) -> std::shared_ptr<composite::component> {
+    // Validate field TYPES, not just presence: a non-string "library"/"id"
+    // (e.g. `"library": 42`) would otherwise throw nlohmann::json::type_error out
+    // of .get<std::string>(), which is not a std::runtime_error and historically
+    // escaped the loader to std::terminate.
+    if (!comp_json.contains("library") || !comp_json["library"].is_string()) {
+        spdlog::error("component 'library' field is required and must be a string");
+        return {};
+    }
+    if (!comp_json.contains("id") || !comp_json["id"].is_string()) {
+        spdlog::error("component 'id' field is required and must be a string");
+        return {};
+    }
     // Get component library path/name
     auto library = comp_json["library"].get<std::string>();
 
@@ -50,7 +61,7 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
     // Get component module handle
     auto comp_handle = std::unique_ptr<void, decltype(&close_func)>(dlopen(library.c_str(), RTLD_NOW), close_func);
     if (!comp_handle) {
-        std::cerr << std::format("failed to open {}: {}\n", library, dlerror());
+        spdlog::error("failed to open {}: {}", library, dlerror());
         return {};
     }
     dlerror(); // clear existing
@@ -58,44 +69,86 @@ auto make_component(const nlohmann::json& comp_json, component_handles_type& han
     // Get component id (required)
     auto comp_id = comp_json["id"].get<std::string>();
 
-    // Component shared_ptr
-    auto comp_ptr = std::shared_ptr<composite::component>{nullptr};
-
-    // Get the create function and call with id
-    if (comp_json.contains("create_arg")) {
-        // Get create arg if present
-        auto create_arg = comp_json["create_arg"].get<std::string>();
-        // Create function with id and arg parameters
-        using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view, std::string_view);
-        auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
-        if (auto err = dlerror(); err != nullptr) {
-            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", library, err);
-            return {};
-        }
-        dlerror(); // clear existing
-        // Create a new component with id and arg
-        comp_ptr = (*create_func)(comp_id, create_arg);
-    } else {
-        // Create function with only id parameter
-        using function_ptr = std::shared_ptr<composite::component> (*)(std::string_view);
-        auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
-        if (auto err = dlerror(); err != nullptr) {
-            std::cerr << std::format("failed to find the 'create' symbol from {}: {}\n", library, err);
-            return {};
-        }
-        dlerror(); // clear existing
-        // Create a new component with id
-        comp_ptr = (*create_func)(comp_id);
+    // ABI handshake: a component built with COMPOSITE_REGISTER_COMPONENT exports
+    // composite_abi_version(). Refuse to call create() on a library that lacks it or
+    // reports an incompatible ABI — both indicate a stale/foreign build whose create()
+    // signature or component contract may not match this framework (calling create()
+    // through a mismatched function pointer would be UB). This is the single, uniform
+    // (id, args) ABI; the old per-arity create() probing is gone.
+    using abi_fn = unsigned long (*)();
+    auto abi_func = reinterpret_cast<abi_fn>(dlsym(comp_handle.get(), "composite_abi_version"));
+    if (abi_func == nullptr) {
+        spdlog::error("{}: missing 'composite_abi_version' symbol — rebuild the component with "
+                      "COMPOSITE_REGISTER_COMPONENT (this framework expects ABI v{})",
+                      library, composite::abi_version);
+        return {};
     }
-    if (comp_ptr == nullptr) {
+    if (auto v = (*abi_func)(); v != composite::abi_version) {
+        spdlog::error("{}: component ABI version {} != framework ABI version {} — rebuild the component",
+                      library, v, composite::abi_version);
+        return {};
+    }
+
+    // Build construction args. Prefer the structured "args" object; accept the legacy
+    // scalar "create_arg" string (mapped to {"type": ...}) so existing configs keep working.
+    composite::create_args args;
+    if (comp_json.contains("args") && comp_json["args"].is_object()) {
+        args.values = comp_json["args"];
+    } else if (comp_json.contains("create_arg") && comp_json["create_arg"].is_string()) {
+        args.values = nlohmann::json{{"type", comp_json["create_arg"].get<std::string>()}};
+    }
+
+    std::shared_ptr<composite::component> inner;
+
+    // create() may throw (a component throws on an unknown/unsupported type arg).
+    // Catch it HERE, while comp_handle (the mapping) is still alive: otherwise the
+    // unique_ptr destructs during unwinding and dlclose()s the library before the
+    // exception reaches its handler — unmapping the in-flight exception's
+    // type_info/vtable (which can live in the .so) → crash. Consuming it here also
+    // turns a config typo into a clean load failure instead of std::terminate.
+    try {
+        using function_ptr =
+            std::shared_ptr<composite::component> (*)(std::string_view, const composite::create_args&);
+        auto create_func = reinterpret_cast<function_ptr>(dlsym(comp_handle.get(), "create"));
+        if (auto err = dlerror(); err != nullptr) {
+            spdlog::error("failed to find the 'create' symbol from {}: {}", library, err);
+            return {};
+        }
+        inner = (*create_func)(comp_id, args);
+    } catch (const std::exception& e) {
+        spdlog::error("create() for '{}' from {} threw: {}", comp_id, library, e.what());
+        return {};
+    } catch (...) {
+        spdlog::error("create() for '{}' from {} threw a non-std exception", comp_id, library);
+        return {};
+    }
+
+    if (inner == nullptr) {
         spdlog::error("failed to create component '{}' from library {}", comp_id, library);
-        return comp_ptr;
+        return {};
+    }
+    // The component must honor the configured id. Some libraries hardcode it
+    // (e.g. a 0-arg create()), which would otherwise silently shadow another
+    // instance (add_component rejects the duplicate) and leave connections/REST
+    // addressing a component that isn't in the graph.
+    if (inner->id() != comp_id) {
+        spdlog::error("library {} returned component id '{}', expected '{}' — create() must use the provided id",
+                      library, inner->id(), comp_id);
+        return {};
     }
 
-    // Store handle for closing later
-    handles.emplace_back(std::move(comp_handle));
-    spdlog::trace("component {} created", comp_ptr->id());
-    return comp_ptr;
+    // Tie the dlopen handle to the component's lifetime. The returned shared_ptr's
+    // control block is owned by THIS binary (not the .so), and its deleter destroys
+    // the component FIRST (inner.reset(), explicit so it runs before the captured
+    // handle), then lets the captured handle dlclose() — so the library is unmapped
+    // only after ~component (whose code/vtable live in that mapping) has run.
+    auto* raw = inner.get();
+    spdlog::trace("component {} created", comp_id);
+    return std::shared_ptr<composite::component>(raw,
+        [inner = std::move(inner), h = std::move(comp_handle)](composite::component*) mutable {
+            inner.reset();  // ~component runs here, while h (the mapping) is still alive
+            // h destructs at the end of this lambda → dlclose() after the component is gone
+        });
 }
 
 auto validate_component_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {
@@ -107,164 +160,11 @@ auto validate_component_connection(const nlohmann::json& conn) -> std::tuple<std
     return {component, port, {}};
 }
 
-auto validate_nats_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {
-#ifndef COMPOSITE_USE_NATS
-    return {"", "", "NATS support is not enabled"};
-#endif
-    if (!conn.contains("subject")) {
-        return {{}, {}, "missing 'subject' field for NATS connection"};
-    }
-    auto url = conn["nats"].get<std::string>();
-    auto subject = conn["subject"].get<std::string>();
-    return {url, subject, {}};
-}
-
 auto validate_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {
     if (conn.contains("component")) {
         return validate_component_connection(conn);
-    } else if (conn.contains("nats")) {
-        return validate_nats_connection(conn);
     }
     return {{}, {}, "missing connection type"};
-}
-
-auto parse_transports(const nlohmann::json& transports_json)
-  -> std::tuple<transport_registry, std::string> {
-    transport_registry registry;
-
-    if (!transports_json.is_array()) {
-        return {std::move(registry), "transports must be an array"};
-    }
-
-    for (const auto& transport_json : transports_json) {
-        // Validate required fields
-        if (!transport_json.contains("id")) {
-            return {std::move(registry), "transport missing 'id' field"};
-        }
-        if (!transport_json.contains("type")) {
-            return {std::move(registry), std::format("transport '{}' missing 'type' field",
-                transport_json["id"].get<std::string>())};
-        }
-
-        auto id = transport_json["id"].get<std::string>();
-        auto type_str = transport_json["type"].get<std::string>();
-
-        // Convert string to transport_type enum
-        auto type_opt = from_string(type_str);
-        if (!type_opt.has_value()) {
-            return {std::move(registry), std::format("unknown transport type '{}' for transport '{}'", type_str, id)};
-        }
-
-        // Check for duplicate IDs
-        if (registry.contains(id)) {
-            return {std::move(registry), std::format("duplicate transport id: '{}'", id)};
-        }
-
-        // Store transport definition
-        transport_definition def;
-        def.id = id;
-        def.type = *type_opt;
-        def.config = transport_json;  // Store full JSON for later instantiation
-
-        registry[id] = def;
-    }
-
-    return {std::move(registry), ""};
-}
-
-auto create_transport(const transport_definition& def)
-  -> std::tuple<std::unique_ptr<transport_base>, std::string> {
-    if (def.type == transport_type::nats) {
-#ifndef COMPOSITE_USE_NATS
-        return {nullptr, std::format("NATS support not enabled for transport '{}'", def.id)};
-#else
-        // Validate NATS-specific fields
-        if (!def.config.contains("url")) {
-            return {nullptr, std::format("NATS transport '{}' missing 'url' field", def.id)};
-        }
-        if (!def.config.contains("subject")) {
-            return {nullptr, std::format("NATS transport '{}' missing 'subject' field", def.id)};
-        }
-
-        auto url = def.config["url"].get<std::string>();
-        auto subject = def.config["subject"].get<std::string>();
-
-        try {
-            auto transport = std::make_unique<nats::transport>(url, subject);
-            return {std::move(transport), ""};
-        } catch (const std::exception& e) {
-            return {nullptr, std::format("failed to create NATS transport '{}': {}", def.id, e.what())};
-        }
-#endif
-    }
-
-    return {nullptr, std::format("unknown transport type '{}' for transport '{}'", to_string(def.type), def.id)};
-}
-
-auto attach_component_transports(
-    std::shared_ptr<component> comp,
-    const nlohmann::json& transports_json,
-    const transport_registry& registry
-) -> std::string {
-
-    if (!transports_json.is_object()) {
-        return std::format("component '{}' transports must be an object", comp->id());
-    }
-
-    // Iterate over port_name -> [transport_ids] mappings
-    for (const auto& [port_name, transport_ids] : transports_json.items()) {
-        if (!transport_ids.is_array()) {
-            return std::format("component '{}' port '{}' transports must be an array",
-                comp->id(), port_name);
-        }
-
-        // Look up the port (will check both inputs and outputs)
-        auto* output_port_ptr = comp->get_port<output_port_base>(port_name);
-
-        if (output_port_ptr != nullptr) {
-            // It's an output port - attach transports
-            for (const auto& transport_id_json : transport_ids) {
-                if (!transport_id_json.is_string()) {
-                    return std::format("component '{}' port '{}' transport ID must be a string",
-                        comp->id(), port_name);
-                }
-
-                auto transport_id = transport_id_json.get<std::string>();
-
-                // Look up transport definition in registry
-                auto it = registry.find(transport_id);
-                if (it == registry.end()) {
-                    return std::format("component '{}' port '{}' references unknown transport '{}'",
-                        comp->id(), port_name, transport_id);
-                }
-
-                // Create a new transport instance from the definition
-                auto [transport, error] = create_transport(it->second);
-                if (!error.empty()) {
-                    return std::format("component '{}' port '{}': {}", comp->id(), port_name, error);
-                }
-
-                // Attach transport to the output port
-                output_port_ptr->add_transport(std::move(transport));
-
-                spdlog::debug("Attached transport '{}' to component '{}' port '{}'",
-                    transport_id, comp->id(), port_name);
-            }
-        } else {
-            // Check if it's an input port
-            auto* input_port = comp->get_port<input_port_base>(port_name);
-            if (input_port != nullptr) {
-                // Input transports not yet implemented
-                return std::format("component '{}' port '{}' is an input port - input transports not yet supported",
-                    comp->id(), port_name);
-            } else {
-                return std::format("component '{}' has no port named '{}'",
-                    comp->id(), port_name);
-            }
-        }
-    }
-
-    return "";
 }
 
 auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config {
