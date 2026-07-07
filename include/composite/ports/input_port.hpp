@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024-2025 Geon Technologies, LLC
+ * Copyright (C) 2024-2026 Geon Technologies, LLC
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
@@ -7,448 +7,288 @@
 
 #include "composite/buffers/buffer.hpp"
 #include "composite/core/metadata.hpp"
+#include "composite/core/park.hpp"  // doorbell: signal the consumer worker on the empty->non-empty edge
 #include "composite/core/timestamp.hpp"
 #include "port_base.hpp"
 
 #include <atomic>
 #include <chrono>
-#include <deque>
-#include <limits>
+#include <cstddef>
+#include <new>
 #include <optional>
-#include <ranges>
+#include <span>
 #include <tuple>
+#include <type_traits>
 #include <typeinfo>
+#include <vector>
 
 namespace composite {
 
-/**
- * @brief Tag type for blocking get_data operations
- *
- * Use this tag to request blocking behavior (waits indefinitely until data arrives).
- *
- * Example usage:
- * @code
- * auto data = input.get_data(composite::blocking);  // Blocks until data available
- * auto data = input.get_data(500ms);                // Waits up to 500ms
- * auto data = input.get_data();                     // Default 1s timeout
- * @endcode
- */
-struct blocking_t {};
+/// Trait: is @c Buf a mutable_buffer<T>? Reports a port's mutability without two
+/// separate input_port specializations.
+template <typename> struct is_mutable_buffer : std::false_type {};
+template <typename T> struct is_mutable_buffer<mutable_buffer<T>> : std::true_type {};
+
+namespace detail {
+inline auto round_up_pow2(std::size_t n) -> std::size_t {
+    std::size_t p = 1;
+    while (p < n) { p <<= 1; }
+    return p;
+}
+} // namespace detail
 
 /**
- * @brief Constant instance of blocking_t for use with get_data()
+ * @brief Input port: a bounded **lock-free single-producer/single-consumer ring**
+ *        of (buffer, timestamp, metadata) packets.
+ * @tparam Buf Buffer type — either @c immutable_buffer<T> or @c mutable_buffer<T>.
+ *
+ * **Concurrency model (the precondition the lock-free ring rests on):**
+ *  - **One consumer:** only the owning component's single worker thread calls
+ *    get_data(). (REST introspection reads stats, never the ring.)
+ *  - **One producer:** an input may be fed by at most one output port. This is
+ *    enforced at connect time (output_port_base::connect claims the input;
+ *    fan-in is rejected), so the single-producer invariant holds by construction.
+ *
+ * The ring uses two monotonically increasing indices: the producer owns @c m_tail,
+ * the consumer owns @c m_head, on separate cache lines. Publication is a
+ * release/acquire pair on each index — see add_data()/pop() for the ordering
+ * argument. Capacity is a power of two fixed at construction (grown only while
+ * empty, at setup); @c depth() is the runtime soft limit (0 ⇒ drop all, i.e.
+ * paused). When the ring is full the packet is dropped at the producer and the
+ * overflow callback fires — real bounded backpressure.
  */
-inline constexpr blocking_t blocking{};
-
-/**
- * @brief Forward declaration of input_port template
- *
- * input_port is specialized for immutable_buffer<T> and mutable_buffer<T>.
- */
-template <typename BufferType> class input_port;
-
-/**
- * @brief Input port specialization for immutable buffers
- * @tparam T Element type (e.g., float, int, custom struct)
- *
- * Receives immutable_buffer<T> data from connected output ports. Features:
- * - Zero-copy sharing when possible (immutable → immutable)
- * - Thread-safe queue with configurable depth and backpressure
- * - Multiple get_data() variants (timeout, blocking)
- * - Statistics tracking (throughput, drops, queue depth)
- * - Metadata association with data packets
- *
- * **Thread Safety:** All public methods are thread-safe. The queue is
- * protected by a mutex, and get_data() uses condition variables for
- * efficient blocking.
- *
- * **Typical Usage:**
- * @code
- * input_port<immutable_buffer<float>> input{"samples_in"};
- * input.depth(100);  // Limit queue to 100 packets
- *
- * // In component process():
- * auto [buffer, ts, metadata] = input.get_data();
- * if (buffer) {
- *     // Process data...
- * }
- * @endcode
- */
-template <typename T>
-class input_port<immutable_buffer<T>> : public input_port_base {
+template <typename Buf>
+class input_port : public input_port_base {
 public:
-    using buffer_type = immutable_buffer<T>;  ///< Buffer type for this port
-    using value_type = T;                     ///< Element type stored in buffers
-    using queue_type = std::tuple<buffer_type, timestamp, std::optional<composite::metadata>>;  ///< Queue entry structure
+    using buffer_type = Buf;
+    using value_type = typename Buf::value_type;
+    using queue_type = std::tuple<buffer_type, timestamp, std::optional<composite::metadata>>;
 
-    /**
-     * @brief Inherit constructor from input_port_base
-     */
-    using input_port_base::input_port_base;
+    /// @param name Port name. @param depth Initial queue depth (also sizes the ring).
+    explicit input_port(std::string_view name, std::size_t depth = 1024)
+        : input_port_base(name) {
+        this->depth(depth);  // sizes the ring (empty) + sets the soft limit
+    }
 
-    /**
-     * @brief Default destructor
-     */
     ~input_port() override = default;
 
-    /**
-     * @brief Get type index for element type T
-     * @return std::type_index for type T
-     */
-    auto element_type() const -> std::type_index override {
-        return std::type_index(typeid(T));
-    }
+    auto element_type() const -> std::type_index override { return std::type_index(typeid(value_type)); }
+    auto element_type_id() const -> std::size_t override { return typeid(value_type).hash_code(); }
+    auto is_mutable() const -> bool override { return is_mutable_buffer<Buf>::value; }
 
-    /**
-     * @brief Get type identifier for element type T
-     * @return Hash code from typeid(T)
-     */
-    auto element_type_id() const -> std::size_t override {
-        return typeid(T).hash_code();
-    }
-
-    /**
-     * @brief Check if this port uses mutable buffers
-     * @return false (immutable_buffer port)
-     */
-    auto is_mutable() const -> bool override { return false; }
-
-    /**
-     * @brief Get data with timeout (defaults to 1 second)
-     * @param timeout Maximum time to wait for data (default: 1s)
-     * @return Tuple of buffer, timestamp, and optional metadata
-     */
-    template<typename Rep = int64_t, typename Period = std::ratio<1>>
-    auto get_data(std::chrono::duration<Rep, Period> timeout = std::chrono::seconds(1)) -> queue_type {
-        auto lock = std::unique_lock{m_mtx};
-        m_cv.wait_for(lock, timeout, [this]{ return !m_queue.empty(); });
-
-        if (!m_queue.empty()) {
-            auto result = std::move(m_queue.front());
-            m_queue.pop_front();
-
-            // Update statistics and queue depth
-            auto& [buffer, ts_val, metadata] = result;
-            m_stats.record_transfer(buffer.size() * sizeof(T));
-            update_queue_depth_metric(m_queue.size());
-
-            return result;
+    /// Set the queue depth (soft limit). Grows the ring to hold @p value only while
+    /// the ring is empty (setup-time); a runtime change (e.g. pause via depth(0))
+    /// just adjusts the limit and never reallocates a live ring.
+    auto depth(std::size_t value) -> void override {
+        const std::size_t want = detail::round_up_pow2(value == 0 ? 1 : value);
+        if (want > m_ring.size()
+            && m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_acquire)) {
+            m_ring = std::vector<queue_type>(want);  // default-construct slots (queue_type is move-only)
+            m_mask = want - 1;
+            m_head.store(0, std::memory_order_relaxed);
+            m_tail.store(0, std::memory_order_relaxed);
         }
-        return {};
+        input_port_base::depth(value);  // soft limit + capacity gauge
+    }
+    using input_port_base::depth;  // keep the const getter overload visible
+
+    /// Try-pop that distinguishes an EMPTY ring (returns std::nullopt) from a REAL packet (returns
+    /// the packet, even one carrying a zero-length buffer) — resolving the size-0 ambiguity that
+    /// get_data() cannot. This is the CANONICAL read: `if (auto pkt = in.try_get()) { ... }`, else
+    /// return NOOP to idle on the doorbell (the base auto-FINISHes at end-of-stream). Single-consumer:
+    /// pending()>0 guarantees pop() yields the slot.
+    [[nodiscard]] auto try_get() -> std::optional<queue_type> {
+        if (pending() == 0) { return std::nullopt; }
+        return pop();
     }
 
-    /**
-     * @brief Blocking get_data (waits indefinitely)
-     * @param tag Blocking tag (use composite::blocking)
-     * @return Tuple of buffer, timestamp, and optional metadata
-     *
-     * This overload waits indefinitely until data is available, with no timeout.
-     */
-    auto get_data(blocking_t) -> queue_type {
-        auto lock = std::unique_lock{m_mtx};
-        m_cv.wait(lock, [this]{ return !m_queue.empty(); });
+    /// Non-blocking get: try-pop one packet, returning a default-constructed (size-0) buffer when the
+    /// ring is empty (test `buffer.empty()`). Prefer try_get() — it distinguishes an empty ring from a
+    /// genuine zero-length packet, which this overload cannot.
+    auto get_data() -> queue_type { return pop(); }
 
-        auto result = std::move(m_queue.front());
-        m_queue.pop_front();
-
-        // Update statistics and queue depth
-        auto& [buffer, ts_val, metadata] = result;
-        m_stats.record_transfer(buffer.size() * sizeof(T));
-        update_queue_depth_metric(m_queue.size());
-
-        return result;
+    /// Drain up to @p out.size() packets in one shot, publishing a single head
+    /// advance for the whole batch (amortizes the release fence + cache-line bounce
+    /// across the batch). @return number of packets moved into @p out. Consumer-side.
+    auto get_batch(std::span<queue_type> out) -> std::size_t {
+        const auto head = m_head.load(std::memory_order_relaxed);  // consumer-owned
+        const auto tail = m_tail.load(std::memory_order_acquire);  // observe producer
+        const std::size_t avail = static_cast<std::size_t>(tail - head);
+        const std::size_t k = avail < out.size() ? avail : out.size();
+        // reverse doorbell: was the ring full before this drain? (see pop() — consumer owns
+        // head; the batch frees k slots.) If so, the batch crosses the full->not-full edge.
+        auto* producer_doorbell = m_producer_doorbell.load(std::memory_order_acquire);
+        bool was_full = false;
+        if (producer_doorbell != nullptr && k != 0) {
+            const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+            was_full = avail >= cap;
+        }
+        std::size_t bytes = 0;
+        for (std::size_t i = 0; i < k; ++i) {
+            out[i] = std::move(m_ring[(head + i) & m_mask]);
+            bytes += std::get<0>(out[i]).size() * sizeof(value_type);
+        }
+        if (k != 0) {
+            m_head.store(head + k, std::memory_order_release);  // one publish for the batch
+            m_stats.record_transfer(bytes, k);  // k packets, not 1 — keeps packets_transferred / drop_rate accurate
+            update_queue_depth_metric(static_cast<std::size_t>(tail - (head + k)));
+            if (was_full) {
+                producer_doorbell->signal_data();  // wake an AWAIT_OUTPUT producer (see pop())
+            }
+        }
+        return k;
     }
 
-    /**
-     * @brief Get current queue size
-     * @return Number of packets currently queued
-     */
     auto size() const -> std::size_t {
-        const auto lock = std::scoped_lock{m_mtx};
-        return m_queue.size();
+        const auto t = m_tail.load(std::memory_order_acquire);
+        const auto h = m_head.load(std::memory_order_acquire);
+        return t - h;
     }
-
-    /**
-     * @brief Clear all queued packets
-     *
-     * Discards all pending data. Does not affect statistics or depth settings.
-     * Useful for resetting port state between runs.
-     */
+    /// @copydoc input_port_base::pending
+    [[nodiscard]] auto pending() const -> std::size_t override { return size(); }
     auto clear() -> void {
-        const auto lock = std::scoped_lock{m_mtx};
-        m_queue.clear();
-    }
-
-    /**
-     * @brief Check if queue is at capacity
-     * @return true if size() >= depth()
-     *
-     * Used by output ports to implement backpressure. When full, new
-     * packets will be dropped until space becomes available.
-     */
-    auto is_full() const -> bool override {
-        const auto lock = std::scoped_lock{m_mtx};
-        return m_queue.size() >= m_depth;
-    }
-
-    /**
-     * @brief Get available queue capacity
-     * @return Number of packets that can be queued before reaching depth limit
-     *
-     * Returns 0 if full, depth - size otherwise. Useful for flow control.
-     */
-    auto available_capacity() const -> std::size_t override {
-        const auto lock = std::scoped_lock{m_mtx};
-        if (m_queue.size() >= m_depth) {
-            return 0;
+        // Consumer-side drain. Safe only on the consumer thread (or while quiesced).
+        while (m_head.load(std::memory_order_relaxed) != m_tail.load(std::memory_order_acquire)) {
+            (void)pop();
         }
-        return m_depth - m_queue.size();
+    }
+    auto is_full() const -> bool override {
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+        return size() >= cap;
+    }
+    auto available_capacity() const -> std::size_t override {
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+        const auto s = size();
+        return s >= cap ? 0 : cap - s;
     }
 
 private:
-    /**
-     * @brief Friend declaration for output_port to call add_data()
-     */
     template<typename> friend class output_port;
 
-    /**
-     * @brief Internal method to add data to queue (called by output_port)
-     * @param data Buffer to enqueue
-     * @param ts Timestamp associated with the data
-     *
-     * This method:
-     * 1. Updates queue depth high-water mark statistics
-     * 2. Enqueues data if space available, or drops if full
-     * 3. Associates latched metadata with data packet
-     * 4. Notifies waiting threads via condition variable
-     * 5. Invokes overflow callback if packet dropped
-     */
-    auto add_data(buffer_type data, timestamp ts) -> void {
-        const auto lock = std::scoped_lock{m_mtx};
+    /// Producer side (single thread). Enqueue or drop-if-full.
+    auto add_data(buffer_type data, timestamp ts, std::optional<composite::metadata> md = std::nullopt) -> void {
+        const auto tail = m_tail.load(std::memory_order_relaxed);   // only the producer writes tail
+        const auto head = m_head.load(std::memory_order_acquire);   // observe consumer progress
+        // Clamp the effective limit to the PHYSICAL ring capacity. depth() is a
+        // soft limit that can be raised at runtime above the ring size (the ring
+        // only grows while empty); without this clamp, a raised depth lets the
+        // producer lap and overwrite unread slots — silent data loss, and a
+        // read/write race with the consumer's pop().
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();
+        if (tail - head >= cap) {                                   // full (or paused: depth()==0)
+            record_drop();
+            return;
+        }
+        m_ring[tail & m_mask] = queue_type{std::move(data), ts, std::move(md)};
+        // Release: the slot write above happens-before a consumer that acquire-loads
+        // this new tail value, so the consumer never reads a torn/stale slot.
+        m_tail.store(tail + 1, std::memory_order_release);
+        // NOTE: the queue-depth gauge IS still written here (producer side). Moving it fully
+        // off the data path needs a pull/observable gauge (compute size() from head/tail at
+        // scrape time) so the live-enqueue-depth metric — a deliberate, tested feature — is
+        // preserved without the per-packet producer+consumer cache-line ping-pong. That is a
+        // metrics-subsystem addition, deferred; the per-packet clock and the atomic<shared_ptr>
+        // connection-snapshot spinlock (the two larger steady-state taxes) are removed.
+        update_queue_depth_metric(tail + 1 - head);
+        // doorbell: FAST-PATH wake of an idle consumer on the empty->non-empty edge.
+        // The edge is decided from a FRESH head re-loaded AFTER the publish: the entry
+        // `head` (above) is stale — the consumer can drain to empty between that load and
+        // here, so testing `tail == head` (entry head) misses real edges. fresh_head == tail
+        // (the pre-increment index = the slot we just wrote) means the consumer has consumed
+        // everything before it: the ring was empty and our packet is the only one — exactly
+        // when an arming/sleeping consumer must be woken (and when armed, its head is frozen
+        // here, so this test catches it). On a saturated stream head lags far behind, so this
+        // is false and signal_data() (with its seq_cst fence) is never reached — the fence
+        // lands only in the near-empty / consumer-keeps-up regime, not the throughput path.
+        //
+        // This is a best-effort LATENCY optimization, NOT the liveness guarantee: the
+        // worker's wait_for_data() always carries the m_delay timeout, which is the true
+        // backstop (and the worst-case wake latency). The fence-Dekker makes the common
+        // single-add-vs-concurrent-arm case reliably fast; a rarer multi-packet burst that a
+        // lagging consumer later observes as empty via a coherence-stale m_tail can miss the
+        // fast wake and fall back to the m_delay timeout — the SAME bound the pre-doorbell
+        // NOOP backoff always had, never a hang or data loss. So keep m_delay modest; treat
+        // it as the wake-latency ceiling and the doorbell as the typical-case accelerator.
+        if (m_doorbell != nullptr && m_head.load(std::memory_order_acquire) == tail) {
+            m_doorbell->signal_data();
+        }
+    }
 
-        auto current_size = m_queue.size();
-
-        if (current_size < m_depth) {
-            // Space available - enqueue packet
-            m_queue.emplace_back(std::move(data), ts, m_metadata);
-            m_metadata.reset();  // Clear latched metadata after use
-            update_queue_depth_metric(m_queue.size());
-            m_cv.notify_one();   // Wake up one waiting get_data() call
-        } else {
-            // Queue full - drop packet and update statistics
-            m_stats.record_drop();
-
-            // Invoke overflow callback if set
-            if (m_overflow_callback) {
-                m_overflow_callback(1);
+    /// Producer side (single thread). Enqueue up to in.size() packets with a single
+    /// tail publish; the rest (if the ring fills) are dropped + counted. Symmetric
+    /// to get_batch — amortizes the release fence + cache-line bounce over the batch.
+    /// @return number of packets accepted.
+    auto add_batch(std::span<queue_type> in) -> std::size_t {
+        const auto tail = m_tail.load(std::memory_order_relaxed);
+        const auto head = m_head.load(std::memory_order_acquire);
+        const auto cur = tail - head;
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // clamp to ring capacity
+        const std::size_t room = cap > cur ? static_cast<std::size_t>(cap - cur) : 0;
+        const std::size_t k = room < in.size() ? room : in.size();
+        for (std::size_t i = 0; i < k; ++i) {
+            m_ring[(tail + i) & m_mask] = std::move(in[i]);
+        }
+        if (k != 0) {
+            m_tail.store(tail + k, std::memory_order_release);  // one publish for the batch
+            update_queue_depth_metric(tail + k - head);
+            // doorbell: empty->non-empty edge via a FRESH head re-load (see add_data for
+            // why the entry head is stale). fresh_head == tail (the pre-batch index) means
+            // nothing before our batch is unconsumed — the ring was empty — so wake an idle
+            // consumer; otherwise the consumer is busy/behind and cannot be armed.
+            if (m_doorbell != nullptr && m_head.load(std::memory_order_acquire) == tail) {
+                m_doorbell->signal_data();
             }
         }
+        for (std::size_t i = k; i < in.size(); ++i) { record_drop(); }  // overflow
+        return k;
     }
 
-    std::deque<queue_type> m_queue;  ///< Thread-safe queue of data packets
-
-}; // input_port<immutable_buffer<T>>
-
-/**
- * @brief Input port specialization for mutable buffers
- * @tparam T Element type (e.g., float, int, custom struct)
- *
- * Receives mutable_buffer<T> data from connected output ports. Features:
- * - Exclusive ownership of buffer data (move semantics)
- * - Thread-safe queue with configurable depth and backpressure
- * - Multiple get_data() variants (timeout, blocking)
- * - Statistics tracking (throughput, drops, queue depth)
- * - Metadata association with data packets
- *
- * **Thread Safety:** All public methods are thread-safe. The queue is
- * protected by a mutex, and get_data() uses condition variables for
- * efficient blocking.
- *
- * **Transfer Semantics:** Buffers are moved into the queue. When receiving
- * from fan-out scenarios, the last receiver gets the moved buffer while
- * earlier receivers get deep copies.
- *
- * **Typical Usage:**
- * @code
- * input_port<mutable_buffer<float>> input{"samples_in"};
- * input.depth(100);  // Limit queue to 100 packets
- *
- * // In component process():
- * auto [buffer, ts, metadata] = input.get_data();
- * if (buffer) {
- *     // Modify data in-place...
- *     buffer[0] *= 2.0f;
- * }
- * @endcode
- */
-template<typename T>
-class input_port<mutable_buffer<T>> : public input_port_base {
-public:
-    using buffer_type = mutable_buffer<T>;  ///< Buffer type for this port
-    using value_type = T;                   ///< Element type stored in buffers
-    using queue_type = std::tuple<buffer_type, timestamp, std::optional<composite::metadata>>;  ///< Queue entry structure
-
-    /**
-     * @brief Inherit constructor from input_port_base
-     */
-    using input_port_base::input_port_base;
-
-    /**
-     * @brief Get type index for element type T
-     * @return std::type_index for type T
-     */
-    auto element_type() const -> std::type_index override {
-        return std::type_index(typeid(T));
-    }
-
-    /**
-     * @brief Get type identifier for element type T
-     * @return Hash code from typeid(T)
-     */
-    auto element_type_id() const -> std::size_t override {
-        return typeid(T).hash_code();
-    }
-
-    /**
-     * @brief Check if this port uses mutable buffers
-     * @return true (mutable_buffer port)
-     */
-    auto is_mutable() const -> bool override { return true; }
-
-    /**
-     * @brief Get data with timeout (defaults to 1 second)
-     * @param timeout Maximum time to wait for data (default: 1s)
-     * @return Tuple of buffer, timestamp, and optional metadata
-     */
-    template<typename Rep = int64_t, typename Period = std::ratio<1>>
-    auto get_data(std::chrono::duration<Rep, Period> timeout = std::chrono::seconds(1)) -> queue_type {
-        auto lock = std::unique_lock{m_mtx};
-        m_cv.wait_for(lock, timeout, [this]{ return !m_queue.empty(); });
-
-        if (!m_queue.empty()) {
-            auto result = std::move(m_queue.front());
-            m_queue.pop_front();
-
-            // Update statistics and queue depth
-            auto& [buffer, ts_val, metadata] = result;
-            m_stats.record_transfer(buffer.size() * sizeof(T));
-            update_queue_depth_metric(m_queue.size());
-
-            return result;
+    /// Consumer side (single thread). Try-pop; empty packet if the ring is empty.
+    auto pop() -> queue_type {
+        const auto head = m_head.load(std::memory_order_relaxed);   // only the consumer writes head
+        const auto tail = m_tail.load(std::memory_order_acquire);   // observe producer publication
+        if (head == tail) { return {}; }                            // empty
+        // reverse doorbell: was the ring FULL before this pop? (consumer owns head -> fresh;
+        // tail is acquire-loaded, and a stale-low tail can only UNDER-report full, never falsely
+        // report it.) If so, this pop is the full->not-full edge — the moment to wake an
+        // AWAIT_OUTPUT producer. Only computed when a producer worker is wired (a
+        // component-to-component connection); free-standing inputs skip it.
+        auto* producer_doorbell = m_producer_doorbell.load(std::memory_order_acquire);
+        bool was_full = false;
+        if (producer_doorbell != nullptr) {
+            const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();  // match add_data's clamp
+            was_full = (tail - head) >= cap;
         }
-        return {};
-    }
-
-    /**
-     * @brief Blocking get_data (waits indefinitely)
-     * @param tag Blocking tag (use composite::blocking)
-     * @return Tuple of buffer, timestamp, and optional metadata
-     *
-     * This overload waits indefinitely until data is available, with no timeout.
-     */
-    auto get_data(blocking_t) -> queue_type {
-        auto lock = std::unique_lock{m_mtx};
-        m_cv.wait(lock, [this]{ return !m_queue.empty(); });
-
-        auto result = std::move(m_queue.front());
-        m_queue.pop_front();
-
-        // Update statistics and queue depth
-        auto& [buffer, ts_val, metadata] = result;
-        m_stats.record_transfer(buffer.size() * sizeof(T));
-        update_queue_depth_metric(m_queue.size());
-
+        queue_type result = std::move(m_ring[head & m_mask]);
+        // Release: our read of the slot happens-before the producer that acquire-loads
+        // this new head and then overwrites the slot one lap later.
+        m_head.store(head + 1, std::memory_order_release);
+        const auto& [buffer, ts_val, md] = result;
+        (void)ts_val; (void)md;
+        m_stats.record_transfer(buffer.size() * sizeof(value_type));
+        update_queue_depth_metric(tail - (head + 1));
+        // signal_data() fences then bails lock-free unless the producer is armed (i.e. actually
+        // AWAIT_OUTPUT-sleeping) — off the steady-state path. The producer's arm + can_send
+        // re-check closes the pre-sleep race; this signal closes the post-sleep one.
+        if (was_full) {
+            producer_doorbell->signal_data();
+        }
         return result;
     }
 
-    /**
-     * @brief Get current queue size
-     * @return Number of packets currently queued
-     */
-    auto size() const -> std::size_t {
+    auto record_drop() -> void {
+        m_stats.record_drop();
+        // Overflow callback is configured at setup; lock guards a runtime re-set.
         const auto lock = std::scoped_lock{m_mtx};
-        return m_queue.size();
+        if (m_overflow_callback) { m_overflow_callback(1); }
     }
 
-    /**
-     * @brief Clear all queued packets
-     *
-     * Discards all pending data. Does not affect statistics or depth settings.
-     * Useful for resetting port state between runs.
-     */
-    auto clear() -> void {
-        const auto lock = std::scoped_lock{m_mtx};
-        m_queue.clear();
-    }
+    static constexpr std::size_t k_cacheline = 64;  ///< keep producer/consumer indices off one line
+    std::vector<queue_type> m_ring;   ///< ring storage; size is a power of two
+    std::size_t m_mask{0};            ///< size - 1 (index mask)
+    alignas(k_cacheline) std::atomic<std::size_t> m_head{0};  ///< consumer index (consumer writes)
+    alignas(k_cacheline) std::atomic<std::size_t> m_tail{0};  ///< producer index (producer writes)
 
-    /**
-     * @brief Check if queue is at capacity
-     * @return true if size() >= depth()
-     *
-     * Used by output ports to implement backpressure. When full, new
-     * packets will be dropped until space becomes available.
-     */
-    auto is_full() const -> bool override {
-        const auto lock = std::scoped_lock{m_mtx};
-        return m_queue.size() >= m_depth;
-    }
-
-    /**
-     * @brief Get available queue capacity
-     * @return Number of packets that can be queued before reaching depth limit
-     *
-     * Returns 0 if full, depth - size otherwise. Useful for flow control.
-     */
-    auto available_capacity() const -> std::size_t override {
-        const auto lock = std::scoped_lock{m_mtx};
-        if (m_queue.size() >= m_depth) {
-            return 0;
-        }
-        return m_depth - m_queue.size();
-    }
-
-private:
-    /**
-     * @brief Friend declaration for output_port to call add_data()
-     */
-    template<typename> friend class output_port;
-
-    /**
-     * @brief Internal method to add data to queue (called by output_port)
-     * @param data Buffer to enqueue
-     * @param ts Timestamp associated with the data
-     *
-     * This method:
-     * 1. Updates queue depth high-water mark statistics
-     * 2. Enqueues data if space available, or drops if full
-     * 3. Associates latched metadata with data packet
-     * 4. Notifies waiting threads via condition variable
-     * 5. Invokes overflow callback if packet dropped
-     */
-    auto add_data(buffer_type data, timestamp ts) -> void {
-        const auto lock = std::scoped_lock{m_mtx};
-
-        auto current_size = m_queue.size();
-
-        if (current_size < m_depth) {
-            // Space available - enqueue packet
-            m_queue.emplace_back(std::move(data), ts, m_metadata);
-            m_metadata.reset();  // Clear latched metadata after use
-            update_queue_depth_metric(m_queue.size());
-            m_cv.notify_one();   // Wake up one waiting get_data() call
-        } else {
-            // Queue full - drop packet and update statistics
-            m_stats.record_drop();
-
-            // Invoke overflow callback if set
-            if (m_overflow_callback) {
-                m_overflow_callback(1);
-            }
-        }
-    }
-
-    std::deque<queue_type> m_queue;  ///< Thread-safe queue of data packets
-
-}; // input_port<mutable_buffer<T>>
+}; // class input_port<Buf>
 
 } // namespace composite

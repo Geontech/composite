@@ -5,12 +5,14 @@
 
 #pragma once
 
+#include "composite/core/metadata.hpp"
 #include "composite/core/timestamp.hpp"
-#include "composite/transports/transport.hpp"
 #include "input_port.hpp"
 #include "port_base.hpp"
 
+#include <optional>
 #include <ranges>
+#include <span>
 #include <string_view>
 #include <typeinfo>
 #include <vector>
@@ -33,14 +35,19 @@ template <typename BufferType> class output_port;
  * - Deep copy when sending to mutable input ports
  * - Fan-out support (one output → many inputs)
  * - Statistics tracking (throughput, packets sent)
- * - Metadata broadcasting via send_metadata()
+ * - Metadata carried atomically with each packet (send_data's optional 3rd arg)
  *
  * **Transfer Optimization:**
  * - immutable → immutable: Zero-copy share (fast)
  * - immutable → mutable: Deep copy (required for exclusive ownership)
  *
- * **Thread Safety:** All public methods are thread-safe. The connection
- * list is protected by a mutex during send operations.
+ * **Thread Safety:** Wiring/introspection methods (connect, disconnect, is_connected,
+ * connection_count, can_send, stats) are thread-safe — the connection list is mutex-protected.
+ * **send_data()/send_batch() are SINGLE-PRODUCER**: they must be called from one thread only.
+ * The send path reads a lock-free cached connection snapshot (refreshed via a generation counter
+ * on topology change), which is mutable per-producer state with no internal locking; concurrent
+ * senders on the same output are a data race. (One component worker owns the send path; the pool
+ * threads in pipeline_component never send.)
  *
  * **Typical Usage:**
  * @code
@@ -91,67 +98,104 @@ public:
     auto is_mutable() const -> bool override { return false; }
 
     /**
-     * @brief Send data to all connected input ports
+     * @brief Send data (and optional metadata) to all connected input ports
      * @param buffer Immutable buffer to send
      * @param ts Timestamp associated with the data
+     * @param md Optional metadata describing this packet — travels atomically WITH
+     *           the data to every connected port (no separate latch, no race)
      *
      * Delivers buffer to all connected input ports with optimal transfer strategy:
      * - For immutable inputs: Zero-copy share via buffer.share()
      * - For mutable inputs: Deep copy to new mutable_buffer
      *
+     * Transfer optimization (mirrors the mutable path): the sole / last receiver gets the
+     * buffer + metadata by MOVE (no share/refcount bump, no metadata copy); the common 1:1
+     * connection therefore performs zero metadata copies. Earlier fan-out receivers copy the
+     * metadata (each needs its own) and share the buffer.
+     *
      * Updates statistics (packets, bytes, throughput) and checks queue capacity.
      * If an input port is full, the packet is dropped at that port (not here).
      */
-    auto send_data(buffer_type buffer, timestamp ts) -> void {
+    auto send_data(buffer_type buffer, timestamp ts,
+                   std::optional<composite::metadata> md = std::nullopt) -> void {
         // Update outgoing statistics
         m_stats.record_transfer(buffer.size() * sizeof(T));
 
-        // Lock connection list for thread-safe access
-        const auto lock = std::scoped_lock{m_connection_mtx};
+        // Lock-free snapshot of the fan-out list (mutated only via connect/disconnect).
+        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
 
-        for (const auto& port : m_connected_ports) {
-            if (port == nullptr) { continue; };
+        if (ports->empty()) { return; }
 
+        if (ports->size() == 1) {
+            auto* port = ports->front();
+            if (port == nullptr) { return; }
             if (port->is_mutable()) {
-                // immutable → mutable: Must perform deep copy
+                // immutable → mutable: deep copy (mutable needs independent storage)
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
-
-                // Create mutable copy from immutable data
                 auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
-                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts);
+                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, std::move(md));
             } else {
-                // immutable → immutable: Zero-copy share (optimal)
+                // immutable → immutable, sole receiver: move the buffer + metadata (no copy)
                 auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                immutable_port->add_data(buffer.share(), ts);
+                immutable_port->add_data(std::move(buffer), ts, std::move(md));
             }
+            return;
         }
 
-        // Send to external transports
-        if (!m_transports.empty()) {
-            send_to_transports(buffer.as_span(), ts);
+        // Fan-out: metadata copied to all but the last receiver; the last gets the move.
+        for (std::size_t i = 0; i + 1 < ports->size(); ++i) {
+            auto* port = (*ports)[i];
+            if (port == nullptr) { continue; }
+            if (port->is_mutable()) {
+                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
+                auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
+                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, md);
+            } else {
+                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
+                immutable_port->add_data(buffer.share(), ts, md);
+            }
+        }
+        // Last receiver: move the buffer (immutable) + metadata.
+        auto* last_port = ports->back();
+        if (last_port != nullptr) {
+            if (last_port->is_mutable()) {
+                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(last_port);
+                auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
+                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, std::move(md));
+            } else {
+                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(last_port);
+                immutable_port->add_data(std::move(buffer), ts, std::move(md));
+            }
         }
     }
 
-private:
     /**
-     * @brief Send data to all attached transports
-     * @param data Span of buffer data
-     * @param ts Timestamp
-     *
-     * Sends data as raw bytes to all configured transports (NATS, etc.).
-     * Failed sends are tracked in transport statistics but don't affect
-     * port-to-port delivery.
+     * @brief Send a batch of buffers (sharing one timestamp/metadata) to connected
+     *        inputs. With a single immutable consumer this is one amortized
+     *        add_batch (single ring publish); otherwise it falls back to per-buffer
+     *        send_data (fan-out / mutable targets). Buffers are consumed.
      */
-    auto send_to_transports(std::span<const T> data, timestamp ts) -> void {
-        // Convert to byte span
-        auto byte_span = std::as_bytes(data);
-
-        const auto lock = std::scoped_lock{m_transport_mtx};
-        for (auto& transport : m_transports) {
-            if (transport && transport->is_connected()) {
-                transport->send(byte_span, ts);
+    auto send_batch(std::span<buffer_type> bufs, timestamp ts,
+                    std::optional<composite::metadata> md = std::nullopt) -> void {
+        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
+        if (ports->size() == 1 && ports->front() != nullptr && !ports->front()->is_mutable()) {
+            auto* ip = static_cast<input_port<immutable_buffer<T>>*>(ports->front());
+            std::vector<typename input_port<immutable_buffer<T>>::queue_type> batch;
+            batch.reserve(bufs.size());
+            for (std::size_t j = 0; j < bufs.size(); ++j) {
+                m_stats.record_transfer(bufs[j].size() * sizeof(T));
+                // All batch entries share one metadata; move it into the last entry
+                // (copy into the earlier ones, which each need their own).
+                if (j + 1 == bufs.size()) {
+                    batch.emplace_back(bufs[j].share(), ts, std::move(md));
+                } else {
+                    batch.emplace_back(bufs[j].share(), ts, md);
+                }
             }
+            ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(batch));
+            return;
         }
+        for (auto& b : bufs) { send_data(std::move(b), ts, md); }
     }
 
 }; // class output_port<immutable_buffer<T>>
@@ -175,8 +219,13 @@ private:
  * - First N-1 receivers: Deep copy (required for independent ownership)
  * - Last receiver: Move original buffer (saves one copy)
  *
- * **Thread Safety:** All public methods are thread-safe. The connection
- * list is protected by a mutex during send operations.
+ * **Thread Safety:** Wiring/introspection methods (connect, disconnect, is_connected,
+ * connection_count, can_send, stats) are thread-safe — the connection list is mutex-protected.
+ * **send_data()/send_batch() are SINGLE-PRODUCER**: they must be called from one thread only.
+ * The send path reads a lock-free cached connection snapshot (refreshed via a generation counter
+ * on topology change), which is mutable per-producer state with no internal locking; concurrent
+ * senders on the same output are a data race. (One component worker owns the send path; the pool
+ * threads in pipeline_component never send.)
  *
  * **Typical Usage:**
  * @code
@@ -245,82 +294,91 @@ public:
      * This strategy minimizes copies while maintaining correctness -
      * each receiver gets independent ownership of the data.
      */
-    auto send_data(buffer_type buffer, timestamp ts) -> void {
+    auto send_data(buffer_type buffer, timestamp ts,
+                   std::optional<composite::metadata> md = std::nullopt) -> void {
         // Update statistics
         m_stats.record_transfer(buffer.size() * sizeof(T));
 
-        // Send to external transports FIRST (before buffer is moved)
-        if (!m_transports.empty()) {
-            send_to_transports(buffer.as_span(), ts);
-        }
+        // Lock-free snapshot of the fan-out list (mutated only via connect/disconnect).
+        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
 
-        // Lock for connection access
-        const auto lock = std::scoped_lock{m_connection_mtx};
+        if (ports->empty()) { return; };
 
-        if (m_connected_ports.empty()) { return; };
-
-        if (m_connected_ports.size() == 1) {
-            const auto& port = m_connected_ports.at(0);
+        if (ports->size() == 1) {
+            auto* port = ports->front();
             if (port == nullptr) { return; };
 
             if (port->is_mutable()) {
                 // Mutable to mutable: direct move
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
-                mutable_port->add_data(std::move(buffer), ts);
+                mutable_port->add_data(std::move(buffer), ts, std::move(md));
             } else {
                 // Mutable to immutable: promote
                 auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                immutable_port->add_data(std::move(buffer).to_immutable(), ts);
+                immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
             }
         } else {
-            // Fan-out: handle multiple outputs
-            for (std::size_t i = 0; i < m_connected_ports.size() - 1; ++i) {
-                const auto& port = m_connected_ports.at(i);
+            // Fan-out: handle multiple outputs (metadata copied to each receiver)
+            for (std::size_t i = 0; i < ports->size() - 1; ++i) {
+                auto* port = (*ports)[i];
                 if (port == nullptr) { continue; };
 
                 if (port->is_mutable()) {
                     auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
-                    mutable_port->add_data(buffer.copy(), ts);
+                    mutable_port->add_data(buffer.copy(), ts, md);
                 } else {
                     auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                    immutable_port->add_data(buffer.copy().to_immutable(), ts);
+                    immutable_port->add_data(buffer.copy().to_immutable(), ts, md);
                 }
             }
 
-            // Last output: move
-            const auto& last_port = m_connected_ports.back();
+            // Last output: move the buffer (and the metadata)
+            auto* last_port = ports->back();
             if (last_port != nullptr) {
                 if (last_port->is_mutable()) {
                     auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(last_port);
-                    mutable_port->add_data(std::move(buffer), ts);
+                    mutable_port->add_data(std::move(buffer), ts, std::move(md));
                 } else {
                     auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(last_port);
-                    immutable_port->add_data(std::move(buffer).to_immutable(), ts);
+                    immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
                 }
             }
         }
     }
 
-private:
     /**
-     * @brief Send data to all attached transports
-     * @param data Span of buffer data
-     * @param ts Timestamp
-     *
-     * Sends data as raw bytes to all configured transports (NATS, etc.).
-     * Failed sends are tracked in transport statistics but don't affect
-     * port-to-port delivery.
+     * @brief Send a batch of mutable buffers (sharing one timestamp/metadata) with
+     *        one amortized add_batch to a single consumer (moved for mutable,
+     *        promoted for immutable); per-buffer send_data fallback for fan-out.
+     *        Buffers are consumed.
      */
-    auto send_to_transports(std::span<const T> data, timestamp ts) -> void {
-        // Convert to byte span
-        auto byte_span = std::as_bytes(data);
-
-        const auto lock = std::scoped_lock{m_transport_mtx};
-        for (auto& transport : m_transports) {
-            if (transport && transport->is_connected()) {
-                transport->send(byte_span, ts);
+    auto send_batch(std::span<buffer_type> bufs, timestamp ts,
+                    std::optional<composite::metadata> md = std::nullopt) -> void {
+        const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
+        if (ports->size() == 1 && ports->front() != nullptr) {
+            auto* port = ports->front();
+            if (port->is_mutable()) {
+                auto* ip = static_cast<input_port<mutable_buffer<T>>*>(port);
+                std::vector<typename input_port<mutable_buffer<T>>::queue_type> batch;
+                batch.reserve(bufs.size());
+                for (auto& b : bufs) {
+                    m_stats.record_transfer(b.size() * sizeof(T));
+                    batch.emplace_back(std::move(b), ts, md);
+                }
+                ip->add_batch(std::span<typename input_port<mutable_buffer<T>>::queue_type>(batch));
+            } else {
+                auto* ip = static_cast<input_port<immutable_buffer<T>>*>(port);
+                std::vector<typename input_port<immutable_buffer<T>>::queue_type> batch;
+                batch.reserve(bufs.size());
+                for (auto& b : bufs) {
+                    m_stats.record_transfer(b.size() * sizeof(T));
+                    batch.emplace_back(std::move(b).to_immutable(), ts, md);
+                }
+                ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(batch));
             }
+            return;
         }
+        for (auto& b : bufs) { send_data(std::move(b), ts, md); }
     }
 
 }; // output_port<mutable_buffer<T>>

@@ -20,6 +20,20 @@
 
 using namespace composite;
 
+// Poll @p pred until it is true or @p timeout elapses; returns its final value. Replaces
+// fixed sleep_for() "give the worker time" waits so the started-worker lifecycle tests do
+// not flake under sanitizer slowdown / parallel oversubscription — it returns the instant
+// the condition holds (so it never over-waits) and only waits as long as actually needed.
+template <typename Pred>
+static auto wait_until(Pred pred, std::chrono::milliseconds timeout = std::chrono::seconds(2)) -> bool {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return pred();
+}
+
 // ============================================================================
 // Test Fixtures and Mock Components
 // ============================================================================
@@ -129,7 +143,7 @@ private:
  */
 class TestImmutableSink : public component {
 public:
-    TestImmutableSink() : component("TestImmutableSink") {
+    explicit TestImmutableSink(std::string_view id = "TestImmutableSink") : component(id) {
         add_port(m_input);
     }
 
@@ -263,15 +277,13 @@ public:
             md.annotations[m_annotation_key] = m_annotation_value;
         }
 
-        m_output.send_metadata(md);
-
-        // Then send data
+        // Send data, carrying the metadata atomically with the packet
         auto buffer = make_mutable<float>(m_size);
         for (std::size_t i = 0; i < buffer.size(); ++i) {
             buffer[i] = static_cast<float>(i);
         }
 
-        m_output.send_data(std::move(buffer), timestamp{});
+        m_output.send_data(std::move(buffer), timestamp{}, md);
         m_sent = true;
         return retval::NORMAL;
     }
@@ -346,13 +358,8 @@ public:
         m_processed = true;
         m_received_metadata = md;
 
-        // Forward metadata if present
-        if (md.has_value()) {
-            m_output.send_metadata(md.value());
-        }
-
-        // Forward data
-        m_output.send_data(std::move(buffer), ts);
+        // Forward data with its metadata attached
+        m_output.send_data(std::move(buffer), ts, md);
         return retval::FINISH;
     }
 
@@ -384,16 +391,12 @@ public:
 
         m_processed = true;
 
-        // Modify metadata
+        // Modify metadata (if any) and forward it with the data
         if (md.has_value()) {
-            auto modified_md = md.value();
-            modified_md.center_frequency += m_cf_offset;
-            modified_md.annotations["modified_by"] = id();
-            m_output.send_metadata(modified_md);
+            md->center_frequency += m_cf_offset;
+            md->annotations["modified_by"] = id();
         }
-
-        // Forward data
-        m_output.send_data(std::move(buffer), ts);
+        m_output.send_data(std::move(buffer), ts, md);
         return retval::FINISH;
     }
 
@@ -741,7 +744,6 @@ TEST_CASE("mutable to mutable connection", "[port][connection]") {
 
     // Run components
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify data transfer
@@ -755,6 +757,33 @@ TEST_CASE("mutable to mutable connection", "[port][connection]") {
     }
 }
 
+TEST_CASE("component connect/disconnect bookkeeping (P0.2/P0.3)", "[port][connection]") {
+    auto source = std::make_shared<TestMutableSource>();
+    auto sink = std::make_shared<TestMutableSink>();
+
+    REQUIRE(source->connections().empty());
+    REQUIRE(source->connect("data_out", sink, "data_in"));
+    REQUIRE(source->connections().size() == 1);
+    REQUIRE(source->connections()[0].output.second == "data_out");
+    REQUIRE(source->connections()[0].input.first == sink->id());
+
+    // Parked disconnect (no worker running -> with_worker_parked inline path):
+    // tears down the port wiring AND removes the bookkeeping record.
+    REQUIRE(source->disconnect("data_out", sink, "data_in"));
+    REQUIRE(source->connections().empty());
+    // already disconnected -> false, bookkeeping unchanged
+    REQUIRE_FALSE(source->disconnect("data_out", sink, "data_in"));
+
+    // the input's producer claim was released, so a reconnect succeeds...
+    REQUIRE(source->connect("data_out", sink, "data_in"));
+    REQUIRE(source->connections().size() == 1);
+    // ...and disconnect_all clears the record and releases the claim again.
+    REQUIRE(source->disconnect_all("data_out") == 1);
+    REQUIRE(source->connections().empty());
+    REQUIRE(source->connect("data_out", sink, "data_in"));  // re-claimable
+    REQUIRE(source->connections().size() == 1);
+}
+
 TEST_CASE("immutable to immutable connection", "[port][connection]") {
     auto source = std::make_shared<TestImmutableSource>();
     auto sink = std::make_shared<TestImmutableSink>();
@@ -766,7 +795,6 @@ TEST_CASE("immutable to immutable connection", "[port][connection]") {
 
     // Run components
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify data transfer
@@ -790,7 +818,6 @@ TEST_CASE("mutable to immutable connection (promotion)", "[port][connection]") {
 
     // Run components
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify data transfer (mutable promoted to immutable)
@@ -808,7 +835,6 @@ TEST_CASE("immutable to mutable connection (copy)", "[port][connection]") {
 
     // Run components
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify data transfer (immutable copied to mutable)
@@ -837,11 +863,8 @@ TEST_CASE("mutable processing chain (zero copy)", "[port][chain]") {
 
     // Run pipeline
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(amp1->process() == retval::FINISH);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(amp2->process() == retval::FINISH);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify final result (1.0 * 2.0 * 3.0 = 6.0 multiplier)
@@ -874,9 +897,8 @@ TEST_CASE("immutable fan-out (zero copy)", "[port][fanout]") {
     REQUIRE(source->connect("data_out", sink2, "data_in"));
     REQUIRE(source->connect("data_out", sink3, "data_in"));
 
-    // Run source
+    // Run source (synchronous: send_data delivers into each sink's ring immediately)
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Run all sinks
     REQUIRE(sink1->process() == retval::FINISH);
@@ -901,6 +923,33 @@ TEST_CASE("immutable fan-out (zero copy)", "[port][fanout]") {
     }
 }
 
+TEST_CASE("immutable fan-out delivers metadata to every receiver (M4-2 move-for-last)", "[port][fanout][metadata]") {
+    // send_data moves the metadata into the LAST receiver and copies it into the earlier
+    // ones; verify NONE are dropped — all three inputs must see the same metadata.
+    output_port<immutable_buffer<float>> out{"out"};
+    input_port<immutable_buffer<float>> in1{"in1", 4};
+    input_port<immutable_buffer<float>> in2{"in2", 4};
+    input_port<immutable_buffer<float>> in3{"in3", 4};
+    REQUIRE(out.connect(&in1));
+    REQUIRE(out.connect(&in2));
+    REQUIRE(out.connect(&in3));
+
+    metadata md;
+    md.center_frequency = 2.4e9;
+    md.sample_rate = 1e6;
+    md.eos = true;
+    out.send_data(make_immutable<float>({1.0f, 2.0f, 3.0f}), timestamp{}, md);
+
+    for (auto* in : {&in1, &in2, &in3}) {
+        auto [buf, ts, rmd] = in->get_data();
+        REQUIRE(buf.size() == 3);
+        REQUIRE(rmd.has_value());
+        REQUIRE(rmd->center_frequency == 2.4e9);
+        REQUIRE(rmd->sample_rate == 1e6);
+        REQUIRE(rmd->eos == true);
+    }
+}
+
 TEST_CASE("broadcaster pattern (mutable to immutable fan-out)", "[port][broadcast]") {
     auto source = std::make_shared<TestMutableSource>();
     auto broadcaster = std::make_shared<TestBroadcaster>();
@@ -919,9 +968,7 @@ TEST_CASE("broadcaster pattern (mutable to immutable fan-out)", "[port][broadcas
 
     // Run pipeline
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(broadcaster->process() == retval::FINISH);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink1->process() == retval::FINISH);
     REQUIRE(sink2->process() == retval::FINISH);
     REQUIRE(sink3->process() == retval::FINISH);
@@ -956,11 +1003,10 @@ TEST_CASE("input port depth limiting", "[port][depth]") {
     REQUIRE(input_port != nullptr);
     input_port->depth(0);
 
-    // Send data
+    // Send data (dropped synchronously at add_data because depth==0)
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Try to receive (should timeout with no data)
+    // Try to receive (nothing was queued)
     REQUIRE(sink->process() == retval::NOOP);
     REQUIRE(!sink->m_received);
 }
@@ -991,7 +1037,6 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
 
         // Run components
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         // Verify data received
@@ -1020,7 +1065,6 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(source->connect("data_out", sink, "data_in"));
 
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::NOOP);  // No data
 
         // No metadata should be received without data
@@ -1037,7 +1081,6 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(source->connect("data_out", sink, "data_in"));
 
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         // Data received but no metadata
@@ -1061,9 +1104,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
 
         // Run pipeline
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(passthrough->process() == retval::FINISH);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         // Verify passthrough received metadata
@@ -1093,9 +1134,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
 
         // Run pipeline
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(modifier->process() == retval::FINISH);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         // Verify metadata was modified
@@ -1116,7 +1155,6 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(source->connect("data_out", sink, "data_in"));
 
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         REQUIRE(sink->m_metadata.has_value());
@@ -1133,7 +1171,6 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(source->connect("data_out", sink, "data_in"));
 
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         REQUIRE(sink->m_metadata.has_value());
@@ -1154,9 +1191,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(modifier->connect("data_out", sink, "data_in"));
 
         REQUIRE(source->process() == retval::NORMAL);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(modifier->process() == retval::FINISH);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(sink->process() == retval::FINISH);
 
         // Should have both source and modifier annotations
@@ -1277,38 +1312,33 @@ TEST_CASE("large buffer transfer", "[port][performance]") {
 
     REQUIRE(source->connect("data_out", sink, "data_in"));
 
-    auto start = std::chrono::high_resolution_clock::now();
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     REQUIRE(sink->process() == retval::FINISH);
-    auto end = std::chrono::high_resolution_clock::now();
 
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
+    // Correctness only: a large buffer transfers intact. The wall-clock threshold that used
+    // to gate this (duration < 1s) was removed — a fixed ms bound flakes under sanitizers /
+    // parallel CI oversubscription; throughput is measured in bench_datapath, not asserted
+    // in the correctness suite.
     REQUIRE(sink->m_received);
     REQUIRE(sink->m_size == 1000000);
-
-    // Should complete reasonably quickly (< 1 second)
-    REQUIRE(duration.count() < 1000);
 }
 
 TEST_CASE("repeated buffer creation and destruction", "[buffer][performance]") {
     constexpr std::size_t iterations = 1000;
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // Exercise repeated allocate / fill / free — a no-leak, no-corruption smoke (meaningful
+    // under ASan). Assert correctness of the produced data rather than a wall-clock bound:
+    // the old `duration < 1s` threshold flaked under sanitizers / CI oversubscription.
+    float last = 0.0F;
     for (std::size_t i = 0; i < iterations; ++i) {
         auto buffer = make_mutable<float>(1000);
         for (std::size_t j = 0; j < buffer.size(); ++j) {
             buffer[j] = static_cast<float>(j);
         }
+        last = buffer[buffer.size() - 1];
         // Buffer destroyed here
     }
-    auto end = std::chrono::high_resolution_clock::now();
-
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-    // Should complete reasonably quickly
-    REQUIRE(duration.count() < 1000);
+    REQUIRE(last == static_cast<float>(999));
 }
 
 // ============================================================================
@@ -1321,9 +1351,9 @@ TEST_CASE("complete pipeline integration", "[integration]") {
     auto source = std::make_shared<TestMutableSource>();
     auto amp = std::make_shared<TestAmplifier>();
     auto broadcaster = std::make_shared<TestBroadcaster>();
-    auto sink1 = std::make_shared<TestImmutableSink>();
-    auto sink2 = std::make_shared<TestImmutableSink>();
-    auto sink3 = std::make_shared<TestImmutableSink>();
+    auto sink1 = std::make_shared<TestImmutableSink>("sink1");
+    auto sink2 = std::make_shared<TestImmutableSink>("sink2");
+    auto sink3 = std::make_shared<TestImmutableSink>("sink3");
 
     source->m_size = 20;
     amp->m_gain = 5.0f;
@@ -1430,14 +1460,14 @@ TEST_CASE("concurrent port access", "[port][concurrent]") {
         source->process();
     });
 
+    // Poll process() until the source (running on its own thread) has delivered — avoids a
+    // fixed-sleep race where a sink could run process() before the source sends.
     std::thread sink1_thread([&]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        sink1->process();
+        wait_until([&] { return sink1->process() != retval::NOOP; });
     });
 
     std::thread sink2_thread([&]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        sink2->process();
+        wait_until([&] { return sink2->process() != retval::NOOP; });
     });
 
     source_thread.join();
@@ -1621,7 +1651,7 @@ TEST_CASE("concept rejects invalid containers", "[buffer][concept][negative]") {
 
     SECTION("container without data() method fails") {
         struct NoDataMethod {
-            using value_type = float;
+            using value_type [[maybe_unused]] = float;
             auto size() const -> std::size_t { return 10; }
             // Missing data() method
         };
@@ -1631,7 +1661,7 @@ TEST_CASE("concept rejects invalid containers", "[buffer][concept][negative]") {
 
     SECTION("container with wrong data() return type fails") {
         struct WrongDataReturn {
-            using value_type = float;
+            using value_type [[maybe_unused]] = float;
             auto data() -> void* { return nullptr; }  // Should return float*
             auto size() const -> std::size_t { return 10; }
         };
@@ -1641,7 +1671,7 @@ TEST_CASE("concept rejects invalid containers", "[buffer][concept][negative]") {
 
     SECTION("container without size() method fails") {
         struct NoSizeMethod {
-            using value_type = float;
+            using value_type [[maybe_unused]] = float;
             auto data() -> float* { return nullptr; }
             // Missing size() method
         };
@@ -1651,7 +1681,7 @@ TEST_CASE("concept rejects invalid containers", "[buffer][concept][negative]") {
 
     SECTION("non-copyable container fails") {
         struct NonCopyable {
-            using value_type = float;
+            using value_type [[maybe_unused]] = float;
             NonCopyable() = default;
             NonCopyable(const NonCopyable&) = delete;
             NonCopyable& operator=(const NonCopyable&) = delete;
@@ -2318,7 +2348,7 @@ TEST_CASE("port disconnect thread safety", "[port][disconnect][thread]") {
         // Should have received some data without crashes
         // sink2 should have all packets since it was never disconnected
         REQUIRE(sink2->input.size() > 0);
-        REQUIRE(sink2->input.size() == send_count.load());
+        REQUIRE(sink2->input.size() == static_cast<std::size_t>(send_count.load()));
     }
 
     SECTION("concurrent disconnect calls") {
@@ -2375,10 +2405,8 @@ TEST_CASE("port disconnect with metadata", "[port][disconnect][metadata]") {
         // Send metadata and data to both
         metadata md1;
         md1.sample_rate = 1e6;
-        source->output.send_metadata(md1);
-
         auto buffer1 = make_mutable<float>(10);
-        source->output.send_data(std::move(buffer1), timestamp{});
+        source->output.send_data(std::move(buffer1), timestamp{}, md1);
 
         auto [data1a, ts1a, md1a] = sink1->input.get_data();
         REQUIRE(md1a.has_value());
@@ -2394,10 +2422,8 @@ TEST_CASE("port disconnect with metadata", "[port][disconnect][metadata]") {
         // Send new metadata and data
         metadata md2;
         md2.sample_rate = 2e6;
-        source->output.send_metadata(md2);
-
         auto buffer2 = make_mutable<float>(10);
-        source->output.send_data(std::move(buffer2), timestamp{});
+        source->output.send_data(std::move(buffer2), timestamp{}, md2);
 
         // sink1 should have no new data
         REQUIRE(sink1->input.size() == 0);
@@ -2823,7 +2849,6 @@ TEST_CASE("input port statistics tracking", "[port][stats]") {
 
     // Send data
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     REQUIRE(sink->process() == retval::FINISH);
 
     // Verify statistics updated
@@ -2850,9 +2875,8 @@ TEST_CASE("output port statistics tracking", "[port][stats]") {
     auto& stats = output_port->stats();
     REQUIRE(stats.packets_transferred() == 0);
 
-    // Send data
+    // Send data (record_transfer updates output stats synchronously inside send_data)
     REQUIRE(source->process() == retval::NORMAL);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Verify statistics
     REQUIRE(stats.packets_transferred() == 1);
@@ -2871,9 +2895,8 @@ TEST_CASE("statistics reset", "[port][stats]") {
 
     auto* input_port = sink->get_port<input_port_base>("data_in");
 
-    // Send some data
+    // Send some data (synchronous: source->process() fills the ring, sink->process() drains)
     source->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     sink->process();
 
     // Verify stats exist
@@ -2928,7 +2951,6 @@ TEST_CASE("queue depth and capacity metrics", "[port][stats]") {
     for (int i = 0; i < 3; ++i) {
         source->m_sent = false;
         source->process();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // Queue depth should reflect 3 packets
@@ -2936,7 +2958,6 @@ TEST_CASE("queue depth and capacity metrics", "[port][stats]") {
 
     // Consume one packet
     sink->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Queue depth should now be 2
     REQUIRE(depth_gauge.value() == 2.0);
@@ -2957,7 +2978,6 @@ TEST_CASE("statistics throughput calculation", "[port][stats]") {
 
     // Send data
     source->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Calculate throughput
     auto throughput = output_port->stats().throughput_mbps();
@@ -2989,11 +3009,9 @@ TEST_CASE("port is_full() check", "[port][backpressure]") {
     source->m_size = 10;
     source->m_sent = false;
     source->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     source->m_sent = false;
     source->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Should be full now
     REQUIRE(input_port->is_full());
@@ -3016,7 +3034,6 @@ TEST_CASE("available_capacity() tracking", "[port][backpressure]") {
     // Send one packet
     source->m_size = 10;
     source->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Capacity should decrease
     REQUIRE(input_port->available_capacity() == 4);
@@ -3047,7 +3064,6 @@ TEST_CASE("overflow callback invocation", "[port][backpressure]") {
     for (int i = 0; i < 5; ++i) {
         source->m_sent = false;
         source->process();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // Some packets should have been dropped (sent 5, depth is 2, so 3 dropped)
@@ -3076,7 +3092,6 @@ TEST_CASE("overflow with drop rate calculation", "[port][backpressure]") {
     for (int i = 0; i < 10; ++i) {
         source->m_sent = false;
         source->process();
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
     // All should be dropped
@@ -3103,7 +3118,6 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
     input_port->depth(1);
     source->m_size = 10;
     source->process();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Now cannot send (queue full)
     REQUIRE(!output_port->can_send());
@@ -3114,8 +3128,8 @@ TEST_CASE("can_send() backpressure check", "[port][backpressure]") {
 // Blocking Variants Tests
 // ============================================================================
 
-// Note: Blocking variants (get_data with composite::blocking tag and get_data with timeout) are
-// template methods tested indirectly through the components themselves
+// Note: the deprecated get_data(timeout) / get_data(blocking) no-op overloads were removed;
+// try_get() is the canonical non-blocking read and get_data() remains for the size-0 idiom.
 
 // ============================================================================
 // Stress Tests
@@ -3617,9 +3631,9 @@ public:
     }
 
     auto process() -> retval override {
-        auto [buffer, ts, metadata] = m_input.get_data(std::chrono::milliseconds(10));
+        auto [buffer, ts, metadata] = m_input.get_data();
         if (buffer.size() > 0) {
-            m_packets_received++;
+            m_packets_received.fetch_add(1, std::memory_order_relaxed);
             m_last_size = buffer.size();
         }
         return retval::NORMAL;
@@ -3629,11 +3643,15 @@ public:
         return m_input.depth();
     }
 
-    std::size_t m_packets_received{0};
-    std::size_t m_last_size{0};
+    // Written by the worker (process()), read by the test's main thread while the worker
+    // runs -> must be atomic (this counter races the main-thread reads below otherwise; the
+    // doorbell's scheduling shift surfaced the latent race under TSan).
+    std::atomic<std::size_t> m_packets_received{0};
+    std::size_t m_last_size{0};  // worker-only (written, never read cross-thread)
 
 private:
     input_port<immutable_buffer<float>> m_input{"data_in"};
+    component::auto_stop m_auto_stop{*this};  // MUST be last
 };
 
 /**
@@ -3663,6 +3681,7 @@ public:
 
 private:
     output_port<immutable_buffer<float>> m_output{"data_out"};
+    component::auto_stop m_auto_stop{*this};  // MUST be last
 };
 
 TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
@@ -3675,12 +3694,12 @@ TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
         
         // Start component
         sink->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
-        // Disable component via property
-        sink->set_properties({{"enabled", "false"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
+        REQUIRE(wait_until([&] { return sink->is_running(); }));
+
+        // Disable component via property (synchronous stop + pause)
+        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
+
         // Verify component stopped and input port paused
         REQUIRE(sink->get_property<bool>("enabled") == false);
         REQUIRE(sink->get_input_depth() == 0);  // Should be paused
@@ -3694,17 +3713,17 @@ TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
         
         // Start and then disable
         sink->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        sink->set_properties({{"enabled", "false"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
+        REQUIRE(wait_until([&] { return sink->is_running(); }));
+        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
+
         // Verify paused
         REQUIRE(sink->get_input_depth() == 0);
-        
+
         // Re-enable
-        sink->set_properties({{"enabled", "true"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
+        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == 100; }));
+
         // Verify depth restored
         REQUIRE(sink->get_property<bool>("enabled") == true);
         REQUIRE(sink->get_input_depth() == 100);  // Should be restored
@@ -3718,29 +3737,27 @@ TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
         // Connect components
         source->connect("data_out", sink, "data_in");
         
-        // Start both
+        // Start both, then wait until the sink's worker has actually received some packets
+        // (async processing — this is a genuine wait, not a synchronous lifecycle op).
         source->start();
         sink->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        
-        auto initial_received = sink->m_packets_received;
+        REQUIRE(wait_until([&] { return sink->m_packets_received.load() > 0; }));
+
+        auto initial_received = sink->m_packets_received.load();
         REQUIRE(initial_received > 0);  // Should have received some packets
-        
-        // Disable sink (pauses input port to depth 0)
-        sink->set_properties({{"enabled", "false"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        
+
+        // Disable sink (synchronous stop + pause to depth 0)
+        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle: let any in-flight packet land
+
         // Source continues sending, but sink's input port should drop everything
-        auto packets_after_disable = sink->m_packets_received;
+        auto packets_after_disable = sink->m_packets_received.load();
         // Allow a small number of packets that were in-flight during disable
         REQUIRE(packets_after_disable - initial_received <= 2);
-        
-        // Re-enable sink
-        sink->set_properties({{"enabled", "true"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        // Should start receiving again
-        REQUIRE(sink->m_packets_received > packets_after_disable);
+        // Re-enable sink — it should start receiving again (async, so poll).
+        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->m_packets_received.load() > packets_after_disable; }));
         
         // Cleanup
         source->stop();
@@ -3755,22 +3772,18 @@ TEST_CASE("Component enabled property lifecycle", "[lifecycle][enabled]") {
         REQUIRE(sink->get_input_depth() == original_depth);
         
         // Cycle 1
-        sink->set_properties({{"enabled", "false"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        REQUIRE(sink->get_input_depth() == 0);
+        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
         
-        sink->set_properties({{"enabled", "true"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        REQUIRE(sink->get_input_depth() == original_depth);
+        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == original_depth; }));
         
         // Cycle 2
-        sink->set_properties({{"enabled", "false"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        REQUIRE(sink->get_input_depth() == 0);
+        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
         
-        sink->set_properties({{"enabled", "true"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        REQUIRE(sink->get_input_depth() == original_depth);
+        sink->set_properties({{"enabled", true}}); sink->apply_lifecycle_changes();
+        REQUIRE(wait_until([&] { return sink->get_input_depth() == original_depth; }));
         
         sink->stop();
     }
@@ -3784,27 +3797,22 @@ TEST_CASE("Component lifecycle memory management", "[lifecycle][memory]") {
         source->m_max_packets = 1000;  // Lots of packets
         source->connect("data_out", sink, "data_in");
         
-        // Start source but not sink
+        // Start source and sink, then wait until the sink is actually receiving.
         source->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        
-        // Sink's input queue should not grow because it's not started
-        // (enabled defaults to true but start() hasn't been called)
-        // Actually, let's start it then disable it
         sink->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
-        // Now disable it - this should pause input ports
-        sink->set_properties({{"enabled", "false"}}); sink->apply_lifecycle_changes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
-        auto packets_at_disable = sink->m_packets_received;
-        
-        // Let source keep sending
+        REQUIRE(wait_until([&] { return sink->m_packets_received.load() > 0; }));
+
+        // Now disable it - synchronous stop + pause of the input ports.
+        sink->set_properties({{"enabled", false}}); sink->apply_lifecycle_changes();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // settle: let any in-flight packet land
+
+        auto packets_at_disable = sink->m_packets_received.load();
+
+        // Let the source keep sending into the paused (depth-0) port for a window...
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        
-        // Sink shouldn't receive any more (input port depth is 0)
-        REQUIRE(sink->m_packets_received == packets_at_disable);
+
+        // ...the sink must NOT receive any more (asserting absence over the window).
+        REQUIRE(sink->m_packets_received.load() == packets_at_disable);
         
         source->stop();
         sink->stop();

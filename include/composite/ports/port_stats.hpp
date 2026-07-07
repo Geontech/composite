@@ -97,16 +97,20 @@ struct port_stats {
 
     /**
      * @brief Record a successful packet transfer
-     * @param bytes Number of bytes in the packet
+     * @param bytes Number of bytes transferred
+     * @param packets Number of packets transferred (default 1; batch paths pass k
+     *                so packets_transferred and drop_rate() stay accurate)
      */
-    auto record_transfer(std::size_t bytes) -> void {
+    auto record_transfer(std::size_t bytes, std::size_t packets = 1) -> void {
         if (m_packets_transferred) {
-            m_packets_transferred->add(1);
+            m_packets_transferred->add(packets);
         }
         if (m_bytes_transferred) {
             m_bytes_transferred->add(bytes);
         }
-        update_activity_timestamp();
+        // No clock here. The per-packet steady_clock::now() (a vDSO call on the hot
+        // path, paid on every send AND every pop) is gone; last-activity is derived at
+        // scrape time in time_since_last_activity() from the transfer counters instead.
     }
 
     /**
@@ -193,17 +197,28 @@ struct port_stats {
 
     /**
      * @brief Get time elapsed since last activity
-     * @return Duration since last send/receive operation
+     * @return Duration since the last observed send/receive operation
+     *
+     * Derived at SCRAPE time (not on the data path): each call samples the cumulative
+     * transfer/drop counters; if they advanced since the previous call, "now" becomes the
+     * last-activity instant. Resolution is therefore the scrape interval — ample for a
+     * liveness diagnostic, and it keeps the per-packet hot path clock-free. The mutable
+     * observation state is only touched here (the scrape path), never by record_transfer.
      */
     [[nodiscard]]
     auto time_since_last_activity() const -> std::chrono::nanoseconds {
-        auto last = m_last_activity_ns.load(std::memory_order_relaxed);
         auto now = std::chrono::steady_clock::now();
         auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()
         ).count();
 
-        return std::chrono::nanoseconds{now_ns - last};
+        const auto traffic = packets_transferred() + packets_dropped();
+        if (traffic != m_last_seen_traffic.load(std::memory_order_relaxed)) {
+            m_last_seen_traffic.store(traffic, std::memory_order_relaxed);
+            m_last_activity_ns.store(now_ns, std::memory_order_relaxed);
+            return std::chrono::nanoseconds{0};
+        }
+        return std::chrono::nanoseconds{now_ns - m_last_activity_ns.load(std::memory_order_relaxed)};
     }
 
     /**
@@ -220,17 +235,9 @@ struct port_stats {
 
         m_start_time_ns.store(ns, std::memory_order_relaxed);
         m_last_activity_ns.store(ns, std::memory_order_relaxed);
-    }
-
-    /**
-     * @brief Update last activity timestamp to now
-     */
-    auto update_activity_timestamp() -> void {
-        auto now = std::chrono::steady_clock::now();
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()
-        ).count();
-        m_last_activity_ns.store(ns, std::memory_order_relaxed);
+        // Counters are cumulative (not reset) — baseline the observation at the current
+        // total so the next scrape doesn't spuriously report activity.
+        m_last_seen_traffic.store(packets_transferred() + packets_dropped(), std::memory_order_relaxed);
     }
 
 private:
@@ -239,9 +246,12 @@ private:
     metrics::counter<uint64_t>* m_packets_dropped{nullptr};
     metrics::counter<uint64_t>* m_bytes_transferred{nullptr};
 
-    // Timestamps (local storage - not exposed as metrics)
-    std::atomic<int64_t> m_last_activity_ns{0};
+    // Timestamps (local storage - not exposed as metrics). m_last_activity_ns and
+    // m_last_seen_traffic are scrape-side observation state (mutable: updated only by the
+    // const time_since_last_activity() diagnostic, never by the data path).
     std::atomic<int64_t> m_start_time_ns{0};
+    mutable std::atomic<int64_t> m_last_activity_ns{0};
+    mutable std::atomic<uint64_t> m_last_seen_traffic{0};
 
 }; // struct port_stats
 
