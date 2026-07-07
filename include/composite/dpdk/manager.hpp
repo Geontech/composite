@@ -9,7 +9,9 @@
 
 #include "composite/util/export.hpp"
 #include "config.hpp"
+#include "port_registry.hpp"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -80,7 +82,7 @@ public:
      * @return true if DPDK is initialized and ready for use
      */
     COMPOSITE_API
-    auto is_initialized() const -> bool { return m_initialized; }
+    auto is_initialized() const -> bool { return m_initialized.load(std::memory_order_acquire); }
 
     /**
      * @brief Get physical CPU cores used by DPDK as lcores
@@ -168,12 +170,37 @@ public:
     auto release_queue(const std::string& interface_name, uint16_t queue_id) -> void;
 
     /**
+     * @brief RAII variant of allocate_queue()
+     *
+     * Returns a queue_lease that releases the queue automatically when destroyed,
+     * so a component cannot leak a queue on an early return / exception between
+     * allocation and release. Prefer this over allocate_queue()/release_queue().
+     *
+     * @param interface_name Interface name
+     * @param queue_id Queue ID to allocate
+     * @return A valid lease on success; a falsy lease if DPDK is not initialized
+     *         or the queue is unavailable.
+     */
+    COMPOSITE_API
+    auto lease_queue(const std::string& interface_name, uint16_t queue_id) -> queue_lease;
+
+    /**
+     * @brief RAII variant of allocate_next_available_queue()
+     *
+     * @param interface_name Interface name
+     * @return A valid lease owning the first free queue; a falsy lease if DPDK is
+     *         not initialized or all queues are allocated.
+     */
+    COMPOSITE_API
+    auto lease_next_available_queue(const std::string& interface_name) -> queue_lease;
+
+    /**
      * @brief Get number of available ports
      *
      * @return Number of configured DPDK ports
      */
     COMPOSITE_API
-    auto get_port_count() const -> std::size_t { return m_interface_to_port.size(); }
+    auto get_port_count() const -> std::size_t { return m_registry.port_count(); }
 
     /**
      * @brief Summary information about an available DPDK port
@@ -230,28 +257,21 @@ private:
      */
     auto create_mempool(const port_config& config) -> rte_mempool*;
 
-    /**
-     * @brief Information about a configured port
-     */
-    struct port_info {
-        uint16_t port_id;                       ///< DPDK port ID
-        std::string interface_name;             ///< Linux interface name
-        uint16_t num_rx_queues;                 ///< Number of RX queues configured
-        std::vector<bool> queue_allocated;      ///< Allocation status of each queue
-        rte_mempool* mempool{nullptr};          ///< Associated mempool
-    };
-
     struct mempool_config {
         uint32_t mempool_size;
         uint16_t mempool_cache_size;
         uint16_t mbuf_data_room_size;
     };
 
-    bool m_initialized{false};
-    std::map<std::string, port_info> m_interface_to_port;     ///< Interface name → port info
-    std::map<std::string, rte_mempool*> m_mempools;           ///< Mempool name → mempool ptr
-    std::map<std::string, mempool_config> m_mempool_configs;  ///< Mempool name → config
-    std::vector<uint16_t> m_configured_ports;                 ///< List of configured port IDs
+    // All interface/queue/mempool bookkeeping AND the lock that serializes it live
+    // in the EAL-free port_registry, which is compiled and TSan-unit-tested in the
+    // normal build (test/test_dpdk_registry.cpp) — the concurrent queue-allocation
+    // check-then-act that had the data race is verified there, without a NIC.
+    // This manager is the thin EAL adapter that delegates to it. m_initialized is
+    // atomic so is_initialized() reads it without the registry lock.
+    std::atomic<bool> m_initialized{false};
+    port_registry m_registry;
+    std::map<std::string, mempool_config> m_mempool_configs;  ///< Mempool name → config (init-time only)
 
 }; // class manager
 

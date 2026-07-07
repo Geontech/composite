@@ -28,7 +28,10 @@ auto manager::instance() -> manager& {
 }
 
 auto manager::initialize(const dpdk::config& config) -> bool {
-    if (m_initialized) {
+    // initialize()/shutdown() run once at app startup/teardown on the main thread;
+    // concurrent queue allocate/release from REST threads is serialized inside the
+    // port_registry, so the manager itself needs no lock here.
+    if (m_initialized.load(std::memory_order_acquire)) {
         spdlog::warn("DPDK already initialized");
         return true;
     }
@@ -36,7 +39,7 @@ auto manager::initialize(const dpdk::config& config) -> bool {
     spdlog::info("Initializing DPDK...");
 
     auto cleanup_partial = [this]() {
-        for (uint16_t port_id : m_configured_ports) {
+        for (uint16_t port_id : m_registry.configured_port_ids()) {
             int ret = rte_eth_dev_stop(port_id);
             if (ret != 0) {
                 spdlog::warn("Failed to stop DPDK port {}: {}", port_id, rte_strerror(-ret));
@@ -46,9 +49,8 @@ auto manager::initialize(const dpdk::config& config) -> bool {
                 spdlog::warn("Failed to close DPDK port {}: {}", port_id, rte_strerror(-ret));
             }
         }
-        m_mempools.clear();
-        m_interface_to_port.clear();
-        m_configured_ports.clear();
+        m_registry.clear();
+        m_mempool_configs.clear();  // (was missed before — left stale config after a failed init)
         int ret = rte_eal_cleanup();
         if (ret != 0) {
             spdlog::warn("DPDK EAL cleanup returned: {}", ret);
@@ -81,20 +83,25 @@ auto manager::initialize(const dpdk::config& config) -> bool {
                      port_config.mempool_name);
     }
 
-    m_initialized = true;
+    m_initialized.store(true, std::memory_order_release);
     spdlog::info("DPDK initialization complete");
     return true;
 }
 
 auto manager::shutdown() -> void {
-    if (!m_initialized) {
+    // Exactly-once, and flip the gate to false BEFORE tearing down any hardware.
+    // The manager no longer holds a coarse lock, so an allocate_queue racing
+    // shutdown (the "shutdown only after components stop" contract is documented
+    // but not enforced) must be refused before it can hand out a queue on a port
+    // we are about to close — the allocate forwarders gate on m_initialized.
+    if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
 
     spdlog::info("Shutting down DPDK...");
 
     // Stop and close all configured ports
-    for (uint16_t port_id : m_configured_ports) {
+    for (uint16_t port_id : m_registry.configured_port_ids()) {
         int ret = rte_eth_dev_stop(port_id);
         if (ret != 0) {
             spdlog::warn("Failed to stop DPDK port {}: {}", port_id, rte_strerror(-ret));
@@ -107,10 +114,8 @@ auto manager::shutdown() -> void {
     }
 
     // Note: mempools are freed automatically by DPDK on cleanup
-    m_mempools.clear();
+    m_registry.clear();
     m_mempool_configs.clear();
-    m_interface_to_port.clear();
-    m_configured_ports.clear();
 
     // Clean up EAL
     int ret = rte_eal_cleanup();
@@ -118,7 +123,7 @@ auto manager::shutdown() -> void {
         spdlog::warn("DPDK EAL cleanup returned: {}", ret);
     }
 
-    m_initialized = false;
+    // m_initialized was already set false by the exchange at the top of shutdown().
     spdlog::info("DPDK shutdown complete");
 }
 
@@ -160,7 +165,7 @@ auto manager::init_eal(const std::vector<std::string>& eal_args) -> bool {
 }
 
 auto manager::get_dpdk_lcores() const -> std::vector<int> {
-    if (!m_initialized) {
+    if (!m_initialized.load(std::memory_order_acquire)) {
         spdlog::warn("DPDK not initialized, cannot query lcores");
         return {};
     }
@@ -208,6 +213,19 @@ auto manager::list_available_ports() const -> std::vector<port_summary> {
 
 auto manager::configure_port(const port_config& config) -> bool {
     uint16_t port_id = config.port_id;
+
+    // Reject a duplicate interface name or port_id BEFORE touching any hardware.
+    // The registry is the single owner of each port's teardown (cleanup_partial /
+    // shutdown), so reconfiguring/re-registering a port already tracked would lead
+    // to a double stop/close of that physical port. Checking up front also avoids
+    // re-running rte_eth_dev_configure/start on an already-started port (which is
+    // -EBUSY on most PMDs but accepted by some), making the failure deterministic.
+    if (m_registry.is_port_configured(port_id) ||
+        m_registry.get_port_id_for_interface(config.interface).has_value()) {
+        spdlog::error("Port {} / interface '{}' already configured; refusing to reconfigure",
+                      port_id, config.interface);
+        return false;
+    }
 
     // Validate port exists
     if (!rte_eth_dev_is_valid_port(port_id)) {
@@ -304,16 +322,21 @@ auto manager::configure_port(const port_config& config) -> bool {
     }
     spdlog::info("Port {} started with hardware MAC filtering (promiscuous=off, allmulticast=off)", port_id);
 
-    // Store port information for later lookup
-    port_info info;
-    info.port_id = port_id;
-    info.interface_name = config.interface;
-    info.num_rx_queues = config.rx_queues;
-    info.queue_allocated.resize(config.rx_queues, false);
-    info.mempool = mempool;
-
-    m_interface_to_port[config.interface] = info;
-    m_configured_ports.push_back(port_id);
+    // Store port information for later lookup. The duplicate cases were already
+    // rejected up front, so register_port failing here is not expected in the
+    // single-threaded init path — but if it does, only stop/close the hardware
+    // when THIS port_id is not already tracked by the registry. A port the
+    // registry owns is torn down exactly once by cleanup_partial/shutdown;
+    // closing it here too would be a double stop/close of the same device.
+    if (!m_registry.register_port(config.interface, port_id, config.rx_queues, mempool)) {
+        spdlog::error("Port {} / interface '{}' already configured; refusing to overwrite",
+                      port_id, config.interface);
+        if (!m_registry.is_port_configured(port_id)) {
+            rte_eth_dev_stop(port_id);
+            rte_eth_dev_close(port_id);
+        }
+        return false;
+    }
 
     return true;
 }
@@ -349,7 +372,9 @@ auto manager::create_mempool(const port_config& config) -> rte_mempool* {
             };
         }
         spdlog::debug("Reusing existing mempool '{}'", config.mempool_name);
-        m_mempools[config.mempool_name] = existing;
+        // Already-registered name (a sibling port created it) is fine: emplace is
+        // a no-op and the pointer is the same global pool returned by lookup.
+        (void)m_registry.register_mempool(config.mempool_name, existing);
         return existing;
     }
 
@@ -369,7 +394,7 @@ auto manager::create_mempool(const port_config& config) -> rte_mempool* {
         return nullptr;
     }
 
-    m_mempools[config.mempool_name] = pool;
+    (void)m_registry.register_mempool(config.mempool_name, pool);
     m_mempool_configs[config.mempool_name] = {
         config.mempool_size,
         config.mempool_cache_size,
@@ -381,113 +406,102 @@ auto manager::create_mempool(const port_config& config) -> rte_mempool* {
     return pool;
 }
 
+// The interface/port/queue/mempool bookkeeping below is entirely delegated to the
+// EAL-free port_registry, which owns the lock and is unit-/TSan-tested without a NIC
+// (test/test_dpdk_registry.cpp). These are thin forwarders; the diagnostics that the
+// old in-line code logged on the failure paths now live in the callers (components),
+// which decide whether a refused allocation is fatal.
+
 auto manager::get_port_id_for_interface(const std::string& interface_name) const
     -> std::optional<uint16_t> {
-    auto it = m_interface_to_port.find(interface_name);
-    if (it != m_interface_to_port.end()) {
-        return it->second.port_id;
-    }
-    return std::nullopt;
+    return m_registry.get_port_id_for_interface(interface_name);
 }
 
 auto manager::get_mempool(const std::string& name) const -> rte_mempool* {
-    auto it = m_mempools.find(name);
-    return (it != m_mempools.end()) ? it->second : nullptr;
+    return m_registry.get_mempool(name);
 }
 
 auto manager::is_port_configured(uint16_t port_id) const -> bool {
-    return std::find(m_configured_ports.begin(), m_configured_ports.end(), port_id)
-           != m_configured_ports.end();
+    return m_registry.is_port_configured(port_id);
 }
 
 auto manager::is_queue_available(const std::string& interface_name, uint16_t queue_id) const
     -> bool {
-    auto it = m_interface_to_port.find(interface_name);
-    if (it == m_interface_to_port.end()) {
-        return false;
-    }
-
-    const auto& port = it->second;
-    if (queue_id >= port.num_rx_queues) {
-        return false;
-    }
-
-    return !port.queue_allocated[queue_id];
+    return m_registry.is_queue_available(interface_name, queue_id);
 }
 
 auto manager::allocate_queue(const std::string& interface_name, uint16_t queue_id) -> bool {
-    auto it = m_interface_to_port.find(interface_name);
-    if (it == m_interface_to_port.end()) {
-        spdlog::error("Interface '{}' not found in DPDK configuration", interface_name);
+    // Refuse new allocations once shutdown has begun (or before init completes):
+    // shutdown() clears the gate before tearing down hardware, so this prevents
+    // handing out a queue on a port that is being / has been closed.
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        spdlog::warn("Refusing queue allocation on '{}': DPDK not initialized", interface_name);
         return false;
     }
-
-    auto& port = it->second;
-
-    if (queue_id >= port.num_rx_queues) {
-        spdlog::error("Queue {} does not exist on interface '{}' (has {} queues)",
-                     queue_id, interface_name, port.num_rx_queues);
+    if (!m_registry.allocate_queue(interface_name, queue_id)) {
+        spdlog::error("Failed to allocate queue {} on interface '{}' "
+                      "(unknown interface, out of range, or already allocated)",
+                      queue_id, interface_name);
         return false;
     }
-
-    if (port.queue_allocated[queue_id]) {
-        spdlog::error("Queue {} on interface '{}' is already allocated",
-                     queue_id, interface_name);
-        return false;
-    }
-
-    port.queue_allocated[queue_id] = true;
     spdlog::debug("Allocated queue {} on interface '{}'", queue_id, interface_name);
     return true;
 }
 
 auto manager::allocate_next_available_queue(const std::string& interface_name)
     -> std::optional<uint16_t> {
-    auto it = m_interface_to_port.find(interface_name);
-    if (it == m_interface_to_port.end()) {
-        spdlog::error("Interface '{}' not found in DPDK configuration", interface_name);
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        spdlog::warn("Refusing queue allocation on '{}': DPDK not initialized", interface_name);
         return std::nullopt;
     }
-
-    auto& port = it->second;
-
-    // Find first unallocated queue
-    for (uint16_t q = 0; q < port.num_rx_queues; q++) {
-        if (!port.queue_allocated[q]) {
-            port.queue_allocated[q] = true;
-            spdlog::debug("Auto-allocated queue {} on interface '{}'", q, interface_name);
-            return q;
-        }
+    auto q = m_registry.allocate_next_available_queue(interface_name);
+    if (!q) {
+        spdlog::error("No available queue on interface '{}' "
+                      "(unknown interface or all queues allocated)", interface_name);
+        return std::nullopt;
     }
-
-    spdlog::error("No available queues on interface '{}' (all {} queues allocated)",
-                 interface_name, port.num_rx_queues);
-    return std::nullopt;
+    spdlog::debug("Auto-allocated queue {} on interface '{}'", *q, interface_name);
+    return q;
 }
 
 auto manager::release_queue(const std::string& interface_name, uint16_t queue_id) -> void {
-    auto it = m_interface_to_port.find(interface_name);
-    if (it == m_interface_to_port.end()) {
-        spdlog::warn("Attempted to release queue on unknown interface '{}'", interface_name);
+    if (!m_registry.release_queue(interface_name, queue_id)) {
+        spdlog::warn("Attempted to release queue {} on interface '{}' that was not "
+                     "allocated (or interface/queue invalid)", queue_id, interface_name);
         return;
     }
-
-    auto& port = it->second;
-
-    if (queue_id >= port.num_rx_queues) {
-        spdlog::warn("Attempted to release invalid queue {} on interface '{}'",
-                    queue_id, interface_name);
-        return;
-    }
-
-    if (!port.queue_allocated[queue_id]) {
-        spdlog::warn("Attempted to release queue {} on interface '{}' which was not allocated",
-                    queue_id, interface_name);
-        return;
-    }
-
-    port.queue_allocated[queue_id] = false;
     spdlog::debug("Released queue {} on interface '{}'", queue_id, interface_name);
+}
+
+auto manager::lease_queue(const std::string& interface_name, uint16_t queue_id) -> queue_lease {
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        spdlog::warn("Refusing queue lease on '{}': DPDK not initialized", interface_name);
+        return {};
+    }
+    auto lease = m_registry.lease_queue(interface_name, queue_id);
+    if (lease) {
+        spdlog::debug("Leased queue {} on interface '{}'", queue_id, interface_name);
+    } else {
+        spdlog::error("Failed to lease queue {} on interface '{}' "
+                      "(unknown interface, out of range, or already allocated)",
+                      queue_id, interface_name);
+    }
+    return lease;
+}
+
+auto manager::lease_next_available_queue(const std::string& interface_name) -> queue_lease {
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        spdlog::warn("Refusing queue lease on '{}': DPDK not initialized", interface_name);
+        return {};
+    }
+    auto lease = m_registry.lease_next_available_queue(interface_name);
+    if (lease) {
+        spdlog::debug("Auto-leased queue {} on interface '{}'", lease.queue_id(), interface_name);
+    } else {
+        spdlog::error("No available queue to lease on interface '{}' "
+                      "(unknown interface or all queues allocated)", interface_name);
+    }
+    return lease;
 }
 
 } // namespace composite
