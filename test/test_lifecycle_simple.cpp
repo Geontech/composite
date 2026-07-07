@@ -10,6 +10,19 @@
 
 using namespace composite;
 
+// Poll @p pred until true or @p timeout — replaces fixed sleep_for() "let the worker run"
+// waits so these started-worker lifecycle/metrics tests do not flake under sanitizer
+// slowdown / parallel oversubscription (returns the instant the condition holds).
+template <typename Pred>
+static auto wait_until(Pred pred, std::chrono::milliseconds timeout = std::chrono::seconds(2)) -> bool {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return pred();
+}
+
 class SimpleTestSink : public component {
 public:
     SimpleTestSink() : component("SimpleTestSink") {
@@ -38,13 +51,13 @@ TEST_CASE("Component enabled property pauses input ports", "[lifecycle]") {
     
     // Start component
     sink->start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    
-    // Disable component via property
-    sink->set_properties({{"enabled", "false"}});
+    REQUIRE(wait_until([&] { return sink->is_running(); }));
+
+    // Disable component via property (synchronous stop + pause)
+    sink->set_properties({{"enabled", false}});
     sink->apply_lifecycle_changes();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    
+    REQUIRE(wait_until([&] { return sink->get_input_depth() == 0; }));
+
     // Verify component stopped and input port paused
     REQUIRE(sink->get_property<bool>("enabled") == false);
     REQUIRE(sink->get_input_depth() == 0);  // Should be paused
@@ -124,7 +137,7 @@ TEST_CASE("Component state metric updates on start/stop", "[lifecycle][metrics]"
 
     // Start component
     comp->start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(wait_until([&] { return get_state() == Catch::Approx(1.0); }));
 
     // State should be 1 (running)
     REQUIRE(get_state() == Catch::Approx(1.0));
@@ -169,20 +182,27 @@ TEST_CASE("Component process metrics are recorded", "[lifecycle][metrics]") {
     REQUIRE(get_counter("composite.component.noop_count") == 0);
     REQUIRE(get_histogram_count() == 0);
 
-    // Start component and let it run
+    // Per-iteration timing is opt-out (off by default): running the worker
+    // increments process_calls but the hot path reads no clock, so the
+    // process_time histogram stays empty.
     comp->start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(wait_until([&] { return get_counter("composite.component.process_calls") > 0; }));
     comp->stop();
 
-    // Should have some process calls
     auto process_calls = get_counter("composite.component.process_calls");
     REQUIRE(process_calls > 0);
+    REQUIRE(get_histogram_count() == 0);                          // timing off -> no samples
+    REQUIRE(get_counter("composite.component.noop_count") == 0);  // process() returned NORMAL
 
-    // Histogram should have same count as process calls
-    REQUIRE(get_histogram_count() == process_calls);
+    // Enabling measure_process_time makes the hot path sample into the histogram.
+    comp->set_properties(properties::json{{"measure_process_time", true}},
+                         properties::config_type::RUNTIME);
+    comp->start();
+    REQUIRE(wait_until([&] { return get_histogram_count() > 0; }));
+    comp->stop();
 
-    // noop_count should be 0 since we returned NORMAL
-    REQUIRE(get_counter("composite.component.noop_count") == 0);
+    REQUIRE(get_histogram_count() > 0);                          // timing on -> samples recorded
+    REQUIRE(get_counter("composite.component.process_calls") > process_calls);
 
     // Destroy component before cleaning up metrics (component destructor accesses metrics)
     comp.reset();
@@ -203,9 +223,10 @@ TEST_CASE("Component NOOP count is tracked", "[lifecycle][metrics]") {
         return 0;
     };
 
-    // Start component and let it run (NOOPs have a delay so won't be many)
+    // Start component and let it run until at least one NOOP is counted (NOOPs back off,
+    // so poll rather than assume a fixed window is long enough).
     comp->start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(wait_until([&] { return get_noop_count() > 0; }));
     comp->stop();
 
     // Should have some NOOP counts
