@@ -22,8 +22,10 @@
 namespace composite::metrics {
 
 auto registry::instance() -> registry& {
-    static registry instance;
-    return instance;
+    // Leaked on purpose: the registry must outlive every component so a component
+    // destructor (which deregisters its metrics) is safe even at process exit.
+    static registry* const instance = new registry;
+    return *instance;
 }
 
 } // namespace composite::metrics

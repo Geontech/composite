@@ -8,9 +8,14 @@
 #include <bit>
 #include <cstdint>
 #include <format>
+#include <cstdint>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
 
 namespace composite {
 
@@ -109,7 +114,7 @@ public:
  *
  * **Usage Pattern:**
  * @code
- * // Create and send metadata before data
+ * // Build metadata and send it WITH the data packet (third send_data argument)
  * metadata md;
  * md.sample_rate = 1e6;          // 1 MHz
  * md.center_frequency = 2.4e9;    // 2.4 GHz
@@ -118,20 +123,74 @@ public:
  * md.format.bit_width = 32;
  * md.annotations["source"] = "antenna_1";
  *
- * output_port.send_metadata(md);
- * output_port.send_data(buffer, timestamp);
+ * output_port.send_data(buffer, timestamp, md);
  * @endcode
  *
  * **Propagation Rules:**
- * - Metadata is sent via `output_port::send_metadata()`
- * - Metadata is "latched" by input ports until data arrives
- * - Metadata is bundled with the next data packet received
- * - Components can forward, modify, or generate new metadata
- * - Metadata without subsequent data is discarded
+ * - Metadata travels atomically with its data packet (the optional third
+ *   argument to `output_port::send_data()`), so it cannot be mis-associated
+ *   with a different packet under concurrent producers (no latch, no race).
+ * - It is delivered together with the buffer in `input_port::get_data()`'s tuple.
+ * - Components can forward, modify, or generate new metadata per packet.
  *
- * @see output_port_base::send_metadata()
+ * @see output_port::send_data()
  * @see input_port::get_data()
  */
+/**
+ * @brief A typed metadata annotation value: bool, integer, double, or string.
+ *
+ * Replaces the old string-only annotation so numeric metadata (sample counts,
+ * gains, flags) is carried as its real type rather than stringified and reparsed.
+ * Implicitly constructs from bool/integers/double/string (and `const char*`), so
+ * `md.annotations["gain"] = 2.5;` / `= 42` / `= true` / `= "iq"` all work, and
+ * comparing to a string literal still compiles.
+ */
+class annotation_value {
+public:
+    using variant_type = std::variant<bool, std::int64_t, double, std::string>;
+
+    annotation_value() : m_v(std::string{}) {}
+    annotation_value(bool b) : m_v(b) {}                                   // NOLINT(google-explicit-constructor)
+    annotation_value(std::int64_t i) : m_v(i) {}                           // NOLINT
+    annotation_value(int i) : m_v(static_cast<std::int64_t>(i)) {}         // NOLINT
+    annotation_value(std::uint64_t u) : m_v(static_cast<std::int64_t>(u)) {}  // NOLINT
+    annotation_value(double d) : m_v(d) {}                                 // NOLINT
+    annotation_value(const char* s) : m_v(std::string{s}) {}              // NOLINT
+    annotation_value(std::string s) : m_v(std::move(s)) {}                 // NOLINT
+
+    auto operator<=>(const annotation_value&) const = default;
+    auto operator==(const annotation_value&) const -> bool = default;
+
+    [[nodiscard]] auto value() const -> const variant_type& { return m_v; }
+    template <typename T> [[nodiscard]] auto get() const -> T { return std::get<T>(m_v); }
+    template <typename T> [[nodiscard]] auto holds() const -> bool { return std::holds_alternative<T>(m_v); }
+
+    [[nodiscard]] auto to_string() const -> std::string {
+        return std::visit([](const auto& v) -> std::string {
+            using V = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<V, bool>) { return v ? "true" : "false"; }
+            else if constexpr (std::is_same_v<V, std::string>) { return v; }
+            else { return std::format("{}", v); }
+        }, m_v);
+    }
+
+private:
+    variant_type m_v;
+};
+
+/// nlohmann ADL hooks so annotations (and maps of them) round-trip JSON with their
+/// real type — a bool/integer/double/string, not a stringified value.
+inline auto to_json(nlohmann::json& j, const annotation_value& v) -> void {
+    std::visit([&j](const auto& x) { j = x; }, v.value());
+}
+inline auto from_json(const nlohmann::json& j, annotation_value& v) -> void {
+    if (j.is_boolean()) { v = annotation_value(j.get<bool>()); }
+    else if (j.is_number_integer() || j.is_number_unsigned()) { v = annotation_value(j.get<std::int64_t>()); }
+    else if (j.is_number_float()) { v = annotation_value(j.get<double>()); }
+    else if (j.is_string()) { v = annotation_value(j.get<std::string>()); }
+    else { v = annotation_value{}; }  // null / unsupported -> default (empty string)
+}
+
 class metadata {
 public:
     data_format format;
@@ -139,7 +198,7 @@ public:
     double bandwidth{};
     double sample_rate{};
     bool eos{false};
-    std::map<std::string, std::string> annotations;
+    std::map<std::string, annotation_value> annotations;
 
     auto operator<=>(const metadata&) const = default;
     auto operator==(const metadata&) const -> bool = default;
@@ -173,7 +232,7 @@ public:
             s += "    (none)\n";
         } else {
             for (const auto& [key, value] : annotations) {
-                s += std::format("    {}: {}\n", key, value);
+                s += std::format("    {}: {}\n", key, value.to_string());
             }
         }
 
