@@ -10,8 +10,10 @@
 #include <cstddef>
 #include <cstdlib>
 #include <format>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 
 namespace composite {
 
@@ -36,6 +38,10 @@ public:
     using iterator = value_type*;               ///< Iterator type (raw pointer)
     using const_iterator = const value_type*;   ///< Const iterator type (raw const pointer)
 
+    static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>,
+        "aligned_mem assigns / std::copy's into raw aligned_alloc memory and frees without running "
+        "~T() — T must be trivially copyable and trivially destructible (its DSP/POD domain).");
+
     /**
      * @brief Constructs an aligned memory buffer
      * @param alignment Memory alignment requirement (must be a power of 2)
@@ -56,7 +62,7 @@ public:
             throw std::invalid_argument(err);
         }
         if (count > 0) {
-            m_data = static_cast<T*>(std::aligned_alloc(alignment, count * sizeof(T)));
+            m_data = static_cast<T*>(aligned_alloc_padded(alignment, bytes_for(count)));
             if (m_data == nullptr) {
                 throw std::runtime_error("memory allocation failed");
             }
@@ -65,6 +71,33 @@ public:
                 m_data[i] = T{};
             }
         }
+    }
+
+    /**
+     * @brief Allocate `bytes` with the given alignment, padded to a legal size
+     *
+     * std::aligned_alloc requires the requested size to be an integral multiple
+     * of the alignment (per the C standard, and enforced by AddressSanitizer).
+     * Round the request up so callers can ask for any element count without UB.
+     */
+    /// Bytes for `count` elements of T, or throw on overflow. Used at every
+    /// allocation site so a hostile/garbage element count (often a runtime
+    /// property) cannot wrap count*sizeof(T) into an undersized allocation
+    /// followed by a full-extent element write (heap overflow).
+    static auto bytes_for(size_type count) -> size_type {
+        if (count > std::numeric_limits<size_type>::max() / sizeof(T)) {
+            throw std::overflow_error("aligned_mem: count * sizeof(T) overflows");
+        }
+        return count * sizeof(T);
+    }
+
+    static auto aligned_alloc_padded(size_type alignment, size_type bytes) -> void* {
+        // Guard the padding round-up against overflow as well.
+        if (bytes > std::numeric_limits<size_type>::max() - (alignment - 1)) {
+            throw std::overflow_error("aligned_mem: size too large for alignment padding");
+        }
+        const size_type padded = ((bytes + alignment - 1) / alignment) * alignment;
+        return std::aligned_alloc(alignment, padded);
     }
 
     /**
@@ -84,7 +117,7 @@ public:
       m_count(other.m_count),
       m_capacity(other.m_capacity) {
         if (m_capacity > 0) {
-            m_data = static_cast<T*>(std::aligned_alloc(m_alignment, m_capacity * sizeof(T)));
+            m_data = static_cast<T*>(aligned_alloc_padded(m_alignment, bytes_for(m_capacity)));
             if (m_data == nullptr) {
                 throw std::runtime_error("memory allocation failed during copy construction");
             }
@@ -103,7 +136,7 @@ public:
             T* new_data = nullptr;
             if (other.m_capacity > 0) {
                 new_data = static_cast<T*>(
-                  std::aligned_alloc(other.m_alignment, other.m_capacity * sizeof(T))
+                  aligned_alloc_padded(other.m_alignment, bytes_for(other.m_capacity))
                 );
                 if (new_data == nullptr) {
                     throw std::runtime_error("memory allocation failed during copy assignment");
@@ -308,7 +341,7 @@ public:
             m_count = new_size;
         } else {
             // Need to reallocate
-            auto new_data = static_cast<T*>(std::aligned_alloc(m_alignment, new_size * sizeof(T)));
+            auto new_data = static_cast<T*>(aligned_alloc_padded(m_alignment, bytes_for(new_size)));
             if (new_data == nullptr) {
                 throw std::runtime_error("memory allocation failed during resize");
             }
@@ -348,7 +381,7 @@ public:
             return; // Already have enough capacity
         }
 
-        auto new_data = static_cast<T*>(std::aligned_alloc(m_alignment, new_capacity * sizeof(T)));
+        auto new_data = static_cast<T*>(aligned_alloc_padded(m_alignment, bytes_for(new_capacity)));
         if (new_data == nullptr) {
             throw std::runtime_error("memory allocation failed during reserve");
         }
@@ -386,7 +419,7 @@ public:
             return;
         }
 
-        auto new_data = static_cast<T*>(std::aligned_alloc(m_alignment, m_count * sizeof(T)));
+        auto new_data = static_cast<T*>(aligned_alloc_padded(m_alignment, bytes_for(m_count)));
         if (new_data == nullptr) {
             throw std::runtime_error("memory allocation failed during shrink_to_fit");
         }

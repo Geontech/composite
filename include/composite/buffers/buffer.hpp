@@ -11,13 +11,10 @@
 #include "external_buffer.hpp"
 
 #include <concepts>
-#include <condition_variable>
-#include <deque>
 #include <format>
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -114,7 +111,7 @@ public:
     template<ValidBufferContainer<T> Container>
     explicit immutable_buffer(std::shared_ptr<Container> data) :
       m_data(std::static_pointer_cast<const void>(data)),
-      m_span(std::as_bytes(std::span{data->data(), data->size()})),
+      m_span(make_byte_span(data->data(), data->size())),
       m_size(data->size()) {}
 
     /**
@@ -141,7 +138,7 @@ public:
      */
     explicit immutable_buffer(external_buffer<T> buf) :
       m_data(buf.ownership_handle()),
-      m_span(std::as_bytes(std::span{buf.data(), buf.size()})),
+      m_span(make_byte_span(buf.data(), buf.size())),
       m_size(buf.size()) {}
 
     /**
@@ -278,13 +275,20 @@ public:
         // Calculate actual count (handle npos = "to end")
         auto actual_count = (count == npos) ? (m_size - offset) : count;
 
-        // Validate count
-        if (offset + actual_count > m_size) {
+        // Validate count in SUBTRACTION form, which cannot overflow: offset has
+        // already been validated <= m_size, so (m_size - offset) is safe. The
+        // previous `offset + actual_count > m_size` wrapped for a large count
+        // (e.g. an underflowed `end - start` near SIZE_MAX), silently passing the
+        // check and returning an out-of-bounds view. (Don't print offset+count in
+        // the message — that sum can itself overflow.)
+        if (actual_count > m_size - offset) {
             throw std::out_of_range(
-                std::format("slice range [{}, {}) exceeds buffer size {}",
-                           offset, offset + actual_count, m_size)
+                std::format("slice range offset {} + count {} exceeds buffer size {}",
+                           offset, actual_count, m_size)
             );
         }
+        // With actual_count <= m_size - offset, the byte multiplications below are
+        // bounded by m_size * sizeof(T) (the allocated extent) and cannot overflow.
 
         // Create slice sharing same data
         immutable_buffer result;
@@ -346,6 +350,20 @@ public:
 private:
     friend class mutable_buffer<T>;
 
+    // Byte span over n elements of T, validating n*sizeof(T) does not overflow.
+    // The adopting constructors build m_span from a possibly-foreign size (an
+    // external_buffer wraps caller-supplied memory + length), so guard it the same
+    // way to_immutable() does — an unchecked std::as_bytes over a wrapped size
+    // would yield a byte span with a wrapped length (UB on later access).
+    static auto make_byte_span(const T* ptr, std::size_t n) -> std::span<const std::byte> {
+        constexpr auto max_size = std::numeric_limits<std::size_t>::max() / sizeof(T);
+        if (n > max_size) {
+            throw std::overflow_error(
+                std::format("immutable_buffer: size {} exceeds maximum {} for element type", n, max_size));
+        }
+        return std::as_bytes(std::span{ptr, n});
+    }
+
     std::shared_ptr<const void> m_data;     ///< Type-erased immutable container
     std::span<const std::byte> m_span;      ///< View into raw bytes for type-safe access
     std::size_t m_size{0};                  ///< Number of elements (not bytes)
@@ -368,13 +386,51 @@ private:
 template <typename T>
 class mutable_buffer {
     using deleter_type = void(*)(void*);
-    using copier_type = std::function<std::unique_ptr<void, deleter_type>(const void*)>;
-    using data_accessor_type = std::function<T*(void*)>;
-    using resize_op_type = std::function<void(void*, std::size_t)>;
-    using reserve_op_type = std::function<void(void*, std::size_t)>;
-    using capacity_getter_type = std::function<std::size_t(const void*)>;
-    using shrink_op_type = std::function<void(void*)>;
-    using clear_op_type = std::function<void(void*)>;
+
+    /**
+     * @brief Per-Container operation table (a manual "vtable").
+     *
+     * One static, immutable instance is shared by every mutable_buffer of a
+     * given Container type, replacing the seven per-instance std::function
+     * members the buffer used to carry. A buffer now stores a single
+     * `const buffer_ops*` instead of ~224 bytes of type-erased callables,
+     * so moves are trivial and copy() does one indirect call. The dynamic
+     * operations are nullptr for containers that are not DynamicBufferContainer.
+     */
+    struct buffer_ops {
+        std::unique_ptr<void, deleter_type> (*copy)(const void*);  ///< deep-copy the container
+        T* (*data_accessor)(void*);                                ///< container -> element pointer
+        void (*resize)(void*, std::size_t);                        ///< nullptr unless dynamic
+        void (*reserve)(void*, std::size_t);                       ///< nullptr unless dynamic
+        std::size_t (*capacity)(const void*);                      ///< nullptr unless dynamic
+        void (*shrink)(void*);                                     ///< nullptr unless dynamic
+        void (*clear)(void*);                                      ///< nullptr unless dynamic
+    };
+
+    /// Return the single static ops table for a given Container type.
+    template<ValidBufferContainer<T> Container>
+    static auto ops_for() -> const buffer_ops* {
+        static const buffer_ops ops = [] {
+            buffer_ops o{};
+            o.copy = [](const void* src) -> std::unique_ptr<void, deleter_type> {
+                auto* s = static_cast<const Container*>(src);
+                auto nc = std::make_unique<Container>(*s);
+                return {nc.release(), [](void* p) { delete static_cast<Container*>(p); }};
+            };
+            o.data_accessor = [](void* p) -> T* {
+                return static_cast<Container*>(p)->data();
+            };
+            if constexpr (DynamicBufferContainer<Container>) {
+                o.resize   = [](void* p, std::size_t n) { static_cast<Container*>(p)->resize(n); };
+                o.reserve  = [](void* p, std::size_t n) { static_cast<Container*>(p)->reserve(n); };
+                o.capacity = [](const void* p) -> std::size_t { return static_cast<const Container*>(p)->capacity(); };
+                o.shrink   = [](void* p) { static_cast<Container*>(p)->shrink_to_fit(); };
+                o.clear    = [](void* p) { static_cast<Container*>(p)->clear(); };
+            }
+            return o;
+        }();
+        return &ops;
+    }
 public:
     using value_type = T;
 
@@ -402,36 +458,8 @@ public:
             static_cast<Container*>(m_data.get())->data(),
             m_size
         })),
-        m_copier([](const void* src) -> std::unique_ptr<void, void(*)(void*)> {
-            auto* src_container = static_cast<const Container*>(src);
-            auto new_container = std::make_unique<Container>(*src_container);
-            return {new_container.release(), [](void* p) {
-                delete static_cast<Container*>(p);
-            }};
-        }),
-        m_data_accessor([](void* container_ptr) -> T* {
-            return static_cast<Container*>(container_ptr)->data();
-        })
-    {
-        // Only initialize capacity management operations for dynamic containers
-        if constexpr (DynamicBufferContainer<Container>) {
-            m_resize_op = [](void* container_ptr, std::size_t new_size) {
-                static_cast<Container*>(container_ptr)->resize(new_size);
-            };
-            m_reserve_op = [](void* container_ptr, std::size_t new_capacity) {
-                static_cast<Container*>(container_ptr)->reserve(new_capacity);
-            };
-            m_capacity_getter = [](const void* container_ptr) -> std::size_t {
-                return static_cast<const Container*>(container_ptr)->capacity();
-            };
-            m_shrink_op = [](void* container_ptr) {
-                static_cast<Container*>(container_ptr)->shrink_to_fit();
-            };
-            m_clear_op = [](void* container_ptr) {
-                static_cast<Container*>(container_ptr)->clear();
-            };
-        }
-    }
+        m_ops(ops_for<Container>())
+    {}
 
     /**
      * @brief Copy constructor - deleted (move-only, use copy() for deep copy)
@@ -451,13 +479,7 @@ public:
         : m_data(std::move(other.m_data)),
           m_size(other.m_size),
           m_span_mut(other.m_span_mut),
-          m_copier(std::move(other.m_copier)),
-          m_data_accessor(std::move(other.m_data_accessor)),
-          m_resize_op(std::move(other.m_resize_op)),
-          m_reserve_op(std::move(other.m_reserve_op)),
-          m_capacity_getter(std::move(other.m_capacity_getter)),
-          m_shrink_op(std::move(other.m_shrink_op)),
-          m_clear_op(std::move(other.m_clear_op)) {
+          m_ops(other.m_ops) {
         // Reset moved-from object to empty state
         other.m_size = 0;
         other.m_span_mut = {};
@@ -473,13 +495,7 @@ public:
             m_data = std::move(other.m_data);
             m_size = other.m_size;
             m_span_mut = other.m_span_mut;
-            m_copier = std::move(other.m_copier);
-            m_data_accessor = std::move(other.m_data_accessor);
-            m_resize_op = std::move(other.m_resize_op);
-            m_reserve_op = std::move(other.m_reserve_op);
-            m_capacity_getter = std::move(other.m_capacity_getter);
-            m_shrink_op = std::move(other.m_shrink_op);
-            m_clear_op = std::move(other.m_clear_op);
+            m_ops = other.m_ops;
 
             // Reset moved-from object to empty state
             other.m_size = 0;
@@ -606,20 +622,14 @@ public:
         mutable_buffer result;
         if (empty()) { return result; }
 
-        // Use the copier to create a new instance
-        result.m_data = m_copier(m_data.get());
+        // Use the per-Container ops table to deep-copy the container
+        result.m_data = m_ops->copy(m_data.get());
         result.m_size = m_size;
-        result.m_copier = m_copier;
-        result.m_data_accessor = m_data_accessor;
-        result.m_resize_op = m_resize_op;
-        result.m_reserve_op = m_reserve_op;
-        result.m_capacity_getter = m_capacity_getter;
-        result.m_shrink_op = m_shrink_op;
-        result.m_clear_op = m_clear_op;
+        result.m_ops = m_ops;
 
         // Use the data accessor to get the actual data pointer from the container
         result.m_span_mut = std::as_writable_bytes(std::span{
-            m_data_accessor(result.m_data.get()),
+            m_ops->data_accessor(result.m_data.get()),
             m_size
         });
         return result;
@@ -686,7 +696,7 @@ public:
         }
 
         // Get the actual data pointer using the accessor
-        auto* data_ptr = m_data_accessor(container_ptr);
+        auto* data_ptr = m_ops ? m_ops->data_accessor(container_ptr) : nullptr;
         if (!data_ptr) {
             throw std::runtime_error("mutable_buffer::to_immutable: data accessor returned null");
         }
@@ -761,16 +771,16 @@ public:
      * @param new_size Target size in elements
      */
     auto resize(std::size_t new_size) -> void {
-        if (!m_data || !m_resize_op) {
+        if (!m_data || !m_ops || !m_ops->resize) {
             throw std::runtime_error("cannot resize empty or uninitialized buffer");
         }
 
-        m_resize_op(m_data.get(), new_size);
+        m_ops->resize(m_data.get(), new_size);
         m_size = new_size;
 
         // Update span to reflect new size
         m_span_mut = std::as_writable_bytes(std::span{
-            m_data_accessor(m_data.get()),
+            m_ops->data_accessor(m_data.get()),
             m_size
         });
     }
@@ -784,15 +794,15 @@ public:
      * @param new_capacity Target capacity in elements
      */
     auto reserve(std::size_t new_capacity) -> void {
-        if (!m_data || !m_reserve_op) {
+        if (!m_data || !m_ops || !m_ops->reserve) {
             throw std::runtime_error("cannot reserve on empty or uninitialized buffer");
         }
 
-        m_reserve_op(m_data.get(), new_capacity);
+        m_ops->reserve(m_data.get(), new_capacity);
 
         // Update span in case reallocation occurred
         m_span_mut = std::as_writable_bytes(std::span{
-            m_data_accessor(m_data.get()),
+            m_ops->data_accessor(m_data.get()),
             m_size
         });
     }
@@ -803,10 +813,10 @@ public:
      * @return Number of elements that can be stored without reallocation
      */
     auto capacity() const -> std::size_t {
-        if (!m_data || !m_capacity_getter) {
+        if (!m_data || !m_ops || !m_ops->capacity) {
             return 0;
         }
-        return m_capacity_getter(m_data.get());
+        return m_ops->capacity(m_data.get());
     }
 
     /**
@@ -816,15 +826,15 @@ public:
      * request; implementations may choose not to shrink.
      */
     auto shrink_to_fit() -> void {
-        if (!m_data || !m_shrink_op) {
+        if (!m_data || !m_ops || !m_ops->shrink) {
             return;  // No-op for empty buffers
         }
 
-        m_shrink_op(m_data.get());
+        m_ops->shrink(m_data.get());
 
         // Update span in case reallocation occurred
         m_span_mut = std::as_writable_bytes(std::span{
-            m_data_accessor(m_data.get()),
+            m_ops->data_accessor(m_data.get()),
             m_size
         });
     }
@@ -836,13 +846,35 @@ public:
      * release capacity. After clear(), capacity() is unchanged but size() is 0.
      */
     auto clear() -> void {
-        if (!m_data || !m_clear_op) {
+        if (!m_data || !m_ops || !m_ops->clear) {
             return;  // No-op for empty buffers
         }
 
-        m_clear_op(m_data.get());
+        m_ops->clear(m_data.get());
         m_size = 0;
         m_span_mut = {};
+    }
+
+    /**
+     * @brief Logically shrink the buffer without reallocating
+     *
+     * Reduces the buffer's reported size and view to the first new_size elements.
+     * The underlying container is untouched (capacity() is unchanged, no realloc,
+     * no element destruction) — this only narrows the logical view. Common when a
+     * producer allocates a maximum-size buffer up front, then fills fewer elements
+     * (packet parsing, framing) and ships exactly what it produced.
+     *
+     * @param new_size Target size in elements; must be <= current size()
+     * @throws std::out_of_range if new_size > size() (truncate cannot grow; use resize())
+     */
+    auto truncate(std::size_t new_size) -> void {
+        if (new_size > m_size) {
+            throw std::out_of_range(
+              std::format("truncate size {} exceeds current size {}", new_size, m_size)
+            );
+        }
+        m_size = new_size;
+        m_span_mut = m_span_mut.subspan(0, new_size * sizeof(T));
     }
 
 private:
@@ -851,13 +883,7 @@ private:
     std::unique_ptr<void, deleter_type> m_data{nullptr, [](void*){}};   ///< Type-erased container with custom deleter
     std::size_t m_size{};                                               ///< Number of elements (not bytes)
     std::span<std::byte> m_span_mut;                                    ///< Mutable view into raw bytes
-    copier_type m_copier;                                               ///< Type-erased copy operation
-    data_accessor_type m_data_accessor;                                 ///< Type-erased data pointer accessor
-    resize_op_type m_resize_op;                                         ///< Optional resize operation (dynamic containers only)
-    reserve_op_type m_reserve_op;                                       ///< Optional reserve operation (dynamic containers only)
-    capacity_getter_type m_capacity_getter;                             ///< Optional capacity query (dynamic containers only)
-    shrink_op_type m_shrink_op;                                         ///< Optional shrink operation (dynamic containers only)
-    clear_op_type m_clear_op;                                           ///< Optional clear operation (dynamic containers only)
+    const buffer_ops* m_ops{nullptr};                                   ///< Per-Container static vtable (copy/data/resize/reserve/capacity/shrink/clear)
 };
 
 // ============================================================================

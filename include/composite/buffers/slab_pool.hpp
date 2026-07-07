@@ -12,10 +12,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <sys/mman.h>
 #include <utility>
 #include <vector>
@@ -31,7 +32,7 @@ namespace composite {
  *
  * Key features:
  * - Zero-copy buffer acquisition via external_buffer with custom deleter
- * - Thread-safe acquire/release operations with mutex protection
+ * - Thread-safe, lock-free acquire/release (Treiber free list; ABA-safe via a tagged head)
  * - LIFO allocation for better cache performance
  * - Optional huge page support for reduced TLB pressure
  * - Lock-free observability counters (available, outstanding)
@@ -147,10 +148,20 @@ public:
     slab_pool(ctor_tag, std::size_t buffer_size, std::size_t buffer_count) :
       m_buffer_size(buffer_size),
       m_buffer_count(buffer_count) {
+        static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>,
+            "slab_pool hands out raw, uninitialized slab memory reinterpret_cast to T* and never "
+            "runs T's constructor/destructor — T must be trivially copyable and trivially destructible "
+            "(the DSP/POD domain it targets).");
         if (buffer_size == 0 || buffer_count == 0) {
             throw std::invalid_argument("slab_pool: size and count must be > 0");
         }
 
+        // Guard the very first multiplication (the documented 'overflow-safe'
+        // guarantee skipped it): buffer_size * sizeof(T) can wrap for sizeof(T)>1,
+        // yielding stride 0 (SIGFPE at the divide below) or an undersized slab.
+        if (buffer_size > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            throw std::overflow_error("slab_pool: buffer_size * sizeof(T) overflows");
+        }
         const auto raw_bytes = buffer_size * sizeof(T);
 
         // Check for overflow before adding
@@ -176,12 +187,19 @@ public:
         ::madvise(m_slab.get(), m_total_bytes, MADV_HUGEPAGE);
 #endif
 
-        // Populate free stack
-        m_free_stack.reserve(buffer_count);
-        auto* base = m_slab.get();
-        for (std::size_t i = 0; i < buffer_count; ++i) {
-            m_free_stack.push_back(reinterpret_cast<T*>(base + (i * m_stride_bytes)));
+        // Populate the lock-free free list. Links live in a SEPARATE atomic array
+        // (m_next), never in the buffer memory — so a popper reading a link never
+        // races a thread writing user data into a just-acquired slot. m_free_head
+        // packs a 32-bit index with a 32-bit tag, making the Treiber CAS ABA-safe
+        // with a plain 8-byte atomic (no DWCAS).
+        if (buffer_count >= NULL_IDX) {
+            throw std::overflow_error("slab_pool: buffer_count too large for the 32-bit free-list index");
         }
+        m_next = std::make_unique<std::atomic<std::uint32_t>[]>(buffer_count);
+        for (std::uint32_t i = 0; i < buffer_count; ++i) {
+            m_next[i].store((i + 1 < buffer_count) ? (i + 1) : NULL_IDX, std::memory_order_relaxed);
+        }
+        m_free_head.store(0, std::memory_order_relaxed);  // index 0, tag 0
     }
 
     /**
@@ -208,7 +226,7 @@ public:
      * @return Optional containing buffer on success, or std::nullopt if pool exhausted
      *
      * @note Thread-safe: Multiple threads can call concurrently
-     * @note Lock-free after acquisition: Only acquires mutex briefly during pop
+     * @note Lock-free: a single Treiber-stack CAS pops a free slot (no mutex)
      * @note Non-blocking: Returns immediately if no buffers available
      *
      * Example:
@@ -224,22 +242,17 @@ public:
      */
     [[nodiscard]]
     auto acquire() -> std::optional<buffer_type> {
-        auto lock = std::unique_lock{m_mutex};
-        if (m_free_stack.empty()) { return std::nullopt; }
-
-        T* ptr = m_free_stack.back();
-        m_free_stack.pop_back();
-        lock.unlock();
+        const std::uint32_t idx = pop_index();
+        if (idx == NULL_IDX) { return std::nullopt; }
         m_outstanding.fetch_add(1, std::memory_order_relaxed);
-
-        return make_handle(this->shared_from_this(), ptr);
+        return make_handle(this->shared_from_this(), slot_ptr(idx));
     }
 
     /**
      * @brief Acquire multiple buffers at once (batch operation).
      *
      * More efficient than calling acquire() in a loop because:
-     * 1. Acquires mutex only once for entire batch
+     * 1. Amortizes the per-call setup across the batch (each slot is a lock-free CAS pop)
      * 2. Calls shared_from_this() once and reuses for all buffers
      * 3. Pre-reserves vector capacity to avoid reallocations
      *
@@ -273,15 +286,14 @@ public:
      */
     [[nodiscard]]
     auto acquire_batch(std::size_t count, std::vector<buffer_type>& out) -> std::size_t {
-        auto lock = std::unique_lock{m_mutex};
         auto acquired = std::size_t{};
         out.reserve(out.size() + count);
         auto self = this->shared_from_this();
 
-        while (acquired < count && !m_free_stack.empty()) {
-            T* ptr = m_free_stack.back();
-            m_free_stack.pop_back();
-            out.emplace_back(make_handle(self, ptr));
+        while (acquired < count) {
+            const std::uint32_t idx = pop_index();
+            if (idx == NULL_IDX) { break; }
+            out.emplace_back(make_handle(self, slot_ptr(idx)));
             acquired++;
         }
         if (acquired > 0) {
@@ -352,7 +364,7 @@ public:
      *
      * @return Number of buffers ready for immediate acquisition (0 to capacity)
      *
-     * @note Thread-safe: Acquires mutex to read free stack size
+     * @note Thread-safe: a relaxed atomic load of the free-list head (no mutex)
      * @note Snapshot semantics: Value may be stale immediately after return
      *
      * Example:
@@ -364,8 +376,10 @@ public:
      */
     [[nodiscard]]
     auto available() const -> std::size_t {
-        auto lock = std::lock_guard{m_mutex};
-        return m_free_stack.size();
+        // Derived from the outstanding counter (the lock-free list isn't countable
+        // without traversal): available + outstanding == capacity.
+        const auto out = m_outstanding.load(std::memory_order_acquire);
+        return out >= m_buffer_count ? 0 : m_buffer_count - out;
     }
 
     /**
@@ -460,7 +474,7 @@ private:
      * @param ptr Pointer to buffer previously acquired from this pool.
      *            Must be a valid pointer returned by acquire() or acquire_batch().
      *
-     * @note Thread-safe: Acquires mutex to modify free stack
+     * @note Thread-safe: a lock-free Treiber-stack CAS pushes the slot back (no mutex)
      * @note Private: Only callable by buffer deleter (not part of public API)
      * @note Debug validation: Asserts on invalid pointers in debug builds
      *
@@ -475,9 +489,49 @@ private:
         bool aligned = ((addr - base) % m_stride_bytes) == 0;
         assert(in_range && aligned && "slab_pool: attempt to release invalid pointer");
 #endif
-        auto lock = std::lock_guard{m_mutex};
-        m_free_stack.push_back(ptr);
+        const auto idx = static_cast<std::uint32_t>(
+            (reinterpret_cast<std::uint8_t*>(ptr) - m_slab.get()) / m_stride_bytes);
+        push_index(idx);
         m_outstanding.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    // ----- lock-free Treiber free list (index + tag packed in m_free_head) -----
+    static constexpr std::uint32_t NULL_IDX = 0xFFFFFFFFu;
+    static auto tag_of(std::uint64_t h) -> std::uint32_t { return static_cast<std::uint32_t>(h >> 32); }
+
+    auto slot_ptr(std::uint32_t idx) -> T* {
+        return reinterpret_cast<T*>(m_slab.get() + static_cast<std::size_t>(idx) * m_stride_bytes);
+    }
+
+    /// Pop the head free index (NULL_IDX if empty). ABA-safe via the tag; the link
+    /// read is an atomic load on m_next (never touches buffer memory).
+    auto pop_index() -> std::uint32_t {
+        std::uint64_t head = m_free_head.load(std::memory_order_acquire);
+        for (;;) {
+            const auto idx = static_cast<std::uint32_t>(head);
+            if (idx == NULL_IDX) { return NULL_IDX; }
+            // The link value is only USED if the CAS succeeds (head unchanged ⇒ idx
+            // still the free head ⇒ its link is current). The head-acquire above
+            // orders this load after the matching push's head-release.
+            const std::uint32_t next = m_next[idx].load(std::memory_order_relaxed);
+            const std::uint64_t nh = (static_cast<std::uint64_t>(tag_of(head) + 1) << 32) | next;
+            if (m_free_head.compare_exchange_weak(head, nh,
+                    std::memory_order_acquire, std::memory_order_acquire)) {
+                return idx;
+            }
+        }
+    }
+    /// Push @p idx onto the free list.
+    auto push_index(std::uint32_t idx) -> void {
+        std::uint64_t head = m_free_head.load(std::memory_order_relaxed);
+        for (;;) {
+            m_next[idx].store(static_cast<std::uint32_t>(head), std::memory_order_relaxed);  // link = head
+            const std::uint64_t nh = (static_cast<std::uint64_t>(tag_of(head) + 1) << 32) | idx;
+            if (m_free_head.compare_exchange_weak(head, nh,
+                    std::memory_order_release, std::memory_order_relaxed)) {
+                return;
+            }
+        }
     }
 
     /**
@@ -503,11 +557,13 @@ private:
      * @note Lambda is stored in external_buffer and invoked on buffer destruction
      */
     auto make_handle(std::shared_ptr<slab_pool> self, T* ptr) -> buffer_type {
-        // Return wrapper with deleter that returns to pool while keeping pool alive
+        // Return wrapper with a deleter that returns the slot to the pool and keeps
+        // the pool alive (captures shared_ptr self). The deleter is invoked with the
+        // buffer pointer, so it need not capture ptr.
         return buffer_type(
             ptr,
             m_buffer_size,
-            [ptr, self = std::move(self)]() { self->release(ptr); }
+            [self = std::move(self)](T* p) { self->release(p); }
         );
     }
 
@@ -531,17 +587,16 @@ private:
      *         Allocated with std::aligned_alloc(), freed via slab_deleter. */
     std::unique_ptr<uint8_t, slab_deleter> m_slab;
 
-    /** @brief Mutex protecting m_free_stack modifications.
-     *         Mutable to allow const methods to lock for reading. */
-    mutable std::mutex m_mutex;
+    /** @brief Lock-free Treiber free-list head: high 32 bits = ABA tag,
+     *         low 32 bits = index of the head free slot (NULL_IDX if empty). */
+    std::atomic<std::uint64_t> m_free_head{0};
 
-    /** @brief LIFO stack of available buffer pointers.
-     *         Protected by m_mutex. Size indicates current availability. */
-    std::vector<T*> m_free_stack;
+    /** @brief Per-slot "next free index" links, kept OUT of the buffer memory so a
+     *         link read never races user data written into a just-acquired slot. */
+    std::unique_ptr<std::atomic<std::uint32_t>[]> m_next;
 
     /** @brief Count of buffers currently acquired (not yet released).
-     *         Updated atomically without mutex. Relaxed ordering sufficient
-     *         because it's for observability only, not synchronization. */
+     *         available() is derived from this (capacity - outstanding). */
     std::atomic<std::size_t> m_outstanding{0};
 
 }; // class slab_pool
