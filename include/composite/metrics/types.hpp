@@ -438,42 +438,26 @@ public:
      * @param value Value to record
      */
     void record(double value) noexcept {
-        std::size_t bucket_idx;
+        // ONE bucketing rule for all boundaries (power-of-2 boundaries are just a
+        // special case), so create_histogram and create_histogram_pow2 agree on
+        // which bucket a value lands in. (The old O(1) power-of-2 fast path used a
+        // different rounding and disagreed with the binary-search path, e.g. 1.5.)
+        auto it = std::lower_bound(m_boundaries.begin(), m_boundaries.end(), value);
+        auto bucket_idx = static_cast<std::size_t>(it - m_boundaries.begin());
 
-        if (m_power_of_2 && value >= 1.0) {
-            // O(1) bucket lookup for power-of-2 boundaries using portable C++20
-            auto int_val = static_cast<uint64_t>(value);
-            bucket_idx = int_val == 0 ? 0 : static_cast<std::size_t>(63 - std::countl_zero(int_val));
-            if (bucket_idx >= m_buckets.size()) {
-                bucket_idx = m_buckets.size() - 1;
-            }
-        } else {
-            // O(log n) binary search for arbitrary boundaries
-            auto it = std::lower_bound(m_boundaries.begin(), m_boundaries.end(), value);
-            bucket_idx = static_cast<std::size_t>(it - m_boundaries.begin());
-        }
-
-        // Increment sequence to odd (write in progress) for seqlock
-        m_sequence.value.fetch_add(1, std::memory_order_release);
-
+        // Independent per-field atomics, no seqlock. Correct under MULTIPLE
+        // concurrent recorders (the old single-writer seqlock was not). A snapshot
+        // taken during concurrent records is per-field-never-torn / eventually
+        // consistent (what an aggregating exporter needs); a quiescent snapshot is exact.
         m_buckets[bucket_idx].value.fetch_add(1, std::memory_order_relaxed);
         m_count.value.fetch_add(1, std::memory_order_relaxed);
 
-        // Sum update - use compare-exchange loop for double
-        // Use bit_cast for type-punning (well-defined in C++20)
         uint64_t current_bits = m_sum.value.load(std::memory_order_relaxed);
         uint64_t new_bits;
         do {
-            double current_sum = std::bit_cast<double>(current_bits);
-            double new_sum = current_sum + value;
+            double new_sum = std::bit_cast<double>(current_bits) + value;
             new_bits = std::bit_cast<uint64_t>(new_sum);
-        } while (!m_sum.value.compare_exchange_weak(
-            current_bits,
-            new_bits,
-            std::memory_order_relaxed));
-
-        // Increment sequence to even (write complete)
-        m_sequence.value.fetch_add(1, std::memory_order_release);
+        } while (!m_sum.value.compare_exchange_weak(current_bits, new_bits, std::memory_order_relaxed));
     }
 
     /**
@@ -505,26 +489,11 @@ public:
     auto snapshot() const -> histogram_data {
         histogram_data data;
         data.bucket_counts.reserve(m_buckets.size());
-
-        uint64_t seq1, seq2;
-        do {
-            // Wait for any in-progress write to complete (seq must be even)
-            do {
-                seq1 = m_sequence.value.load(std::memory_order_acquire);
-            } while (seq1 & 1);
-
-            // Read all data
-            data.bucket_counts.clear();
-            for (const auto& bucket : m_buckets) {
-                data.bucket_counts.push_back(bucket.value.load(std::memory_order_relaxed));
-            }
-            data.count = m_count.value.load(std::memory_order_relaxed);
-            data.sum = std::bit_cast<double>(m_sum.value.load(std::memory_order_relaxed));
-
-            // Check sequence hasn't changed (no write occurred during read)
-            seq2 = m_sequence.value.load(std::memory_order_acquire);
-        } while (seq1 != seq2);
-
+        for (const auto& bucket : m_buckets) {
+            data.bucket_counts.push_back(bucket.value.load(std::memory_order_relaxed));
+        }
+        data.count = m_count.value.load(std::memory_order_relaxed);
+        data.sum = std::bit_cast<double>(m_sum.value.load(std::memory_order_relaxed));
         return data;
     }
 
@@ -561,17 +530,11 @@ public:
      *          Ensure no other threads are recording during reset.
      */
     void reset() noexcept {
-        // Use seqlock to mark write in progress
-        m_sequence.value.fetch_add(1, std::memory_order_release);
-
         for (auto& bucket : m_buckets) {
             bucket.value.store(0, std::memory_order_relaxed);
         }
         m_count.value.store(0, std::memory_order_relaxed);
         m_sum.value.store(0, std::memory_order_relaxed);
-
-        // Mark write complete
-        m_sequence.value.fetch_add(1, std::memory_order_release);
     }
 
 private:
@@ -579,7 +542,6 @@ private:
     std::vector<aligned_atomic<uint64_t>> m_buckets;
     aligned_atomic<uint64_t> m_count{};
     aligned_atomic<uint64_t> m_sum{};  // Stored as bits of double
-    aligned_atomic<uint64_t> m_sequence{};  // Seqlock: even = stable, odd = write in progress
     bool m_power_of_2{false};
 };
 
