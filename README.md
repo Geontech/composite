@@ -324,8 +324,13 @@ connected input ports.
 
 ```cpp
 out.send_data(std::move(buffer), ts);                 // no metadata
-out.send_data(std::move(buffer), ts, metadata);       // metadata rides with the packet
-out.send_batch(buffers_span, ts, metadata);           // amortized publish for a single consumer
+out.send_data(std::move(buffer), ts, md_ptr);         // shared metadata rides with the packet
+out.send_batch(buffers_span, ts, md_ptr);             // amortized publish for a single consumer
+
+// Build the shared instance ONCE per metadata change, not per packet:
+composite::metadata md;
+md.sample_rate = 1e6;
+auto md_ptr = composite::make_metadata(std::move(md));  // shared_ptr<const metadata>
 ```
 
 - **Single-producer:** `send_data`/`send_batch` must be called from one thread only (the component's
@@ -334,8 +339,13 @@ out.send_batch(buffers_span, ts, metadata);           // amortized publish for a
 - **Minimal copies (move-on-last):** for the common 1:1 case the buffer (and its metadata) is *moved*
   to the receiver — zero copies. On fan-out, earlier receivers get a share/copy and the last receiver
   gets the move. An immutable→mutable hop deep-copies; a mutable→immutable hop promotes in place.
-- **Metadata** travels atomically with its packet as the optional third argument — there is no
-  separate "send metadata" call and no metadata/data race.
+- **Metadata** travels atomically with its packet as the third argument — there is no separate
+  "send metadata" call and no metadata/data race. It is carried as a `composite::metadata_ptr`
+  (`shared_ptr<const metadata>`): the producer rebuilds the instance only when a field changes,
+  every packet in between attaches the same pointer (a refcount bump, not a map copy), fan-out
+  receivers share one instance, and consumers detect "unchanged" by pointer identity instead of
+  a deep compare. A convenience overload still accepts a plain `metadata` value and wraps it
+  (one allocation per call) — fine for tests, avoid on hot paths.
 - **Backpressure:** `can_send()` returns `true` if at least one connected input has capacity. Pair it
   with the `AWAIT_OUTPUT` return value for lossless pacing.
 
@@ -366,8 +376,9 @@ out.connection_count();  out.connected_ports();   // introspection
 #### Receiving data
 
 `try_get()` is the **canonical non-blocking read**. It returns
-`std::optional<std::tuple<BufferType, timestamp, std::optional<metadata>>>`: `std::nullopt` when the
-ring is empty, otherwise the packet — even one carrying a genuine zero-length buffer:
+`std::optional<std::tuple<BufferType, timestamp, metadata_ptr>>`: `std::nullopt` when the
+ring is empty, otherwise the packet — even one carrying a genuine zero-length buffer (the
+`metadata_ptr` is `nullptr` when the packet carries no metadata):
 
 ```cpp
 auto pkt = in.try_get();
@@ -796,7 +807,8 @@ auto passthrough_gain::process() -> composite::retval {
 
     for (std::size_t i = 0; i < buffer.size(); ++i) { buffer[i] *= m_gain; }
 
-    // Metadata (if any) rides atomically with the packet as the optional third argument.
+    // Metadata (if any) rides atomically with the packet as a shared immutable instance;
+    // forwarding it is a refcount bump.
     m_out.send_data(std::move(buffer), ts, metadata);
     return NORMAL;
 }
@@ -843,10 +855,14 @@ output, derive from `pipeline_component<InBuf, OutBuf>` instead of `component`. 
 slot ring that re-serializes out-of-order completions back to submission order; `process()` is `final`.
 Override three hooks instead:
 
-- `prepare(metadata&)` — main thread, arrival order (e.g. stamp annotations).
+- `prepare(metadata&)` — main thread, arrival order (e.g. stamp annotations). Metadata is shared
+  across packets, so this runs only when it actually needs rebuilding: when the incoming packet
+  carries a different metadata instance than the previous one, or after
+  `invalidate_prepared_metadata()` (call that from your property handler when `prepare()` stamps
+  values derived from config). Packets in between share the prepared result.
 - `work(InBuf in, timestamp ts, const metadata& md) -> OutBuf` — runs concurrently on the pool.
-- `finalize(OutBuf& out, timestamp ts, metadata& md) -> bool` — main thread, submission order;
-  return `false` to drop the packet.
+- `finalize(OutBuf& out, timestamp ts, const metadata& md) -> bool` — main thread, submission
+  order; return `false` to drop the packet. Metadata is read-only here — annotate in `prepare()`.
 
 `num_workers` is auto-registered as a RUNTIME property (range 1..1024); changing it drains the pool and
 rebuilds it at the new size. Because only the main thread sends, the single-producer invariant holds.

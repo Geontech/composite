@@ -45,7 +45,7 @@ protected:
         return out;
     }
 
-    auto finalize(out_t& out, timestamp /*ts*/, composite::metadata& /*md*/) -> bool override {
+    auto finalize(out_t& out, timestamp /*ts*/, const composite::metadata& /*md*/) -> bool override {
         auto so = out.as_span();
         const std::int64_t seq = so.empty() ? -1 : so[0] / 2;
         if (seq != m_expect) { m_bad.store(true, std::memory_order_relaxed); }   // SUBMISSION ORDER
@@ -145,6 +145,78 @@ int main() {
         }
         std::printf("PIPELINE runtime-resize OK: %lld packets in exact order across live num_workers changes\n",
                     (long long)M);
+    }
+
+    // ---- prepared-metadata cache: prepare() runs per metadata CHANGE, not per packet ----
+    {
+        class stamper : public pipeline_component<mutable_buffer<std::int64_t>, mutable_buffer<std::int64_t>> {
+        public:
+            stamper() : pipeline_component("stamper", "in", "out", 1) {}
+            std::atomic<int> m_prepares{0};
+            std::atomic<std::int64_t> m_finalized{0};
+            auto poke_invalidate() -> void { invalidate_prepared_metadata(); }
+        protected:
+            auto prepare(composite::metadata& md) -> void override {
+                m_prepares.fetch_add(1, std::memory_order_relaxed);
+                md.annotations["stamp"] = true;
+            }
+            auto work(in_t in, timestamp /*ts*/, const composite::metadata& /*md*/) -> out_t override {
+                return in;
+            }
+            auto finalize(out_t& /*out*/, timestamp /*ts*/, const composite::metadata& md) -> bool override {
+                if (!md.annotations.contains("stamp")) { m_bad.store(true, std::memory_order_relaxed); }
+                m_finalized.fetch_add(1, std::memory_order_relaxed);
+                return false;  // nothing downstream
+            }
+        public:
+            std::atomic_bool m_bad{false};
+            component::auto_stop m_auto_stop{*this};  // MUST be last
+        };
+
+        auto p4 = std::make_shared<stamper>();
+        output_port<mutable_buffer<std::int64_t>> feed4{"feed"};
+        auto* in4 = p4->get_port<input_port_base>("in");
+        if (in4 == nullptr || !feed4.connect(in4)) { std::puts("FAIL: connect (D)"); return 1; }
+        p4->start();
+
+        composite::metadata md;
+        md.sample_rate = 1e6;
+        const auto shared_md = make_metadata(std::move(md));
+        auto send_and_wait = [&](composite::metadata_ptr m, std::int64_t upto) -> bool {
+            feed4.send_data(make_mutable<std::int64_t>(4), timestamp{}, std::move(m));
+            for (int i = 0; i < 2000 && p4->m_finalized.load() < upto; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return p4->m_finalized.load() == upto;
+        };
+
+        // Three packets, one shared instance: prepare() must run exactly once.
+        for (std::int64_t s = 1; s <= 3; ++s) {
+            if (!send_and_wait(shared_md, s)) { std::puts("FAIL: stamper stalled (D)"); return 1; }
+        }
+        if (p4->m_prepares.load() != 1) {
+            std::printf("FAIL: prepare() ran %d times for one metadata instance (want 1)\n",
+                        p4->m_prepares.load());
+            return 1;
+        }
+        // Invalidation (a config change prepare() depends on) forces one rebuild.
+        p4->poke_invalidate();
+        if (!send_and_wait(shared_md, 4)) { std::puts("FAIL: stamper stalled post-invalidate (D)"); return 1; }
+        if (p4->m_prepares.load() != 2) {
+            std::printf("FAIL: prepare() ran %d times after invalidate (want 2)\n", p4->m_prepares.load());
+            return 1;
+        }
+        // A different incoming instance forces one rebuild.
+        composite::metadata md2;
+        md2.sample_rate = 2e6;
+        if (!send_and_wait(make_metadata(std::move(md2)), 5)) { std::puts("FAIL: stamper stalled on new md (D)"); return 1; }
+        if (p4->m_prepares.load() != 3) {
+            std::printf("FAIL: prepare() ran %d times after metadata change (want 3)\n", p4->m_prepares.load());
+            return 1;
+        }
+        p4->stop();
+        if (p4->m_bad.load()) { std::puts("FAIL: unstamped metadata reached finalize (D)"); return 1; }
+        std::puts("PIPELINE prepared-metadata cache OK: 1 prepare per change, shared across packets");
     }
     return 0;
 }

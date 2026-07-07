@@ -39,7 +39,7 @@ The table below maps the old API to the new one.
 | **Construction args** | scalar `"create_arg": "cf32"` | `"args": { "type": "cf32" }` (the scalar form still works, mapped to `{"type": ...}`) |
 | **Input read** | blocking / 1 s default timeout / `blocking` overloads | `try_get()` → `std::optional` is the **canonical** read (distinguishes empty ring from a zero-length packet); `get_data()` stays for the `buffer.empty()` idiom; the no-op timeout/`blocking` overloads were **removed** |
 | **Input queue** | unbounded `std::deque` + condition variable | bounded lock-free SPSC ring, **default depth 1024, drop-on-full** at the producer (+ overflow callback) |
-| **Output metadata** | `send_metadata()` latched separately | metadata rides atomically with the packet — the optional 3rd argument of `send_data` |
+| **Output metadata** | `send_metadata()` latched separately | metadata rides atomically with the packet — the 3rd argument of `send_data`, carried as a shared immutable `metadata_ptr` built once per change (`make_metadata`); a value-accepting convenience overload wraps per call |
 | **`enabled`** | a property + mandatory `apply_lifecycle_changes()` two-step | a spec/status virtual — a RUNTIME write **is** the start/stop (immediate); `apply_lifecycle_changes()` only after an INITIALIZE write |
 | **`process()` return** | `{NORMAL, NOOP, FINISH, NO_YIELD}` | adds `AWAIT_OUTPUT` (lossless backpressure via the reverse doorbell) |
 | **Metric naming** | name auto-prefixed with the component id (`my_comp.packets`) | names used verbatim; identity is the auto-added `component_id` **label** |

@@ -8,8 +8,8 @@
 #include <bit>
 #include <cstdint>
 #include <format>
-#include <cstdint>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
@@ -114,7 +114,8 @@ public:
  *
  * **Usage Pattern:**
  * @code
- * // Build metadata and send it WITH the data packet (third send_data argument)
+ * // Build metadata ONCE (or when a field actually changes), then attach the same
+ * // shared instance to every packet — attachment is a refcount bump, not a copy.
  * metadata md;
  * md.sample_rate = 1e6;          // 1 MHz
  * md.center_frequency = 2.4e9;    // 2.4 GHz
@@ -122,16 +123,22 @@ public:
  * md.format.type = data_type::floating_point;
  * md.format.bit_width = 32;
  * md.annotations["source"] = "antenna_1";
+ * auto md_ptr = std::make_shared<const metadata>(std::move(md));
  *
- * output_port.send_data(buffer, timestamp, md);
+ * output_port.send_data(buffer, timestamp, md_ptr);   // every packet: refcount bump only
  * @endcode
  *
  * **Propagation Rules:**
- * - Metadata travels atomically with its data packet (the optional third
- *   argument to `output_port::send_data()`), so it cannot be mis-associated
- *   with a different packet under concurrent producers (no latch, no race).
+ * - Metadata travels atomically with its data packet (the third argument to
+ *   `output_port::send_data()`), so it cannot be mis-associated with a
+ *   different packet under concurrent producers (no latch, no race).
+ * - It is carried as a `shared_ptr<const metadata>`: producers rebuild the
+ *   instance only when a field changes, all packets in between share it, and
+ *   consumers can detect "unchanged" by pointer identity instead of a deep
+ *   compare. Fan-out receivers share one instance.
  * - It is delivered together with the buffer in `input_port::get_data()`'s tuple.
- * - Components can forward, modify, or generate new metadata per packet.
+ * - A convenience `send_data` overload still accepts a plain
+ *   `std::optional<metadata>` value and wraps it; use the shared form on hot paths.
  *
  * @see output_port::send_data()
  * @see input_port::get_data()
@@ -246,5 +253,17 @@ public:
     }
 
 }; // class metadata
+
+/// How metadata travels through ports: one immutable instance shared by every packet
+/// (and every fan-out receiver) until the producer publishes a changed one. nullptr
+/// means "no metadata on this packet".
+using metadata_ptr = std::shared_ptr<const metadata>;
+
+/// Wrap a metadata value for sending. Producers should call this once per CHANGE and
+/// reuse the returned pointer for every subsequent packet, not once per packet.
+[[nodiscard]]
+inline auto make_metadata(metadata md) -> metadata_ptr {
+    return std::make_shared<const metadata>(std::move(md));
+}
 
 } // namespace composite

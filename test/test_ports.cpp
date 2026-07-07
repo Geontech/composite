@@ -332,7 +332,7 @@ public:
     bool m_received{false};
     std::size_t m_size{0};
     std::vector<float> m_values;
-    std::optional<metadata> m_metadata;
+    metadata_ptr m_metadata;
 
 private:
     input_port<mutable_buffer<float>> m_input{"data_in"};
@@ -364,7 +364,7 @@ public:
     }
 
     bool m_processed{false};
-    std::optional<metadata> m_received_metadata;
+    metadata_ptr m_received_metadata;
 
 private:
     input_port<mutable_buffer<float>> m_input{"data_in"};
@@ -391,10 +391,13 @@ public:
 
         m_processed = true;
 
-        // Modify metadata (if any) and forward it with the data
-        if (md.has_value()) {
-            md->center_frequency += m_cf_offset;
-            md->annotations["modified_by"] = id();
+        // Modify metadata (if any) and forward it with the data: shared metadata is
+        // immutable in flight, so a modifying component copies the value, edits, re-wraps.
+        if (md != nullptr) {
+            auto modified = *md;
+            modified.center_frequency += m_cf_offset;
+            modified.annotations["modified_by"] = id();
+            md = make_metadata(std::move(modified));
         }
         m_output.send_data(std::move(buffer), ts, md);
         return retval::FINISH;
@@ -943,7 +946,7 @@ TEST_CASE("immutable fan-out delivers metadata to every receiver (M4-2 move-for-
     for (auto* in : {&in1, &in2, &in3}) {
         auto [buf, ts, rmd] = in->get_data();
         REQUIRE(buf.size() == 3);
-        REQUIRE(rmd.has_value());
+        REQUIRE(rmd != nullptr);
         REQUIRE(rmd->center_frequency == 2.4e9);
         REQUIRE(rmd->sample_rate == 1e6);
         REQUIRE(rmd->eos == true);
@@ -1021,6 +1024,37 @@ TEST_CASE("input port depth queuing", "[port][depth]") {
 // Metadata Tests
 // ============================================================================
 
+TEST_CASE("metadata is shared by pointer across packets and fan-out", "[port][metadata]") {
+    output_port<immutable_buffer<float>> out{"out"};
+    input_port<immutable_buffer<float>> in1{"in1"};
+    input_port<immutable_buffer<float>> in2{"in2"};
+    REQUIRE(out.connect(&in1));
+    REQUIRE(out.connect(&in2));
+
+    metadata md;
+    md.sample_rate = 1e6;
+    md.annotations["protocol"] = "test";
+    const auto shared = make_metadata(std::move(md));
+
+    // The producer latches one instance and attaches it to every packet.
+    out.send_data(make_immutable<float>({1.0f}), timestamp{}, shared);
+    out.send_data(make_immutable<float>({2.0f}), timestamp{}, shared);
+
+    // Every packet on every receiver carries the SAME instance — no copies were made.
+    auto [b1, t1, m1] = in1.get_data();
+    auto [b2, t2, m2] = in1.get_data();
+    auto [c1, u1, n1] = in2.get_data();
+    auto [c2, u2, n2] = in2.get_data();
+    REQUIRE(m1.get() == shared.get());
+    REQUIRE(m2.get() == shared.get());
+    REQUIRE(n1.get() == shared.get());
+    REQUIRE(n2.get() == shared.get());
+
+    // Consumers detect "unchanged" by pointer identity.
+    REQUIRE(m1 == m2);
+    REQUIRE(m1->sample_rate == 1e6);
+}
+
 TEST_CASE("metadata propagation", "[port][metadata]") {
     SECTION("basic metadata send and receive") {
         auto source = std::make_shared<TestMetadataSource>();
@@ -1044,8 +1078,8 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(sink->m_size == 100);
 
         // Verify metadata received
-        REQUIRE(sink->m_metadata.has_value());
-        auto& md = sink->m_metadata.value();
+        REQUIRE(sink->m_metadata != nullptr);
+        const auto& md = *sink->m_metadata;
         REQUIRE_THAT(md.center_frequency, Catch::Matchers::WithinAbs(2.4e9, 1.0));
         REQUIRE_THAT(md.bandwidth, Catch::Matchers::WithinAbs(20e6, 1.0));
         REQUIRE_THAT(md.sample_rate, Catch::Matchers::WithinAbs(10e6, 1.0));
@@ -1069,7 +1103,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
 
         // No metadata should be received without data
         REQUIRE_FALSE(sink->m_received);
-        REQUIRE_FALSE(sink->m_metadata.has_value());
+        REQUIRE_FALSE(sink->m_metadata != nullptr);
     }
 
     SECTION("data without metadata") {
@@ -1086,7 +1120,7 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         // Data received but no metadata
         REQUIRE(sink->m_received);
         REQUIRE(sink->m_size == 50);
-        REQUIRE_FALSE(sink->m_metadata.has_value());
+        REQUIRE_FALSE(sink->m_metadata != nullptr);
     }
 
     SECTION("metadata propagation through chain") {
@@ -1109,12 +1143,12 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
 
         // Verify passthrough received metadata
         REQUIRE(passthrough->m_processed);
-        REQUIRE(passthrough->m_received_metadata.has_value());
+        REQUIRE(passthrough->m_received_metadata != nullptr);
 
         // Verify sink received metadata
         REQUIRE(sink->m_received);
-        REQUIRE(sink->m_metadata.has_value());
-        auto& md = sink->m_metadata.value();
+        REQUIRE(sink->m_metadata != nullptr);
+        const auto& md = *sink->m_metadata;
         REQUIRE_THAT(md.center_frequency, Catch::Matchers::WithinAbs(5.8e9, 1.0));
         REQUIRE_THAT(md.sample_rate, Catch::Matchers::WithinAbs(50e6, 1.0));
         REQUIRE(md.eos == true);
@@ -1138,8 +1172,8 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(sink->process() == retval::FINISH);
 
         // Verify metadata was modified
-        REQUIRE(sink->m_metadata.has_value());
-        auto& md = sink->m_metadata.value();
+        REQUIRE(sink->m_metadata != nullptr);
+        const auto& md = *sink->m_metadata;
         REQUIRE_THAT(md.center_frequency, Catch::Matchers::WithinAbs(1.1e9, 1.0));
         REQUIRE(md.annotations.contains("modified_by"));
         REQUIRE(md.annotations.at("modified_by") == "TestMetadataModifier");
@@ -1157,8 +1191,8 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(source->process() == retval::NORMAL);
         REQUIRE(sink->process() == retval::FINISH);
 
-        REQUIRE(sink->m_metadata.has_value());
-        REQUIRE(sink->m_metadata.value().eos == true);
+        REQUIRE(sink->m_metadata != nullptr);
+        REQUIRE(sink->m_metadata->eos == true);
     }
 
     SECTION("complex vs real data format") {
@@ -1173,8 +1207,8 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(source->process() == retval::NORMAL);
         REQUIRE(sink->process() == retval::FINISH);
 
-        REQUIRE(sink->m_metadata.has_value());
-        REQUIRE(sink->m_metadata.value().format.is_complex == true);
+        REQUIRE(sink->m_metadata != nullptr);
+        REQUIRE(sink->m_metadata->format.is_complex == true);
     }
 
     SECTION("multiple annotations") {
@@ -1195,8 +1229,8 @@ TEST_CASE("metadata propagation", "[port][metadata]") {
         REQUIRE(sink->process() == retval::FINISH);
 
         // Should have both source and modifier annotations
-        REQUIRE(sink->m_metadata.has_value());
-        auto& md = sink->m_metadata.value();
+        REQUIRE(sink->m_metadata != nullptr);
+        const auto& md = *sink->m_metadata;
         REQUIRE(md.annotations.size() == 2);
         REQUIRE(md.annotations.contains("source_info"));
         REQUIRE(md.annotations.contains("modified_by"));
@@ -2409,11 +2443,11 @@ TEST_CASE("port disconnect with metadata", "[port][disconnect][metadata]") {
         source->output.send_data(std::move(buffer1), timestamp{}, md1);
 
         auto [data1a, ts1a, md1a] = sink1->input.get_data();
-        REQUIRE(md1a.has_value());
+        REQUIRE(md1a != nullptr);
         REQUIRE(md1a->sample_rate == 1e6);
 
         auto [data1b, ts1b, md1b] = sink2->input.get_data();
-        REQUIRE(md1b.has_value());
+        REQUIRE(md1b != nullptr);
         REQUIRE(md1b->sample_rate == 1e6);
 
         // Disconnect sink1
@@ -2430,7 +2464,7 @@ TEST_CASE("port disconnect with metadata", "[port][disconnect][metadata]") {
 
         // sink2 should have new data with new metadata
         auto [data2b, ts2b, md2b] = sink2->input.get_data();
-        REQUIRE(md2b.has_value());
+        REQUIRE(md2b != nullptr);
         REQUIRE(md2b->sample_rate == 2e6);
     }
 }

@@ -24,7 +24,8 @@ auto passthrough_gain::process() -> composite::retval {
 
     for (std::size_t i = 0; i < buffer.size(); ++i) { buffer[i] *= m_gain; }
 
-    // Metadata (if any) rides atomically with the packet as the optional third argument.
+    // Metadata (if any) rides atomically with the packet as a shared immutable instance;
+    // forwarding it is a refcount bump.
     m_out.send_data(std::move(buffer), ts, metadata);
     return NORMAL;
 }

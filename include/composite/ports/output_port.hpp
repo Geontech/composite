@@ -101,23 +101,26 @@ public:
      * @brief Send data (and optional metadata) to all connected input ports
      * @param buffer Immutable buffer to send
      * @param ts Timestamp associated with the data
-     * @param md Optional metadata describing this packet — travels atomically WITH
-     *           the data to every connected port (no separate latch, no race)
+     * @param md Shared metadata describing this packet (nullptr = none) — travels
+     *           atomically WITH the data to every connected port (no separate latch,
+     *           no race). Producers should build the instance once per metadata
+     *           CHANGE (see composite::make_metadata) and pass the same pointer for
+     *           every packet in between; attachment is a refcount bump, and fan-out
+     *           receivers share the one instance.
      *
      * Delivers buffer to all connected input ports with optimal transfer strategy:
      * - For immutable inputs: Zero-copy share via buffer.share()
      * - For mutable inputs: Deep copy to new mutable_buffer
      *
      * Transfer optimization (mirrors the mutable path): the sole / last receiver gets the
-     * buffer + metadata by MOVE (no share/refcount bump, no metadata copy); the common 1:1
-     * connection therefore performs zero metadata copies. Earlier fan-out receivers copy the
-     * metadata (each needs its own) and share the buffer.
+     * buffer + metadata pointer by MOVE (not even a refcount bump); earlier fan-out
+     * receivers bump the metadata refcount and share the buffer.
      *
      * Updates statistics (packets, bytes, throughput) and checks queue capacity.
      * If an input port is full, the packet is dropped at that port (not here).
      */
     auto send_data(buffer_type buffer, timestamp ts,
-                   std::optional<composite::metadata> md = std::nullopt) -> void {
+                   composite::metadata_ptr md = nullptr) -> void {
         // Update outgoing statistics
         m_stats.record_transfer(buffer.size() * sizeof(T));
 
@@ -142,7 +145,8 @@ public:
             return;
         }
 
-        // Fan-out: metadata copied to all but the last receiver; the last gets the move.
+        // Fan-out: all receivers share the one metadata instance (refcount bumps); the
+        // last gets the pointer by move.
         for (std::size_t i = 0; i + 1 < ports->size(); ++i) {
             auto* port = (*ports)[i];
             if (port == nullptr) { continue; }
@@ -170,13 +174,23 @@ public:
     }
 
     /**
+     * @brief Convenience overload: accepts a plain metadata value and wraps it in a
+     *        shared instance for this one send. Prefer the metadata_ptr overload on
+     *        hot paths — this one allocates per call.
+     */
+    auto send_data(buffer_type buffer, timestamp ts, std::optional<composite::metadata> md) -> void {
+        send_data(std::move(buffer), ts,
+                  md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
+    }
+
+    /**
      * @brief Send a batch of buffers (sharing one timestamp/metadata) to connected
      *        inputs. With a single immutable consumer this is one amortized
      *        add_batch (single ring publish); otherwise it falls back to per-buffer
      *        send_data (fan-out / mutable targets). Buffers are consumed.
      */
     auto send_batch(std::span<buffer_type> bufs, timestamp ts,
-                    std::optional<composite::metadata> md = std::nullopt) -> void {
+                    composite::metadata_ptr md = nullptr) -> void {
         const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr && !ports->front()->is_mutable()) {
             auto* ip = static_cast<input_port<immutable_buffer<T>>*>(ports->front());
@@ -184,8 +198,8 @@ public:
             batch.reserve(bufs.size());
             for (std::size_t j = 0; j < bufs.size(); ++j) {
                 m_stats.record_transfer(bufs[j].size() * sizeof(T));
-                // All batch entries share one metadata; move it into the last entry
-                // (copy into the earlier ones, which each need their own).
+                // All batch entries share the one metadata instance; the last takes the
+                // pointer by move.
                 if (j + 1 == bufs.size()) {
                     batch.emplace_back(bufs[j].share(), ts, std::move(md));
                 } else {
@@ -196,6 +210,12 @@ public:
             return;
         }
         for (auto& b : bufs) { send_data(std::move(b), ts, md); }
+    }
+
+    /// Convenience overload: wraps a plain metadata value (allocates per call).
+    auto send_batch(std::span<buffer_type> bufs, timestamp ts, std::optional<composite::metadata> md) -> void {
+        send_batch(bufs, ts,
+                   md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
     }
 
 }; // class output_port<immutable_buffer<T>>
@@ -295,7 +315,7 @@ public:
      * each receiver gets independent ownership of the data.
      */
     auto send_data(buffer_type buffer, timestamp ts,
-                   std::optional<composite::metadata> md = std::nullopt) -> void {
+                   composite::metadata_ptr md = nullptr) -> void {
         // Update statistics
         m_stats.record_transfer(buffer.size() * sizeof(T));
 
@@ -318,7 +338,7 @@ public:
                 immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
             }
         } else {
-            // Fan-out: handle multiple outputs (metadata copied to each receiver)
+            // Fan-out: handle multiple outputs (all share the one metadata instance)
             for (std::size_t i = 0; i < ports->size() - 1; ++i) {
                 auto* port = (*ports)[i];
                 if (port == nullptr) { continue; };
@@ -347,13 +367,23 @@ public:
     }
 
     /**
+     * @brief Convenience overload: accepts a plain metadata value and wraps it in a
+     *        shared instance for this one send. Prefer the metadata_ptr overload on
+     *        hot paths — this one allocates per call.
+     */
+    auto send_data(buffer_type buffer, timestamp ts, std::optional<composite::metadata> md) -> void {
+        send_data(std::move(buffer), ts,
+                  md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
+    }
+
+    /**
      * @brief Send a batch of mutable buffers (sharing one timestamp/metadata) with
      *        one amortized add_batch to a single consumer (moved for mutable,
      *        promoted for immutable); per-buffer send_data fallback for fan-out.
      *        Buffers are consumed.
      */
     auto send_batch(std::span<buffer_type> bufs, timestamp ts,
-                    std::optional<composite::metadata> md = std::nullopt) -> void {
+                    composite::metadata_ptr md = nullptr) -> void {
         const auto& ports = producer_snapshot();  // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr) {
             auto* port = ports->front();
@@ -379,6 +409,12 @@ public:
             return;
         }
         for (auto& b : bufs) { send_data(std::move(b), ts, md); }
+    }
+
+    /// Convenience overload: wraps a plain metadata value (allocates per call).
+    auto send_batch(std::span<buffer_type> bufs, timestamp ts, std::optional<composite::metadata> md) -> void {
+        send_batch(bufs, ts,
+                   md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
     }
 
 }; // output_port<mutable_buffer<T>>

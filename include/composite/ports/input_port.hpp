@@ -62,7 +62,9 @@ class input_port : public input_port_base {
 public:
     using buffer_type = Buf;
     using value_type = typename Buf::value_type;
-    using queue_type = std::tuple<buffer_type, timestamp, std::optional<composite::metadata>>;
+    // Metadata rides as a shared_ptr<const metadata> (composite::metadata_ptr): packets between
+    // metadata changes share ONE instance, so enqueue/dequeue is a refcount bump, never a map copy.
+    using queue_type = std::tuple<buffer_type, timestamp, composite::metadata_ptr>;
 
     /// @param name Port name. @param depth Initial queue depth (also sizes the ring).
     explicit input_port(std::string_view name, std::size_t depth = 1024)
@@ -166,7 +168,7 @@ private:
     template<typename> friend class output_port;
 
     /// Producer side (single thread). Enqueue or drop-if-full.
-    auto add_data(buffer_type data, timestamp ts, std::optional<composite::metadata> md = std::nullopt) -> void {
+    auto add_data(buffer_type data, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
         const auto tail = m_tail.load(std::memory_order_relaxed);   // only the producer writes tail
         const auto head = m_head.load(std::memory_order_acquire);   // observe consumer progress
         // Clamp the effective limit to the PHYSICAL ring capacity. depth() is a

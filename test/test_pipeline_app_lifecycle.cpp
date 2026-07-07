@@ -57,7 +57,7 @@ public:
         for (std::size_t i = 0; i < in.size(); ++i) { out[i] = in[i]; }
         return std::move(out).to_immutable();
     }
-    auto finalize(ibuf& /*out*/, timestamp /*ts*/, metadata& /*md*/) -> bool override {
+    auto finalize(ibuf& /*out*/, timestamp /*ts*/, const metadata& /*md*/) -> bool override {
         return (m_fin++ % 2) == 0;  // keep 0th,2nd,4th... drop the rest (finalize runs main-thread, in order)
     }
     int m_fin{0};  // main-worker only
@@ -74,7 +74,7 @@ public:
         for (std::size_t i = 0; i < in.size(); ++i) { out[i] = in[i]; }
         return std::move(out).to_immutable();
     }
-    auto finalize(ibuf& /*out*/, timestamp /*ts*/, metadata& /*md*/) -> bool override {
+    auto finalize(ibuf& /*out*/, timestamp /*ts*/, const metadata& /*md*/) -> bool override {
         const int n = m_fin_calls.fetch_add(1, std::memory_order_relaxed);  // side effect: counts EVERY call
         if (n == 2) { throw std::runtime_error("finalize boom"); }          // throw once, on the 3rd packet
         return true;

@@ -30,7 +30,7 @@ namespace composite {
  *        ordered-future-drain pattern that fft/psd hand-roll today (ASSESSMENT §4.D).
  *
  * The derived class implements three hooks instead of process():
- *   - prepare(md)                  : main thread, ARRIVAL order (per input packet)
+ *   - prepare(md)                  : main thread, ARRIVAL order (per metadata CHANGE, see below)
  *   - work(in, ts, md) -> out      : pool worker, CONCURRENT across packets
  *   - finalize(out, ts, md) -> bool: main thread, SUBMISSION order (false = drop)
  * plus optional on_workers_resized(n). Order-sensitive stages (prepare/finalize)
@@ -112,8 +112,12 @@ public:
     }
 
 protected:
-    /// Per-input, ARRIVAL order, main thread. Inspect/annotate metadata before the
-    /// packet enters the parallel stage. Default: no-op.
+    /// ARRIVAL order, main thread. Inspect/annotate the metadata that will travel with the
+    /// packets. Metadata is shared across packets, so this runs only when it actually needs
+    /// rebuilding: when the incoming packet carries a DIFFERENT metadata instance than the
+    /// previous one, or after invalidate_prepared_metadata(). Packets in between share the
+    /// prepared result — do per-CHANGE stamping here (config params, formats), never
+    /// per-packet counting. Default: no-op.
     virtual auto prepare(composite::metadata& /*md*/) -> void {}
 
     /// The parallel stage: runs on a pool worker, concurrently across packets.
@@ -121,9 +125,18 @@ protected:
     /// state). Returns the output buffer for this input.
     virtual auto work(in_t in, timestamp ts, const composite::metadata& md) -> out_t = 0;
 
-    /// SUBMISSION order, main thread. Last chance to annotate; return false to drop
-    /// this packet (not sent downstream). Default: keep + send.
-    virtual auto finalize(out_t& /*out*/, timestamp /*ts*/, composite::metadata& /*md*/) -> bool { return true; }
+    /// SUBMISSION order, main thread. Decide keep/drop for this packet (false = not sent
+    /// downstream). The metadata is read-only here — it is shared across packets; annotate
+    /// in prepare(). Default: keep + send.
+    virtual auto finalize(out_t& /*out*/, timestamp /*ts*/, const composite::metadata& /*md*/) -> bool { return true; }
+
+    /// Tell the pipeline that prepare() would now stamp different values (e.g. a property
+    /// changed the config it reads): the cached prepared metadata is rebuilt for the next
+    /// ingested packet even if the incoming metadata instance is unchanged. Callable from
+    /// any thread (property on_change hooks included).
+    auto invalidate_prepared_metadata() -> void {
+        m_prepare_dirty.store(true, std::memory_order_release);
+    }
 
     /// Called once on the main thread after the pool is (re)sized, to (re)build
     /// per-worker state. Default: no-op.
@@ -164,9 +177,8 @@ protected:
                 slot& s = m_ring[m_submit & m_mask];  // FREE; owned by main until READY published
                 s.in = std::move(in);
                 s.ts = ts;
-                s.md = md.has_value() ? *md : composite::metadata{};
+                s.md = prepared_metadata(md);  // shared across packets; prepare() runs per CHANGE
                 s.err = nullptr;
-                prepare(s.md);
                 s.state.store(slot::READY, std::memory_order_release);
                 { std::scoped_lock lk{m_mtx}; ++m_submit; }
                 m_work_cv.notify_one();
@@ -214,7 +226,7 @@ private:
         in_t in{};
         out_t out{};
         timestamp ts{};
-        composite::metadata md{};
+        composite::metadata_ptr md{};  ///< shared prepared metadata; always non-null once submitted
         std::exception_ptr err{};
         // Retire-time latches (main-thread only): finalize() runs exactly once per slot even if the
         // send is deferred across an AWAIT_OUTPUT round-trip; `keep` records its decision so a DROPPED
@@ -227,6 +239,30 @@ private:
         std::size_t p = 1;
         while (p < n) { p <<= 1; }
         return p;
+    }
+
+    /// ARRIVAL order, main thread. Return the shared metadata to travel with this packet,
+    /// re-running prepare() only when the incoming instance differs from the previous
+    /// packet's (pointer identity — producers latch their instance) or after
+    /// invalidate_prepared_metadata(). The steady state is a refcount bump: no metadata
+    /// copy, no prepare() call, no allocation.
+    auto prepared_metadata(const composite::metadata_ptr& in_md) -> composite::metadata_ptr {
+        // exchange (not load) so an invalidate() that lands DURING prepare() re-marks dirty
+        // and the next packet rebuilds again — never a lost invalidation.
+        const bool dirty = m_prepare_dirty.exchange(false, std::memory_order_acq_rel);
+        if (!dirty && m_prepared != nullptr && in_md == m_last_in_md) {
+            return m_prepared;
+        }
+        auto working = in_md ? *in_md : composite::metadata{};
+        try {
+            prepare(working);
+        } catch (...) {
+            m_prepare_dirty.store(true, std::memory_order_release);  // retry on the next packet
+            throw;
+        }
+        m_last_in_md = in_md;
+        m_prepared = composite::make_metadata(std::move(working));
+        return m_prepared;
     }
 
     struct retire_result {
@@ -269,7 +305,7 @@ private:
                     // throw, restart, and re-enter retire_ready() on this same un-retired head, running
                     // finalize() (and its pre-throw side effects) again per retry. [fix round 5]
                     try {
-                        s.keep = finalize(s.out, s.ts, s.md);
+                        s.keep = finalize(s.out, s.ts, *s.md);
                     } catch (const std::exception& e) {
                         logger()->error("pipeline finalize() threw: {} (packet dropped)", e.what());
                         s.keep = false;
@@ -283,11 +319,12 @@ private:
                     if (m_out.producer_is_connected() && !m_out.producer_can_send()) {
                         return {any, /*blocked_on_output=*/true};
                     }
-                    m_out.send_data(std::move(s.out), s.ts, s.md);
+                    m_out.send_data(std::move(s.out), s.ts, s.md);  // refcount bump; slot keeps its ref until reset below
                 }
             }
             s.in = in_t{};
             s.out = out_t{};
+            s.md = nullptr;
             s.finalized = false;
             s.keep = false;
             s.state.store(slot::FREE, std::memory_order_release);
@@ -383,9 +420,11 @@ private:
                 my = m_claim++;  // claim this READY slot (only this worker gets it)
             }
             slot& s = m_ring[my & m_mask];
-            // s.state == READY here; run the parallel stage outside the lock.
+            // s.state == READY here; run the parallel stage outside the lock. The slot holds
+            // its own metadata reference, so a concurrent rebuild of the prepared metadata on
+            // the main thread never invalidates *s.md.
             try {
-                s.out = work(std::move(s.in), s.ts, s.md);
+                s.out = work(std::move(s.in), s.ts, *s.md);
             } catch (...) {
                 s.err = std::current_exception();
             }
@@ -411,6 +450,11 @@ private:
     bool m_park_pending{false};        ///< set by on_park_requested to break the done-wait
     std::atomic_bool m_resize_pending{false};  ///< set by num_workers on_change; applied by the main worker
     std::atomic_bool m_pool_stop{false};
+
+    // Prepared-metadata cache (main-thread ingest state; the dirty flag alone is cross-thread).
+    composite::metadata_ptr m_last_in_md{};   ///< incoming instance the cache was built from
+    composite::metadata_ptr m_prepared{};     ///< prepare()'s result, shared by packets until it changes
+    std::atomic_bool m_prepare_dirty{true};   ///< set by invalidate_prepared_metadata()
     std::vector<std::thread> m_pool;
 
     static inline thread_local int t_worker_index{-1};

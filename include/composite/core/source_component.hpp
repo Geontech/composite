@@ -69,10 +69,11 @@ public:
         produce_status status{produce_status::idle};
         OutBuf buffer{};
         timestamp ts{};
-        std::optional<composite::metadata> md{};
+        composite::metadata_ptr md{};
 
-        /// Emit a packet on the output port.
-        static auto emit(OutBuf b, timestamp t, std::optional<composite::metadata> m = std::nullopt)
+        /// Emit a packet on the output port. Latch the metadata_ptr in the source and pass
+        /// the same instance every packet (rebuild via composite::make_metadata on change).
+        static auto emit(OutBuf b, timestamp t, composite::metadata_ptr m = nullptr)
             -> produce_result {
             return produce_result{produce_status::data, std::move(b), t, std::move(m)};
         }
