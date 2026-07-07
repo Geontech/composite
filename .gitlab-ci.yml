@@ -6,11 +6,13 @@ stages:
   - build
   - sanitize
 
-# GCC 14 image; install cmake + git (FetchContent needs git).
+# GCC 14 image; install cmake + git (FetchContent needs git) + nlohmann-json3-dev
+# (nlohmann_json is a REQUIRED system dependency — the public JSON type in the
+# property API — not a FetchContent fallback; trixie's 3.11.3 meets the floor).
 .gcc:
   image: gcc:14
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake git
+    - apt-get update -qq && apt-get install -y -qq cmake git nlohmann-json3-dev
     - cmake --version && g++ --version | head -1
 
 # ---------------------------------------------------------------------------
@@ -24,7 +26,7 @@ lint:tidy-format:
   image: gcc:14
   allow_failure: true
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake git clang-tidy clang-format
+    - apt-get update -qq && apt-get install -y -qq cmake git clang-tidy clang-format nlohmann-json3-dev
   script:
     # compile_commands.json drives clang-tidy.
     - cmake -B build -DCOMPOSITE_BUILD_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -79,7 +81,7 @@ build:dpdk:
   image: gcc:14
   allow_failure: true
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake git pkg-config libdpdk-dev
+    - apt-get update -qq && apt-get install -y -qq cmake git pkg-config libdpdk-dev nlohmann-json3-dev
     - cmake --version && pkg-config --modversion libdpdk
   script:
     # Build the library (which now contains dpdk_manager.cpp) + the CLI. Tests off:
