@@ -1,0 +1,100 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Debug + tests",
+      "description": "Debug build with the unit-test suite enabled (the CI baseline).",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COMPOSITE_BUILD_TESTS": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release + tests",
+      "inherits": "default",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "openssl",
+      "displayName": "Debug + tests + OpenSSL REST",
+      "inherits": "default",
+      "cacheVariables": { "COMPOSITE_USE_OPENSSL": "ON" }
+    },
+    {
+      "name": "otel",
+      "displayName": "Debug + tests + OpenTelemetry",
+      "inherits": "default",
+      "cacheVariables": { "COMPOSITE_USE_OPENTELEMETRY": "ON" }
+    },
+    {
+      "name": "install",
+      "displayName": "Release install tree",
+      "inherits": "release",
+      "cacheVariables": {
+        "COMPOSITE_BUILD_TESTS": "OFF",
+        "COMPOSITE_INSTALL": "ON",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/prefix"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer + tests",
+      "description": "Debug build with ThreadSanitizer; the gate for the concurrency-dense core (park, SPSC ring, registry, pipeline_component).",
+      "inherits": "default",
+      "cacheVariables": { "COMPOSITE_SANITIZER": "thread" }
+    },
+    {
+      "name": "asan-ubsan",
+      "displayName": "Address+UB Sanitizer + tests",
+      "description": "Debug build with ASan+UBSan; the gate for buffers/memory + the untrusted-parse path.",
+      "inherits": "default",
+      "cacheVariables": { "COMPOSITE_SANITIZER": "address,undefined" }
+    },
+    {
+      "name": "ci",
+      "displayName": "Debug + tests + warnings-as-errors",
+      "description": "Like default but promotes warnings to errors; used by the CI build gate.",
+      "inherits": "default",
+      "cacheVariables": { "COMPOSITE_WERROR": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "openssl", "configurePreset": "openssl" },
+    { "name": "otel", "configurePreset": "otel" },
+    { "name": "install", "configurePreset": "install", "targets": ["install"] },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "asan-ubsan", "configurePreset": "asan-ubsan" },
+    { "name": "ci", "configurePreset": "ci" }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": { "outputOnFailure": true },
+      "environment": { "TSAN_OPTIONS": "halt_on_error=1 second_deadlock_stack=1" }
+    },
+    {
+      "name": "asan-ubsan",
+      "configurePreset": "asan-ubsan",
+      "output": { "outputOnFailure": true },
+      "environment": { "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1", "ASAN_OPTIONS": "halt_on_error=1" }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

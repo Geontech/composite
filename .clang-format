@@ -1,0 +1,22 @@
+# House style for the composite framework. Reflects the existing sources:
+# 4-space indent, trailing return types, attached (K&R) braces, left-aligned
+# pointers, non-indented namespaces, ~120-col lines.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+PointerAlignment: Left
+ReferenceAlignment: Left
+NamespaceIndentation: None
+FixNamespaceComments: true
+AccessModifierOffset: -4
+BreakBeforeBraces: Attach
+AlwaysBreakTemplateDeclarations: Yes
+SpaceAfterTemplateKeyword: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve

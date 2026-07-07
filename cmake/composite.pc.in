@@ -1,5 +1,13 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
 Name: composite
 Description: Composite processing framework
 URL: https://github.com/geontech/composite
-Version: ${PROJECT_VERSION}
-CFlags: -I${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}
+Version: @PROJECT_VERSION@
+Requires: nlohmann_json
+Cflags: -I${includedir} -std=c++20
+Libs: -L${libdir} -lcomposite
+Libs.private: -pthread

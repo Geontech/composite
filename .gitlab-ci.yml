@@ -1,0 +1,207 @@
+# composite CI — build + test + sanitizers.
+# See ASSESSMENT.md §10 (foundation) and §11 (concurrency test gate).
+
+stages:
+  - lint
+  - build
+  - sanitize
+
+# GCC 14 image; install cmake + git (FetchContent needs git).
+.gcc:
+  image: gcc:14
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake git
+    - cmake --version && g++ --version | head -1
+
+# ---------------------------------------------------------------------------
+# Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3). Establishes the
+# .clang-tidy (concurrency-*/bugprone-*) and .clang-format house style and
+# surfaces findings. allow_failure until the existing tree is brought into
+# compliance; then drop allow_failure (and tighten .clang-tidy WarningsAsErrors).
+# ---------------------------------------------------------------------------
+lint:tidy-format:
+  stage: lint
+  image: gcc:14
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake git clang-tidy clang-format
+  script:
+    # compile_commands.json drives clang-tidy.
+    - cmake -B build -DCOMPOSITE_BUILD_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    - cmake --build build -j"$(nproc)" --target composite >/dev/null   # generate version.hpp etc.
+    # clang-tidy every compiled source (recursively); each TU pulls its headers, so the whole
+    # tree's headers are analyzed transitively — including properties/ports/buffers, which the old
+    # 'include/composite/core/*.hpp' glob excluded. `find` (not `git ls-files`) so untracked files
+    # are covered too (much of the tree is currently uncommitted; git ls-files would skip it).
+    - clang-tidy -p build $(find src -name '*.cpp')
+    # clang-format compliance across the whole tree (again `find`, recursive, untracked-visible).
+    - clang-format --dry-run --Werror $(find include src test bench examples -name '*.hpp' -o -name '*.cpp' 2>/dev/null)
+
+# ---------------------------------------------------------------------------
+# Build the library + CLI with the unit tests on, and run ctest.
+# ---------------------------------------------------------------------------
+build:test:
+  stage: build
+  extends: .gcc
+  script:
+    # `ci` preset = Debug + tests + COMPOSITE_WERROR=ON: the tree is warning-clean
+    # under -Wall -Wextra -Wpedantic, so warnings now fail the gate. ctest runs the
+    # full 34-test suite (incl. the formerly-orphaned concurrency tests).
+    - cmake --preset ci
+    - cmake --build --preset ci -j"$(nproc)"
+    - ctest --preset ci
+
+# Build the documented option combinations so the optional-feature paths
+# (OpenSSL / OpenTelemetry, etc.) don't rot. DPDK is its own job below (it pulls
+# libdpdk via pkg-config, which the base gcc image doesn't carry).
+build:options-matrix:
+  stage: build
+  extends: .gcc
+  allow_failure: true   # flip off once each option's deps are provisioned in the image
+  parallel:
+    matrix:
+      - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
+      - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON"
+  script:
+    - cmake -B build $OPTS
+    - cmake --build build -j"$(nproc)"
+
+# DPDK feature build. dpdk_manager.cpp ONLY compiles under -DCOMPOSITE_USE_DPDK=ON
+# (it includes rte_*.h), so it is invisible to every other job and to local dev
+# environments without libdpdk. This is the ONLY gate that compile-checks it — the
+# EAL-free bookkeeping/locking it delegates to (port_registry) is already unit- and
+# TSan-tested in build:test / sanitize:* without a NIC, so this job only needs to
+# COMPILE the EAL adapter, not run it (no NIC in CI). pkg_check_modules(libdpdk)
+# resolves against libdpdk-dev's pkg-config file. allow_failure until a runner image
+# carries libdpdk-dev — flip it off then so the manager can't silently rot.
+build:dpdk:
+  stage: build
+  image: gcc:14
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake git pkg-config libdpdk-dev
+    - cmake --version && pkg-config --modversion libdpdk
+  script:
+    # Build the library (which now contains dpdk_manager.cpp) + the CLI. Tests off:
+    # the DPDK paths need a NIC/hugepages to run; compile coverage is the goal here.
+    - cmake -B build -DCOMPOSITE_USE_DPDK=ON -DCOMPOSITE_BUILD_TESTS=OFF -DCOMPOSITE_WERROR=ON
+    - cmake --build build -j"$(nproc)"
+
+# Install the package and build a downstream consumer against it via
+# find_package(composite). Guards the install/export/pkg-config surface: asserts
+# the generated version.hpp installs and the .pc declares Libs: (both were broken
+# before the packaging fixes — a $<BUILD_INTERFACE:> in install() and a missing
+# Libs: line).
+build:consumer:
+  stage: build
+  extends: .gcc
+  script:
+    - cmake -B build -DCMAKE_INSTALL_PREFIX=$CI_PROJECT_DIR/_install -DCOMPOSITE_INSTALL=ON -DCOMPOSITE_BUILD_TESTS=OFF
+    - cmake --build build -j"$(nproc)" --target install
+    - test -f _install/include/composite/version.hpp        # generated header must install
+    # composite.pc installs to ${CMAKE_INSTALL_LIBDIR}/pkgconfig (lib or lib64, distro-dependent),
+    # not share/pkgconfig — locate it instead of hardcoding the libdir.
+    - grep -q '^Libs:' "$(find _install -name composite.pc)" # .pc must declare Libs
+    - mkdir -p consumer
+    - |
+      cat > consumer/main.cpp <<'EOF'
+      // Include the umbrella header (pulls component.hpp etc.) to ENFORCE self-containment:
+      // the installed package must compile against a clean consumer with no spdlog on the
+      // include path (spdlog is private behind composite::logger; nlohmann_json is a public
+      // find_dependency). A subclass + logger() exercise the logging facade end to end.
+      #include <composite/composite.hpp>
+      namespace {
+      class ci_probe : public composite::component {
+      public:
+          explicit ci_probe(std::string_view id) : composite::component(id) {}
+          auto process() -> composite::retval override { logger()->info("ci {}", id()); return composite::retval::FINISH; }
+      };
+      }
+      int main() {
+          composite::set_global_log_level(composite::log_level::off);
+          auto& r = composite::metrics::registry::instance();
+          r.get_or_create_counter("ci.consumer", "demo", "1", {}).inc();
+          ci_probe p{"ci_consumer"};
+          return 0;
+      }
+      EOF
+    - |
+      cat > consumer/CMakeLists.txt <<'EOF'
+      cmake_minimum_required(VERSION 3.16)
+      project(consumer CXX)
+      set(CMAKE_CXX_STANDARD 20)
+      find_package(composite REQUIRED)
+      add_executable(consumer main.cpp)
+      target_link_libraries(consumer PRIVATE composite::composite)
+      EOF
+    - cmake -S consumer -B consumer/build -DCMAKE_PREFIX_PATH=$CI_PROJECT_DIR/_install
+    - cmake --build consumer/build
+    - LD_LIBRARY_PATH=$CI_PROJECT_DIR/_install/lib consumer/build/consumer
+    # Build the in-repo example component against the install so the README's "Implementing a
+    # Component" walkthrough stays compilable (it is the same source as examples/passthrough_gain).
+    - cmake -S examples/passthrough_gain -B examples/passthrough_gain/build -DCMAKE_PREFIX_PATH=$CI_PROJECT_DIR/_install
+    - cmake --build examples/passthrough_gain/build
+    - test -f "$(find examples/passthrough_gain/build -name 'libpassthrough_gain.so')"  # MODULE .so built
+
+# Build the sibling composite-comps fleet against the freshly-installed framework
+# and run its integration tests — the §6 per-stage exit gate, now that the fleet
+# is migrated to the new APIs (all 5 components build; framer tests pass). Defaults
+# to a sibling project in the same group; allow_failure only until the repo's CI
+# access is provisioned (the build itself is green).
+build:comps:
+  stage: build
+  extends: .gcc
+  allow_failure: true   # pending comps-repo CI access; the build + tests are green locally
+  variables:
+    COMPS_REPO_URL: "$CI_SERVER_URL/$CI_PROJECT_NAMESPACE/composite-comps.git"
+  script:
+    - cmake -B build -DCMAKE_INSTALL_PREFIX=$CI_PROJECT_DIR/_install -DCOMPOSITE_INSTALL=ON -DCOMPOSITE_BUILD_TESTS=OFF
+    - cmake --build build -j"$(nproc)" --target install
+    - git clone --depth 1 "$COMPS_REPO_URL" comps_src
+    - cmake -S comps_src -B comps_src/build -DCMAKE_PREFIX_PATH=$CI_PROJECT_DIR/_install -DBUILD_TESTING=ON
+    - cmake --build comps_src/build -j"$(nproc)"                       # all 5 component .so
+    - cmake --build comps_src/build --target framer_integration_tests  # fleet integration test
+    - ctest --test-dir comps_src/build -R framer_integration --output-on-failure
+    - cmake -S comps_src -B comps_src/build -DCMAKE_PREFIX_PATH=$CI_PROJECT_DIR/_install
+
+# ---------------------------------------------------------------------------
+# Sanitizer gate for the concurrency core + buffers (ASSESSMENT §11).
+#
+# These now drive the CMake `tsan` / `asan-ubsan` presets — a single source of
+# truth shared with local dev (`cmake --preset tsan && ctest --preset tsan`).
+# The presets apply -fsanitize at directory scope, so the WHOLE registered
+# suite is instrumented (the 13 formerly-orphaned standalone tests are now
+# proper CMake targets), not just a hand-picked set of g++ one-liners. The test
+# presets carry the TSAN_OPTIONS/UBSAN_OPTIONS halt_on_error settings.
+# ---------------------------------------------------------------------------
+sanitize:thread:
+  stage: sanitize
+  extends: .gcc
+  script:
+    - cmake --preset tsan
+    - cmake --build --preset tsan -j"$(nproc)"
+    # Concurrency core + ports + lifecycle + standalone suite. The httplib-based
+    # integration test is excluded until httplib itself is confirmed TSan-clean
+    # (third-party); drop the -E to include it once verified.
+    - ctest --preset tsan -E TestHttpIntegration
+
+sanitize:address:
+  stage: sanitize
+  extends: .gcc
+  script:
+    - cmake --preset asan-ubsan
+    - cmake --build --preset asan-ubsan -j"$(nproc)"
+    - ctest --preset asan-ubsan
+
+# Weak-memory (ARM) run: x86 TSO hides the visibility bugs the park
+# happens-before chain guards against (ASSESSMENT §11, T-A/T-C). Requires an
+# aarch64 runner; left allow_failure until one is wired up.
+sanitize:thread-arm64:
+  stage: sanitize
+  extends: .gcc
+  tags: [arm64]
+  allow_failure: true
+  script:
+    - cmake --preset tsan
+    - cmake --build --preset tsan -j"$(nproc)"
+    - ctest --preset tsan -E TestHttpIntegration

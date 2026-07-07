@@ -14,51 +14,99 @@ FetchContent_MakeAvailable(Catch2)
 add_compile_definitions(COMPOSITE_TESTING)
 
 ##############################
-# Properties Tests
+# Standalone tests (own main(), no Catch2)
 ##############################
 
-add_executable(test_properties
-  test_properties.cpp
-  ${PROJECT_SOURCE_DIR}/src/helpers.cpp
-)
+# Linking composite::composite supplies the public include dirs AND the compiled
+# registry singleton (registry.cpp); spdlog/Threads cover headers that need them.
+# This is the CMake equivalent of the hand-rolled
+#   g++ -std=c++20 -I include ... src/registry.cpp -pthread
+# lines that previously lived ONLY in .gitlab-ci.yml — so `ctest` now actually
+# runs the inverted-core concurrency suite. Before this, 13 of 22 test sources
+# were orphaned from the build and a green ctest excluded the park / SPSC ring /
+# component-concurrency / worker-self-write / slab_pool / histogram tests.
+# Under the tsan / asan-ubsan presets these are instrumented automatically by
+# the directory-scope sanitizer flags set in the top-level CMakeLists.
+function(composite_standalone_test name)
+  add_executable(${name} ${name}.cpp)
+  target_include_directories(${name} PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(${name} PRIVATE
+    composite::composite
+    composite_warnings
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog_header_only
+    Threads::Threads)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
 
-target_include_directories(test_properties
-  PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-)
+foreach(t
+    # property core (reflect / typed / property_set / config<T>)
+    test_reflect test_reflect_strict test_fields_macro test_typed test_property_set
+    test_config test_config_crux test_config_roundtrip test_config_loop_top
+    # K1 regression: concurrent inline property writers on a STOPPED component (no worker)
+    # must serialize their config<T> reaction drains under the park (TSan-clean)
+    test_config_stopped_writers
+    # K1-fix deadlock regression: a lifecycle-touching on_apply calling stop() during the inline
+    # drain (EXITING state) must not spin forever on its own park in-flight guard
+    test_reentrant_stop_on_apply
+    test_enabled_lifecycle
+    # M6 lifecycle completion: on_finished / is_finished / wait_until_finished
+    test_lifecycle_finish
+    # M6 lifecycle EOS: end-of-stream marker propagation (at_end / send_eos / try_get)
+    test_eos_propagation
+    # P0 regression: a pipeline_component's pool must start via application::start()/reconcile
+    test_pipeline_app_lifecycle
+    # M6 lifecycle: source_component archetype + application::drain_stop
+    test_source_component
+    # M4 doorbell: producer wakes an idle consumer on the empty->non-empty edge
+    test_doorbell
+    # M4 reverse doorbell: consumer wakes a backpressured AWAIT_OUTPUT producer
+    test_reverse_doorbell
+    # connection-layer ownership: input deregisters from producer on destroy (UAF fix)
+    test_connection_lifetime
+    # inverted-core concurrency + buffers + metrics suite (previously orphaned)
+    test_annotation test_application_registry test_buffer_ops
+    test_component_concurrency test_connection_cow test_histogram
+    test_metrics_lifecycle test_park_coordinator test_pipeline_component
+    test_slab_pool test_spsc_ring test_worker_self_write
+    # overlap_ring: lock-free overlapped framing ring lifted from the comps framer_pool (M6)
+    test_overlap_ring
+    # EAL-free DPDK port_registry bookkeeping (compiles + TSan-tests without libdpdk)
+    test_dpdk_registry)
+  composite_standalone_test(${t})
+endforeach()
 
-target_link_libraries(test_properties
-  PRIVATE
-  composite::composite
-  nlohmann_json::nlohmann_json
-  spdlog::spdlog_header_only
-  httplib::httplib
-  Catch2::Catch2WithMain
-  dl
-)
+# Data-path benchmark (Perf-0): built so it cannot rot, but NOT registered as a
+# ctest (it is a timing harness, not pass/fail). Run from a scheduled,
+# non-gating CI job; the table output makes before/after diffs obvious.
+add_executable(bench_datapath bench_datapath.cpp)
+target_include_directories(bench_datapath PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(bench_datapath PRIVATE
+  composite::composite composite_warnings spdlog::spdlog_header_only Threads::Threads)
 
+# Property tests on the new typed JSON model.
+add_executable(test_properties test_properties.cpp)
+target_include_directories(test_properties PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(test_properties PRIVATE
+  composite::composite composite_warnings nlohmann_json::nlohmann_json spdlog::spdlog_header_only Catch2::Catch2WithMain ${CMAKE_DL_LIBS})
 add_test(NAME TestProperties COMMAND test_properties)
 
-# HTTP Integration Tests
+# REST integration test drives the production make_server (server.cpp) over the
+# new JSON property routes.
 add_executable(test_http_integration
   test_http_integration.cpp
-  ${PROJECT_SOURCE_DIR}/src/helpers.cpp
-)
-
-target_include_directories(test_http_integration
-  PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-)
-
-target_link_libraries(test_http_integration
-  PRIVATE
-  composite::composite
-  nlohmann_json::nlohmann_json
-  spdlog::spdlog_header_only
-  httplib::httplib
-  Catch2::Catch2WithMain
-  dl
-)
+  ${PROJECT_SOURCE_DIR}/src/server.cpp
+  ${PROJECT_SOURCE_DIR}/src/helpers.cpp)
+target_include_directories(test_http_integration PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+# Match the production server's pool size so the SSE-stream-cap test (8 held
+# streams + a rejected 9th) has spare workers to serve the 9th request.
+target_compile_definitions(test_http_integration PRIVATE CPPHTTPLIB_THREAD_POOL_COUNT=16)
+target_link_libraries(test_http_integration PRIVATE
+  composite::composite composite_warnings nlohmann_json::nlohmann_json spdlog::spdlog_header_only
+  httplib::httplib Catch2::Catch2WithMain ${CMAKE_DL_LIBS})
+add_test(NAME TestHttpIntegration COMMAND test_http_integration)
 
 ##############################
 # Ports Tests
@@ -71,6 +119,7 @@ add_executable(test_ports
 target_link_libraries(test_ports
   PRIVATE
   composite::composite
+  composite_warnings
   spdlog::spdlog_header_only
   Catch2::Catch2WithMain
 )
@@ -93,6 +142,7 @@ add_executable(test_lifecycle_simple
 target_link_libraries(test_lifecycle_simple
   PRIVATE
   composite::composite
+  composite_warnings
   spdlog::spdlog_header_only
   Catch2::Catch2WithMain
 )
@@ -110,6 +160,7 @@ add_executable(test_aligned_mem
 target_link_libraries(test_aligned_mem
   PRIVATE
   composite::composite
+  composite_warnings
   spdlog::spdlog_header_only
   Catch2::Catch2WithMain
 )
@@ -118,75 +169,6 @@ add_test(NAME TestAlignedMem COMMAND test_aligned_mem)
 add_test(NAME TestAlignedMem_Basic COMMAND test_aligned_mem "[basic]")
 add_test(NAME TestAlignedMem_Resize COMMAND test_aligned_mem "[resize]")
 add_test(NAME TestAlignedMem_Integration COMMAND test_aligned_mem "[integration]")
-
-##############################
-# Transport Tests
-##############################
-
-add_executable(test_transports
-  test_transports.cpp
-  ${PROJECT_SOURCE_DIR}/src/helpers.cpp
-)
-
-target_include_directories(test_transports
-  PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-)
-
-target_link_libraries(test_transports
-  PRIVATE
-  composite::composite
-  nlohmann_json::nlohmann_json
-  spdlog::spdlog_header_only
-  Catch2::Catch2WithMain
-  dl
-)
-
-# Link NATS if enabled
-if(COMPOSITE_USE_NATS)
-  target_link_libraries(test_transports PRIVATE nats)
-endif()
-
-add_test(NAME TestTransports COMMAND test_transports)
-add_test(NAME TestTransports_Enum COMMAND test_transports "[enum]")
-add_test(NAME TestTransports_Parsing COMMAND test_transports "[parsing]")
-add_test(NAME TestTransports_Creation COMMAND test_transports "[creation]")
-add_test(NAME TestTransports_Attachment COMMAND test_transports "[attachment]")
-add_test(NAME TestTransports_Integration COMMAND test_transports "[integration]")
-
-##############################
-# NATS Integration Tests
-##############################
-
-add_executable(test_nats_integration
-  test_nats_integration.cpp
-)
-
-target_include_directories(test_nats_integration
-  PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-)
-
-target_link_libraries(test_nats_integration
-  PRIVATE
-  composite::composite
-  spdlog::spdlog_header_only
-  Catch2::Catch2WithMain
-)
-
-# Link NATS if enabled
-if(COMPOSITE_USE_NATS)
-  target_link_libraries(test_nats_integration PRIVATE nats)
-endif()
-
-# Note: These tests require a running NATS server at localhost:4222
-# Start with: docker run -d -p 4222:4222 nats:latest
-# The tests will gracefully skip if no server is available
-add_test(NAME TestNATSIntegration COMMAND test_nats_integration "[nats][integration][.]")
-add_test(NAME TestNATSIntegration_Transport COMMAND test_nats_integration "[nats][integration][transport][.]")
-add_test(NAME TestNATSIntegration_Performance COMMAND test_nats_integration "[nats][integration][performance][.]")
-
-add_test(NAME TestHttpIntegration COMMAND test_http_integration)
 
 ##############################
 # Metrics Tests
@@ -199,6 +181,7 @@ add_executable(test_metrics
 target_link_libraries(test_metrics
   PRIVATE
   composite::composite
+  composite_warnings
   spdlog::spdlog_header_only
   Catch2::Catch2WithMain
 )

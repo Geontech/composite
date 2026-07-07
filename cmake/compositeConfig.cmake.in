@@ -1,5 +1,17 @@
 @PACKAGE_INIT@
 
+include(CMakeFindDependencyMacro)
+
+# composite PUBLIC-links Threads::Threads and nlohmann_json::nlohmann_json (imported targets
+# recorded in the exported interface), so the consumer must re-find them. nlohmann_json is a
+# genuine public dependency — its JSON type appears in composite's public property/config API, so
+# a consumer of <composite/composite.hpp> needs it. spdlog is intentionally NOT find_dependency'd:
+# it is a PRIVATE implementation detail hidden behind composite::logger (logger.cpp), so consumers
+# need neither its headers nor a find_dependency for it.
+find_dependency(Threads)
+find_dependency(nlohmann_json)
+@COMPOSITE_CONFIG_OTEL_DEP@
+
 include("${CMAKE_CURRENT_LIST_DIR}/compositeTargets.cmake")
 
 set_and_check(composite_INCLUDE_DIR "@PACKAGE_INCLUDE_INSTALL_DIR@")

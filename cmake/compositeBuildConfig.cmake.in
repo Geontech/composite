@@ -1,0 +1,22 @@
+# Build-tree package config for composite: makes find_package(composite) work against the BUILD
+# tree (point CMAKE_PREFIX_PATH at the build dir) without an install step. The build-tree targets
+# file (written by export()) carries the BUILD_INTERFACE include dirs (source + generated headers)
+# and points at the just-built libcomposite, so no composite_INCLUDE_DIR set_and_check is needed
+# here — consumers get everything from the imported composite::composite target.
+#
+# The install-tree config (cmake/compositeConfig.cmake.in) is the install-relative variant; it is
+# generated into a non-searchable build subdir so it is NOT this file (a find_package against the
+# build tree would otherwise have found an install-relative config that fails).
+
+include(CMakeFindDependencyMacro)
+
+# Public dependencies of composite::composite (mirror compositeConfig.cmake.in).
+find_dependency(Threads)
+find_dependency(nlohmann_json)
+@COMPOSITE_CONFIG_OTEL_DEP@
+
+include("${CMAKE_CURRENT_LIST_DIR}/compositeTargets.cmake")
+
+# (No check_required_components(): that macro is provided by configure_package_config_file's
+# PACKAGE_INIT block, which this plain build-tree config does not use, and composite exports no
+# sub-components for it to validate.)

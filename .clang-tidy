@@ -1,0 +1,23 @@
+# Static-analysis policy for the composite framework. The concurrency-dense core
+# (park handshake, lock-free worker, shared_mutex registry) is exactly where the
+# author contracts are otherwise compiler-unenforced (RC1-RC6, auto_stop-last),
+# so the concurrency-* / bugprone-* families are the load-bearing checks here.
+#
+# WarningsAsErrors is empty for now: this surfaces findings as warnings while the
+# existing tree is brought into compliance. Tighten to '*' (or per-family) once a
+# directory is clean — the CI lint job is allow_failure until then.
+Checks: >
+  -*,
+  bugprone-*,
+  concurrency-*,
+  performance-*,
+  misc-*,
+  cppcoreguidelines-special-member-functions,
+  cppcoreguidelines-slicing,
+  -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -bugprone-easily-swappable-parameters
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/composite/.*'
+FormatStyle: file

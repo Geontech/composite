@@ -2,10 +2,23 @@
  * Copyright (C) 2024-2025 Geon Technologies, LLC
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
- 
+
 #pragma once
 
-#define VERSION_MAJOR @composite_VERSION_MAJOR@
-#define VERSION_MINOR @composite_VERSION_MINOR@
-#define VERSION_PATCH @composite_VERSION_PATCH@
-#define VERSION "@composite_VERSION_MAJOR@.@composite_VERSION_MINOR@.@composite_VERSION_PATCH@"
+#include <string_view>
+
+// Prefixed macros (the unprefixed VERSION/VERSION_* this header used to define
+// are among the most collision-prone names in the C ecosystem — autoconf
+// config.h defines VERSION for every package — so they were renamed).
+#define COMPOSITE_VERSION_MAJOR @composite_VERSION_MAJOR@
+#define COMPOSITE_VERSION_MINOR @composite_VERSION_MINOR@
+#define COMPOSITE_VERSION_PATCH @composite_VERSION_PATCH@
+#define COMPOSITE_VERSION "@composite_VERSION_MAJOR@.@composite_VERSION_MINOR@.@composite_VERSION_PATCH@"
+
+namespace composite {
+/// Compile-time version string, e.g. "0.5.0".
+inline constexpr std::string_view version = COMPOSITE_VERSION;
+inline constexpr int version_major = COMPOSITE_VERSION_MAJOR;
+inline constexpr int version_minor = COMPOSITE_VERSION_MINOR;
+inline constexpr int version_patch = COMPOSITE_VERSION_PATCH;
+} // namespace composite
