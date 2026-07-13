@@ -18,6 +18,22 @@
 namespace composite {
 
 /**
+ * @brief Tag for the uninitialized aligned_mem constructor.
+ *
+ * Selects the allocate-but-do-not-initialize path: the storage is left with the
+ * indeterminate contents std::aligned_alloc returns (the default constructor
+ * value-initializes every element instead). Use ONLY when the caller fully writes
+ * every element before any read — e.g. a DSP output buffer that a kernel overwrites
+ * end-to-end. Guarded by the same trivially-copyable/-destructible static_assert as
+ * the zeroing path, so holding uninitialized bytes is well-defined; reading one
+ * before it is written is not.
+ */
+struct uninitialized_t {
+    explicit uninitialized_t() = default;
+};
+inline constexpr uninitialized_t uninitialized{};
+
+/**
  * @class aligned_mem
  * @brief A template class for managing aligned memory allocations with dynamic sizing
  * @tparam T The data type stored in the aligned memory buffer
@@ -49,7 +65,26 @@ public:
      * @throws std::invalid_argument if alignment is not valid
      * @throws std::runtime_error if memory allocation fails
      */
-    explicit aligned_mem(size_type alignment, size_type count)
+    explicit aligned_mem(size_type alignment, size_type count) : aligned_mem(alignment, count, uninitialized) {
+        // Value-initialize all elements (the tagged base ctor only allocates).
+        for (size_type i = 0; i < m_count; ++i) {
+            m_data[i] = T{};
+        }
+    }
+
+    /**
+     * @brief Constructs an aligned buffer WITHOUT initializing its elements
+     * @param alignment Memory alignment requirement (must be a power of 2)
+     * @param count Number of elements of type T to allocate
+     * @throws std::invalid_argument if alignment is not valid
+     * @throws std::runtime_error if memory allocation fails
+     *
+     * Allocates aligned storage and leaves it with the indeterminate contents
+     * std::aligned_alloc returns — skipping the per-element value-initialization the
+     * default constructor performs. The caller MUST write every element before
+     * reading it. See @ref uninitialized_t.
+     */
+    aligned_mem(size_type alignment, size_type count, uninitialized_t)
         : m_data(), m_alignment(alignment), m_count(count), m_capacity(count) {
         if (alignment < alignof(std::max_align_t) || !std::has_single_bit(alignment)) {
             auto err = std::format("invalid alignment: {}: must be a power of 2 and at least alignof(std::max_align_t)",
@@ -60,10 +95,6 @@ public:
             m_data = static_cast<T*>(aligned_alloc_padded(alignment, bytes_for(count)));
             if (m_data == nullptr) {
                 throw std::runtime_error("memory allocation failed");
-            }
-            // Default-initialize all elements
-            for (size_type i = 0; i < count; ++i) {
-                m_data[i] = T{};
             }
         }
     }
@@ -517,6 +548,21 @@ private:
 template <typename T>
 auto make_aligned(std::size_t alignment, std::size_t count) -> std::unique_ptr<aligned_mem<T>> {
     return std::make_unique<aligned_mem<T>>(alignment, count);
+}
+
+/**
+ * @brief Creates a `std::unique_ptr` to an UNINITIALIZED aligned_mem instance
+ * @tparam T The type stored in the aligned memory
+ * @param alignment The memory alignment (must be a power of 2)
+ * @param count Number of elements to allocate
+ * @return A unique pointer to an aligned_mem<T> whose elements are uninitialized
+ *
+ * The elements are NOT value-initialized — the caller must write every element
+ * before reading it. See @ref uninitialized_t.
+ */
+template <typename T>
+auto make_aligned(std::size_t alignment, std::size_t count, uninitialized_t) -> std::unique_ptr<aligned_mem<T>> {
+    return std::make_unique<aligned_mem<T>>(alignment, count, uninitialized);
 }
 
 } // namespace composite

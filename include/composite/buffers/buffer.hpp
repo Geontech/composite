@@ -952,6 +952,26 @@ auto make_aligned_buffer(std::size_t alignment, std::size_t count) -> mutable_bu
 }
 
 /**
+ * @brief Create a mutable buffer backed by UNINITIALIZED aligned memory
+ * @tparam T The element type
+ * @param alignment Memory alignment requirement (must be a power of 2)
+ * @param count Number of elements to allocate
+ * @return A mutable buffer whose elements are uninitialized
+ * @throws std::invalid_argument if alignment is not valid
+ * @throws std::runtime_error if memory allocation fails
+ *
+ * Like make_aligned_buffer(), but skips the per-element value-initialization: the
+ * storage holds the indeterminate contents std::aligned_alloc returns. Use ONLY on a
+ * hot path where the producer fully overwrites every element before it is read (a DSP
+ * kernel writing an entire output frame) — it trades that safety for eliminating a
+ * whole-buffer write pass per allocation. See @ref uninitialized_t.
+ */
+template <typename T>
+auto make_aligned_buffer_uninitialized(std::size_t alignment, std::size_t count) -> mutable_buffer<T> {
+    return mutable_buffer<T>(make_aligned<T>(alignment, count, uninitialized));
+}
+
+/**
  * @brief Create an immutable buffer backed by aligned memory
  * @tparam T The element type
  * @param alignment Memory alignment requirement (must be a power of 2)
