@@ -63,6 +63,9 @@ The table below maps the old API to the new one.
   upcast to `shared_ptr<component>`. `component::start()`/`stop()` are `final` — subclasses hook
   `on_worker_start()`/`on_worker_stop()`, which run on every start/stop path (including the
   `enabled` reconcile, which bypassed overrides).
+- **`snapshot<T>`** — atomically published, immutable config for threads the park does not quiesce
+  (pipeline pool workers, receiver threads): the property handler `publish()`es, any thread
+  `load()`s a `shared_ptr<const T>` that keeps the value alive while in use.
 - **Connect-time copy warning** — connecting an immutable output to a mutable input is flagged
   loudly at `connect()` (every frame is deep-copied to give the consumer writable storage).
 - **Self-contained package** — `find_package(composite)` works against the install **and** the build

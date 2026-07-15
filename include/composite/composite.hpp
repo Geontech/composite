@@ -28,6 +28,9 @@
 // Core component interface
 #include "composite/core/component.hpp"
 
+// Atomically published config for threads the park never quiesces (pool workers, receivers)
+#include "composite/properties/snapshot.hpp"
+
 // Buffer types
 #include "composite/buffers/buffer.hpp"
 

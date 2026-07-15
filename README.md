@@ -884,6 +884,14 @@ Override three hooks instead:
 rebuilds it at the new size. Because only the main thread sends, the single-producer invariant holds.
 The `fft` and `psd` components in `composite-comps` are built on it.
 
+Pool workers run **concurrently with property commits** — the park quiesces only the main worker —
+so `work()` must not read live config members (torn scalars; a freed string/vector is a
+use-after-free). Publish an immutable value through **`composite::snapshot<T>`**
+(`<composite/properties/snapshot.hpp>`) from your property handler and `load()` it in `work()`: the
+returned `shared_ptr<const T>` keeps that value alive for as long as the worker holds it, however
+many times the publisher has since moved on. The same applies to any thread the park does not
+quiesce (e.g. a source's receiver threads).
+
 ## Versioning & ABI
 
 - The package is versioned with **SemVer**; the installed CMake config declares

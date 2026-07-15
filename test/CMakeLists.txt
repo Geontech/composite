@@ -73,6 +73,8 @@ foreach(t
     # make_component deleter (stop-before-destroy while the leaf is intact) + final lifecycle
     # entry points + connect-time mutability diagnostics
     test_make_component
+    # snapshot<T>: atomically published config for non-parked threads (pool/receiver)
+    test_snapshot
     # overlap_ring: lock-free overlapped framing ring lifted from the comps framer_pool (M6)
     test_overlap_ring
     # EAL-free DPDK port_registry bookkeeping (compiles + TSan-tests without libdpdk)
