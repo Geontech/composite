@@ -75,6 +75,11 @@ struct create_args {
  * Emits the C ABI the loader expects: the ABI-version handshake symbol + the single
  * create(). Variadic so a factory lambda whose body contains commas (template arguments,
  * std::format calls) is accepted as one macro argument.
+ *
+ * Build the component with composite::make_component<CLASS>(id) inside the factory (as
+ * COMPOSITE_REGISTER_SIMPLE does), not make_shared: its deleter stops the component while
+ * the leaf type is intact, so dropping the last shared_ptr of a still-running component
+ * tears down the worker safely instead of racing destruction.
  */
 #define COMPOSITE_REGISTER_COMPONENT(...)                                                                              \
     extern "C" {                                                                                                       \
@@ -92,4 +97,4 @@ struct create_args {
  */
 #define COMPOSITE_REGISTER_SIMPLE(CLASS)                                                                               \
     COMPOSITE_REGISTER_COMPONENT(                                                                                      \
-        [](std::string_view id, const ::composite::create_args&) { return std::make_shared<CLASS>(id); })
+        [](std::string_view id, const ::composite::create_args&) { return ::composite::make_component<CLASS>(id); })

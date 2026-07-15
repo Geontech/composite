@@ -36,6 +36,7 @@ The table below maps the old API to the new one.
 | **List/keyed properties** | `"prop[0]"`, `"prop[]"`, `"prop.field"` index addressing | `keyed_collection` via `add_keyed`, addressed as nested JSON under the property name (RFC-7396 merge; `null` resets/erases) |
 | **`property_change_handler()`** | no-arg virtual | `property_change_handler(const properties::json& diff)`; the no-arg form is **deprecated** |
 | **Component factory** | multi-arity `create()` / `create(type)` / `create(id)` hand-written `extern "C"` | single `create(std::string_view id, const create_args&)` + `composite_abi_version()`, emitted by `COMPOSITE_REGISTER_SIMPLE` / `COMPOSITE_REGISTER_COMPONENT` |
+| **`start()` / `stop()` overrides** | overridable (but silently bypassed by the `enabled` reconcile path) | **`final`** — hook `on_worker_start()` / `on_worker_stop()`, which run on every start/stop path; create heap components via `make_component<T>()` (stops-before-destroy deleter) |
 | **Construction args** | scalar `"create_arg": "cf32"` | `"args": { "type": "cf32" }` (the scalar form still works, mapped to `{"type": ...}`) |
 | **Input read** | blocking / 1 s default timeout / `blocking` overloads | `try_get()` → `std::optional` is the **canonical** read (distinguishes empty ring from a zero-length packet); `get_data()` stays for the `buffer.empty()` idiom; the no-op timeout/`blocking` overloads were **removed** |
 | **Input queue** | unbounded `std::deque` + condition variable | bounded lock-free SPSC ring, **default depth 1024, drop-on-full** at the producer (+ overflow callback) |
@@ -56,6 +57,12 @@ The table below maps the old API to the new one.
 - **Typed, reflected properties** — `config<T>` + `COMPOSITE_FIELDS` with per-field attributes
   (`runtime`, `range`, `unit`, `doc`, `one_of`, `power_of_two`) and JSON-Schema 2020-12 export.
 - **Single component ABI** — one `create(id, create_args)` entry point with an ABI-version handshake.
+- **Safe ownership by default** — `make_component<T>()` returns a `shared_ptr` whose deleter stops
+  the component *before* destruction (leaf vtable intact, so the worker and its hooks tear down
+  fully derived); `COMPOSITE_REGISTER_SIMPLE` builds through it, and the deleter survives the
+  upcast to `shared_ptr<component>`. `component::start()`/`stop()` are `final` — subclasses hook
+  `on_worker_start()`/`on_worker_stop()`, which run on every start/stop path (including the
+  `enabled` reconcile, which bypassed overrides).
 - **Connect-time copy warning** — connecting an immutable output to a mutable input is flagged
   loudly at `connect()` (every frame is deep-copied to give the consumer writable storage).
 - **Self-contained package** — `find_package(composite)` works against the install **and** the build

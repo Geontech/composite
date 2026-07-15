@@ -19,6 +19,7 @@
 #include <concepts>
 #include <condition_variable>
 #include <format>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -83,6 +84,12 @@ public:
     /**
      * @brief RAII member that stops the worker before derived members are destroyed
      *
+     * For a HEAP-allocated component, prefer composite::make_component<T>() — its
+     * deleter stops the component before ~T even begins, which protects the whole
+     * destruction sequence rather than just the members declared after this one.
+     * auto_stop remains the tool for stack-allocated components (and belt-and-braces
+     * in components that may be constructed either way).
+     *
      * Declare as the **LAST data member** of a concrete component:
      * @code
      * class my_comp : public composite::component {
@@ -122,12 +129,17 @@ public:
         // To be implemented by subclasses
     }
 
-    auto start() -> void override {
+    /// start()/stop() are final: they ARE the park/worker machinery, and one lifecycle path
+    /// (the enabled-reconcile used by application::start() and RUNTIME `enabled` writes) calls
+    /// the private *_locked helpers directly — so an override would run on the direct call but
+    /// silently NOT on a reconcile, leaving subclass resources half-managed. Subclasses hook
+    /// on_worker_start()/on_worker_stop() instead, which run on EVERY start/stop path.
+    auto start() -> void final {
         std::scoped_lock life{m_lifecycle_mtx};
         start_locked();
     }
 
-    auto stop() -> void override {
+    auto stop() -> void final {
         bool had_worker = false;
         {
             std::scoped_lock life{m_lifecycle_mtx};
@@ -1386,5 +1398,34 @@ private:
     }
 
 }; // class component
+
+/**
+ * @brief Create a component whose destruction stops it FIRST — while the leaf type is intact.
+ *
+ * The returned shared_ptr's deleter calls stop() before destroying the object, so the worker is
+ * joined (and subclass resources are reaped via the on_worker_stop() hook) while virtual dispatch
+ * still reaches the leaf class. This closes the destruction-order use-after-free where the base
+ * ~component's own stop() runs only after the derived members — and the leaf vtable — are already
+ * gone, with the worker possibly still in process() touching them.
+ *
+ * Prefer this over make_shared/new for every heap-allocated component (the
+ * COMPOSITE_REGISTER_SIMPLE macro builds with it; custom factory lambdas should too). The deleter
+ * survives upcasts: a shared_ptr<component> copied/moved from this still stops through it. A
+ * stack-allocated component still needs component::auto_stop as its last member (or an explicit
+ * stop() early in its leaf destructor).
+ */
+template <typename T, typename... Args>
+    requires std::derived_from<T, component>
+auto make_component(Args&&... args) -> std::shared_ptr<T> {
+    return std::shared_ptr<T>(new T(std::forward<Args>(args)...), [](T* ptr) {
+        try {
+            ptr->stop(); // leaf vtable intact: the worker and its hooks tear down fully derived
+        } catch (...) {
+            // The deleter runs inside ~shared_ptr (a noexcept context): a throw here would
+            // std::terminate. stop() logs its own failures; destruction proceeds regardless.
+        }
+        delete ptr;
+    });
+}
 
 } // namespace composite

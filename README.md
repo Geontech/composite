@@ -166,8 +166,8 @@ Components are dynamically loaded shared libraries:
   COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
                                    -> std::shared_ptr<composite::component> {
       const auto type = args.type();                 // e.g. "cf32"
-      if (type == "cf32") return std::make_shared<my_fft<std::complex<float>>>(id);
-      if (type == "cf64") return std::make_shared<my_fft<std::complex<double>>>(id);
+      if (type == "cf32") return composite::make_component<my_fft<std::complex<float>>>(id);
+      if (type == "cf64") return composite::make_component<my_fft<std::complex<double>>>(id);
       throw std::runtime_error("my_fft: unknown type '" + std::string{type} + "'");
   })
   ```
@@ -200,6 +200,19 @@ Components are dynamically loaded shared libraries:
 5. **Stop** — the worker is joined and resources are released.
 
 Each component runs in its own `std::jthread`, named after the component id for debugging.
+
+`start()`/`stop()` are **`final`**. One lifecycle path (the `enabled` reconcile used by
+`application::start()` and RUNTIME `enabled` writes) never calls the virtual entry points, so an
+override would run on a direct `start()` but silently not on a reconcile. Subclasses that own
+worker-scoped resources (a receiver thread, a worker pool) hook `on_worker_start()` /
+`on_worker_stop()` instead — those run on **every** start/stop path.
+
+**Ownership.** Create heap-allocated components with `composite::make_component<T>(args...)`: the
+returned `shared_ptr`'s deleter **stops the component before destruction begins**, while the leaf
+vtable and derived members are still intact — closing the "destroyed while its worker still runs"
+use-after-free. The deleter survives the upcast to `shared_ptr<component>`, and
+`COMPOSITE_REGISTER_SIMPLE` builds through it (custom factory lambdas should too). A
+**stack-allocated** component instead declares `component::auto_stop` as its **last** data member.
 
 #### Enabling and disabling at runtime
 
@@ -279,8 +292,10 @@ app.stop();
 `produce()` returning `emit(buffer, ts)`, `idle()` (nothing yet — back off), or `done()` (end of
 stream → EOS + FINISH). Backpressure is automatic — when the downstream ring is full the base returns
 `AWAIT_OUTPUT` and does not call `produce()`, so a source paces to consumption instead of dropping.
-A concrete source **must** stop its worker while still fully alive — declare `component::auto_stop` as
-its **last** data member (the base cannot do this for you, since `produce()` is pure).
+A concrete source **must** stop its worker while still fully alive — create it with
+`composite::make_component<T>()` (its deleter stops before destruction), or for a stack instance
+declare `component::auto_stop` as its **last** data member (the base cannot do this for you, since
+`produce()` is pure).
 
 **Resilience.** Set the `error_restart_max` / `error_restart_backoff_ms` properties to retry a
 throwing `process()` with exponential, stop-interruptible backoff instead of finishing on the first
