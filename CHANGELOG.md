@@ -56,6 +56,8 @@ The table below maps the old API to the new one.
 - **Typed, reflected properties** — `config<T>` + `COMPOSITE_FIELDS` with per-field attributes
   (`runtime`, `range`, `unit`, `doc`, `one_of`, `power_of_two`) and JSON-Schema 2020-12 export.
 - **Single component ABI** — one `create(id, create_args)` entry point with an ABI-version handshake.
+- **Connect-time copy warning** — connecting an immutable output to a mutable input is flagged
+  loudly at `connect()` (every frame is deep-copied to give the consumer writable storage).
 - **Self-contained package** — `find_package(composite)` works against the install **and** the build
   tree; spdlog is private, `nlohmann_json` is a public `find_dependency`.
 - **Observability** — lock-free metrics registry (label-only) over REST + SSE, optional OTLP export.

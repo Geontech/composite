@@ -338,7 +338,8 @@ auto md_ptr = composite::make_metadata(std::move(md));  // shared_ptr<const meta
   output are a data race. (Wiring/introspection methods *are* thread-safe — see below.)
 - **Minimal copies (move-on-last):** for the common 1:1 case the buffer (and its metadata) is *moved*
   to the receiver — zero copies. On fan-out, earlier receivers get a share/copy and the last receiver
-  gets the move. An immutable→mutable hop deep-copies; a mutable→immutable hop promotes in place.
+  gets the move. An immutable→mutable hop deep-copies **every frame** (flagged with a
+  connect-time warning); a mutable→immutable hop promotes in place.
 - **Metadata** travels atomically with its packet as the third argument — there is no separate
   "send metadata" call and no metadata/data race. It is carried as a `composite::metadata_ptr`
   (`shared_ptr<const metadata>`): the producer rebuilds the instance only when a field changes,

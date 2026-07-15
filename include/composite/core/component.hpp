@@ -288,10 +288,21 @@ public:
             return false;
         }
 
-        // Log mutability information for transfer optimization transparency
-        m_logger->trace("connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})", id(), output_port_name,
-                        out_port->is_mutable() ? "mutable" : "immutable", other->id(), input_port_name,
-                        in_port->is_mutable() ? "mutable" : "immutable");
+        // Surface the transfer cost at connect time. An immutable output feeding a mutable input
+        // is legal, but EVERY frame is deep-copied to give the consumer exclusive writable
+        // storage — a silent per-frame cost that otherwise only shows up in a profiler. Warn
+        // loudly so the topology author either makes the input immutable (zero-copy share) or
+        // knowingly accepts the copy.
+        if (!out_port->is_mutable() && in_port->is_mutable()) {
+            m_logger->warn("connecting {}:{} (immutable) -> {}:{} (mutable): every frame will be DEEP-COPIED to give "
+                           "the consumer writable storage; declare the input as immutable_buffer to share zero-copy, "
+                           "or keep it mutable to accept the per-frame copy",
+                           id(), output_port_name, other->id(), input_port_name);
+        } else {
+            m_logger->trace("connecting {}:{} (mutability: {}) -> {}:{} (mutability: {})", id(), output_port_name,
+                            out_port->is_mutable() ? "mutable" : "immutable", other->id(), input_port_name,
+                            in_port->is_mutable() ? "mutable" : "immutable");
+        }
 
         // Make the connection. Rejects fan-in: an input may have at most one
         // producer (keeps its lock-free SPSC ring sound by construction).
