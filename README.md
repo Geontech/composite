@@ -43,6 +43,17 @@ it with `find_package(composite)` (or `pkg-config composite`) and links the impo
   opentelemetry-cpp).
 - `COMPOSITE_USE_DPDK` (default OFF) — build DPDK-backed source support.
 
+### Container Images
+
+The repository builds two framework-only Rocky Linux 9 image roles:
+
+- `composite:<version>` — a non-root runtime containing `composite-cli` and `libcomposite`;
+- `composite:<version>-devel` — the matching SDK/toolchain for building external component modules.
+
+The runtime and SDK are produced from one multi-stage build and separate CMake `Runtime` and `Development` install components. The official component fleet will be distributed separately by `composite-comps` on top of these exact framework images.
+
+See [docker/README.md](docker/README.md) for local builds, runtime use, GitLab publication variables, tag behavior, and runner requirements.
+
 ## Composite CLI Application and Configuration
 
 The framework ships `composite-cli`, which loads a JSON application file, wires the graph, starts the

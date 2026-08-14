@@ -1,10 +1,11 @@
-# composite CI — build + test + sanitizers.
+# composite CI — build + test + sanitizers + public framework images.
 # See ASSESSMENT.md §10 (foundation) and §11 (concurrency test gate).
 
 stages:
   - lint
   - build
   - sanitize
+  - publish
 
 # GCC 14 image; install cmake + git (FetchContent needs git) + nlohmann-json3-dev
 # (nlohmann_json is a REQUIRED system dependency — the public JSON type in the
@@ -14,6 +15,25 @@ stages:
   before_script:
     - apt-get update -qq && apt-get install -y -qq cmake git nlohmann-json3-dev
     - cmake --version && g++ --version | head -1
+
+# Docker-in-Docker is isolated to the image jobs. The runner must permit the
+# pinned dind service to run privileged and share its TLS client certificates.
+# Keep the client and daemon versions identical to avoid API drift.
+.docker:
+  image: docker:29.1.3-cli
+  services:
+    - name: docker:29.1.3-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_DRIVER: "overlay2"
+  before_script:
+    - docker version
+    - docker buildx create --name composite-ci --driver docker-container --use
+    - docker buildx inspect --bootstrap
 
 # ---------------------------------------------------------------------------
 # Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3). The tree is
@@ -150,6 +170,87 @@ build:consumer:
     - cmake --build examples/passthrough_gain/build
     - test -f "$(find examples/passthrough_gain/build -name 'libpassthrough_gain.so')"  # MODULE .so built
 
+# Build and exercise both public framework image roles. This job never receives
+# Docker Hub credentials and never pushes: merge-request/branch pipelines only
+# prove the packaging contract. The CI-only targets validate an installed SDK
+# consumer and graceful signal handling without adding test assets to runtime.
+build:container:
+  stage: build
+  extends: .docker
+  script:
+    - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - export IMAGE_VERSION="$(sed -n 's/^project(composite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+    - test -n "$IMAGE_VERSION"
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-runtime
+      --load
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target devel
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-devel
+      --load
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target devel-smoke
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-devel-smoke
+      --load
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime-smoke
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-runtime-smoke
+      --load
+      .
+    - test "$(docker image inspect --format '{{.Config.User}}' composite:ci-runtime)" = "10001:10001"
+    - test "$(docker run --rm composite:ci-runtime --version)" = "$IMAGE_VERSION"
+    - docker run --rm --entrypoint /bin/bash composite:ci-runtime -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++; test ! -e /usr/local/include/composite'
+    - docker run --rm composite:ci-devel cmake --version
+    - docker run --rm composite:ci-devel /bin/bash -c 'test "$(id -u)" = 10001; test -f /usr/local/include/composite/composite.hpp; test -f /usr/local/share/composite/cmake/compositeConfig.cmake'
+    - docker run --rm composite:ci-devel-smoke /bin/true
+    - docker run --detach --name composite-runtime-smoke composite:ci-runtime-smoke
+    - |
+      ready=0
+      for attempt in $(seq 1 40); do
+        if docker logs composite-runtime-smoke 2>&1 | grep -q 'REST server listening'; then
+          ready=1
+          break
+        fi
+        sleep 0.25
+      done
+      test "$ready" = 1
+    - docker kill --signal TERM composite-runtime-smoke
+    - test "$(docker wait composite-runtime-smoke)" = 0
+  after_script:
+    - docker rm -f composite-runtime-smoke 2>/dev/null || true
+
 # Build the sibling composite-comps fleet against the freshly-installed framework
 # and run its integration tests — the §6 per-stage exit gate, now that the fleet
 # is migrated to the new APIs (all 5 components build; framer tests pass). Defaults
@@ -212,3 +313,85 @@ sanitize:thread-arm64:
     - cmake --preset tsan
     - cmake --build --preset tsan -j"$(nproc)"
     - ctest --preset tsan -E TestHttpIntegration
+
+# Build each release image once, push it under its source-SHA tag with SBOM and
+# max provenance, test the registry-resolved artifacts, then promote those same
+# manifests to SemVer aliases. This is initially manual even on a protected
+# release tag; the protected environment supplies the approval/audit boundary.
+publish:dockerhub:
+  stage: publish
+  extends: .docker
+  resource_group: dockerhub-composite
+  environment:
+    name: dockerhub-production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/'
+      when: manual
+    - when: never
+  script:
+    - test -n "$DOCKERHUB_NAMESPACE"
+    - test -n "$DOCKERHUB_LOGIN"
+    - test -n "$DOCKERHUB_TOKEN"
+    - test -n "$DOCKERHUB_REPOSITORY"
+    - export IMAGE_NAME="$DOCKERHUB_NAMESPACE/$DOCKERHUB_REPOSITORY"
+    - export IMAGE_VERSION="${CI_COMMIT_TAG#v}"
+    - export PROJECT_VERSION="$(sed -n 's/^project(composite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+    # An RC image keeps its full prerelease tag, while CMake and composite-cli
+    # report the underlying numeric project version.
+    - export RELEASE_BASE_VERSION="${IMAGE_VERSION%%-rc.*}"
+    - test "$RELEASE_BASE_VERSION" = "$PROJECT_VERSION"
+    - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - export RUNTIME_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA"
+    - export DEVEL_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-devel"
+    - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag "$RUNTIME_SHA_TAG"
+      --provenance=mode=max
+      --sbom=true
+      --push
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target devel
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag "$DEVEL_SHA_TAG"
+      --provenance=mode=max
+      --sbom=true
+      --push
+      .
+    # Pull and test the registry manifests before adding release aliases.
+    - docker pull "$RUNTIME_SHA_TAG"
+    - docker pull "$DEVEL_SHA_TAG"
+    - test "$(docker run --rm "$RUNTIME_SHA_TAG" --version)" = "$PROJECT_VERSION"
+    - docker run --rm --entrypoint /bin/bash "$RUNTIME_SHA_TAG" -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++'
+    - docker run --rm "$DEVEL_SHA_TAG" cmake --version
+    - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION" "$RUNTIME_SHA_TAG"
+    - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION-devel" "$DEVEL_SHA_TAG"
+    - |
+      case "$IMAGE_VERSION" in
+        *-rc.*) ;;
+        *)
+          minor="${IMAGE_VERSION%.*}"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor" "$RUNTIME_SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor-devel" "$DEVEL_SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_NAME:latest" "$RUNTIME_SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_NAME:devel" "$DEVEL_SHA_TAG"
+          ;;
+      esac
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION"
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-devel"
+  after_script:
+    - docker logout 2>/dev/null || true

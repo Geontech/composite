@@ -1,0 +1,12 @@
+.git
+.gitlab
+.vscode
+build
+build-*
+_install
+consumer
+Dockerfile*
+*.md
+!LICENSE
+!README.md
+

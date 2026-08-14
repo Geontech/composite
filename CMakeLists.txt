@@ -199,21 +199,31 @@ if(COMPOSITE_INSTALL)
     install(
         DIRECTORY ${PROJECT_SOURCE_DIR}/include/composite
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        COMPONENT Development
     )
     # Generated headers (e.g. composite/version.hpp under the build tree).
     install(
         DIRECTORY ${PROJECT_BINARY_DIR}/include/composite
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        COMPONENT Development
     )
     install(
         FILES
         "${PROJECT_BINARY_DIR}/install-cmake/compositeConfig.cmake"
         "${PROJECT_BINARY_DIR}/compositeConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/composite/cmake
+        COMPONENT Development
     )
     install(
         TARGETS composite
         EXPORT composite_Targets
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            COMPONENT Runtime
+            NAMELINK_COMPONENT Development
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            COMPONENT Runtime
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            COMPONENT Development
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
     install(
@@ -221,6 +231,7 @@ if(COMPOSITE_INSTALL)
         FILE compositeTargets.cmake
         NAMESPACE composite::
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/composite/cmake
+        COMPONENT Development
     )
     # BUILD-tree package: make find_package(composite) work against the build tree (point
     # CMAKE_PREFIX_PATH at this build dir) without an install step. export() writes a build-tree
@@ -243,9 +254,11 @@ if(COMPOSITE_INSTALL)
     install(
         FILES "${PROJECT_BINARY_DIR}/composite.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+        COMPONENT Development
     )
     install(TARGETS composite-cli
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT Runtime
     )
 endif(COMPOSITE_INSTALL)
 

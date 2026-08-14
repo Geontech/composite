@@ -1,0 +1,132 @@
+# syntax=docker/dockerfile:1.7
+
+# Rocky's organization image is maintained more recently than the legacy
+# library/rockylinux image. Pin the multi-platform index; CI currently selects
+# linux/amd64 explicitly.
+ARG ROCKY_BASE=rockylinux/rockylinux:9-minimal@sha256:e1d0a9f5ed99d52e7faf03afe7ee32e48b231c4dd9586808b3d1aedf894dff04
+
+FROM ${ROCKY_BASE} AS toolchain
+
+# GCC Toolset 13 satisfies Composite's supported compiler floor while retaining
+# Rocky 9 as the runtime ABI baseline. nlohmann_json is a public Composite SDK
+# dependency but is not packaged by Rocky 9, so install its exact upstream
+# commit as a normal CMake package.
+RUN microdnf install -y --enablerepo=crb \
+        ca-certificates \
+        cmake \
+        gcc-toolset-13-gcc-c++ \
+        git-core \
+        ninja-build \
+        pkgconf-pkg-config \
+    && microdnf clean all
+
+ENV PATH="/opt/rh/gcc-toolset-13/root/usr/bin:${PATH}" \
+    CC="/opt/rh/gcc-toolset-13/root/usr/bin/gcc" \
+    CXX="/opt/rh/gcc-toolset-13/root/usr/bin/g++"
+
+ARG NLOHMANN_JSON_REVISION=9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
+RUN git clone --filter=blob:none https://github.com/nlohmann/json.git /tmp/nlohmann-json \
+    && git -C /tmp/nlohmann-json checkout --detach "${NLOHMANN_JSON_REVISION}" \
+    && cmake -S /tmp/nlohmann-json -B /tmp/nlohmann-json-build -G Ninja \
+        -DJSON_BuildTests=OFF \
+        -DJSON_Install=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --install /tmp/nlohmann-json-build \
+    && rm -rf /tmp/nlohmann-json /tmp/nlohmann-json-build
+
+FROM toolchain AS builder
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S /src -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCOMPOSITE_BUILD_TESTS=OFF \
+        -DCOMPOSITE_INSTALL=ON \
+        -DCOMPOSITE_WERROR=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /build --parallel \
+    && cmake --install /build --prefix /opt/composite/runtime --component Runtime \
+    && cmake --install /build --prefix /opt/composite/devel --component Runtime \
+    && cmake --install /build --prefix /opt/composite/devel --component Development
+
+FROM ${ROCKY_BASE} AS runtime
+
+ARG IMAGE_CREATED
+ARG IMAGE_REVISION
+ARG IMAGE_VERSION=0.5.0
+ARG IMAGE_SOURCE=https://github.com/geontech/composite
+
+LABEL org.opencontainers.image.title="Composite" \
+      org.opencontainers.image.description="Runtime for the Composite component streaming framework" \
+      org.opencontainers.image.created="${IMAGE_CREATED}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.url="https://github.com/geontech/composite" \
+      org.opencontainers.image.documentation="https://github.com/geontech/composite/blob/main/README.md" \
+      org.opencontainers.image.vendor="Geon Technologies, LLC" \
+      org.opencontainers.image.licenses="LGPL-3.0-or-later"
+
+RUN microdnf install -y ca-certificates libgcc libstdc++ \
+    && microdnf clean all \
+    && useradd --uid 10001 --create-home --shell /bin/bash composite \
+    && install -d -o 10001 -g 10001 /config /data /workspace
+
+COPY --from=builder /opt/composite/runtime/ /usr/local/
+COPY LICENSE /usr/share/licenses/composite/LICENSE
+
+RUN printf '%s\n' /usr/local/lib64 > /etc/ld.so.conf.d/composite.conf \
+    && ldconfig
+
+USER 10001:10001
+WORKDIR /workspace
+
+EXPOSE 5000
+ENTRYPOINT ["/usr/local/bin/composite-cli"]
+
+FROM toolchain AS devel
+
+ARG IMAGE_CREATED
+ARG IMAGE_REVISION
+ARG IMAGE_VERSION=0.5.0
+ARG IMAGE_SOURCE=https://github.com/geontech/composite
+
+LABEL org.opencontainers.image.title="Composite development SDK" \
+      org.opencontainers.image.description="Compiler, headers, and CMake package for building Composite components" \
+      org.opencontainers.image.created="${IMAGE_CREATED}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.url="https://github.com/geontech/composite" \
+      org.opencontainers.image.documentation="https://github.com/geontech/composite/blob/main/README.md" \
+      org.opencontainers.image.vendor="Geon Technologies, LLC" \
+      org.opencontainers.image.licenses="LGPL-3.0-or-later"
+
+COPY --from=builder /opt/composite/devel/ /usr/local/
+COPY LICENSE /usr/share/licenses/composite/LICENSE
+
+RUN printf '%s\n' /usr/local/lib64 > /etc/ld.so.conf.d/composite.conf \
+    && ldconfig \
+    && useradd --uid 10001 --create-home --shell /bin/bash composite \
+    && install -d -o 10001 -g 10001 /workspace
+
+USER 10001:10001
+WORKDIR /workspace
+CMD ["/bin/bash"]
+
+# CI-only target: prove the installed SDK can build the documented external
+# component without access to the Composite source/build tree.
+FROM devel AS devel-smoke
+COPY --chown=10001:10001 examples/passthrough_gain /tmp/passthrough_gain
+RUN cmake -S /tmp/passthrough_gain -B /tmp/passthrough_gain/build -G Ninja \
+    && cmake --build /tmp/passthrough_gain/build --parallel \
+    && test -f /tmp/passthrough_gain/build/libpassthrough_gain.so
+
+# CI-only target: package a minimal valid graph so the job can verify startup,
+# non-root execution, and SIGTERM delivery through the exec-form entrypoint.
+FROM runtime AS runtime-smoke
+COPY docker/smoke/empty.json /config/smoke.json
+CMD ["--server", "0.0.0.0", "/config/smoke.json"]
+
