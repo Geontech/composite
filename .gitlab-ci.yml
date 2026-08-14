@@ -35,7 +35,11 @@ stages:
     DOCKER_DRIVER: "overlay2"
   before_script:
     - docker version
-    - docker buildx create --name composite-ci --driver docker-container --use
+    # Buildx cannot persist TLS material inherited only through DOCKER_* variables
+    # when it creates a container-backed builder. Materialize that endpoint and
+    # its client certificates as a Docker context, then bind the builder to it.
+    - docker context create composite-dind
+    - docker buildx create --name composite-ci --driver docker-container --use composite-dind
     - docker buildx inspect --bootstrap
 
 # ---------------------------------------------------------------------------
