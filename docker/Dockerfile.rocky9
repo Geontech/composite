@@ -33,6 +33,8 @@ RUN git clone --filter=blob:none https://github.com/nlohmann/json.git /tmp/nlohm
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
     && cmake --install /tmp/nlohmann-json-build \
+    && install -D -m 0644 /tmp/nlohmann-json/LICENSE.MIT \
+        /usr/local/share/licenses/nlohmann_json/LICENSE.MIT \
     && rm -rf /tmp/nlohmann-json /tmp/nlohmann-json-build
 
 FROM toolchain AS builder
@@ -51,6 +53,21 @@ RUN cmake -S /src -B /build -G Ninja \
     && cmake --install /build --prefix /opt/composite/devel --component Runtime \
     && cmake --install /build --prefix /opt/composite/devel --component Development
 
+# Both images redistribute code from Composite's header-only dependencies —
+# compiled into libcomposite/composite-cli, and (nlohmann_json) shipped as
+# headers in the SDK — so their MIT notices must travel with the images. These
+# are hard paths on purpose: if a dependency stops being vendored (spdlog is
+# fetched only because Rocky does not package it) the build fails here rather
+# than silently publishing an image with a missing notice.
+RUN install -D -m 0644 /build/_deps/argparse-src/LICENSE \
+        /opt/composite/licenses/argparse/LICENSE \
+    && install -D -m 0644 /build/_deps/httplib-src/LICENSE \
+        /opt/composite/licenses/cpp-httplib/LICENSE \
+    && install -D -m 0644 /build/_deps/spdlog-src/LICENSE \
+        /opt/composite/licenses/spdlog/LICENSE \
+    && install -D -m 0644 /usr/local/share/licenses/nlohmann_json/LICENSE.MIT \
+        /opt/composite/licenses/nlohmann_json/LICENSE.MIT
+
 FROM ${ROCKY_BASE} AS runtime
 
 ARG IMAGE_CREATED
@@ -58,6 +75,10 @@ ARG IMAGE_REVISION
 ARG IMAGE_VERSION=0.5.0
 ARG IMAGE_SOURCE=https://github.com/geontech/composite
 
+# The Rocky base sets its own name/version/license/vendor/summary/authors
+# labels, and a label can only be overwritten, never deleted. Left alone they
+# ride along on the published image and contradict the OCI set below — most
+# damagingly `license=BSD-3-Clause` on an LGPL image. Restate every one.
 LABEL org.opencontainers.image.title="Composite" \
       org.opencontainers.image.description="Runtime for the Composite component streaming framework" \
       org.opencontainers.image.created="${IMAGE_CREATED}" \
@@ -67,7 +88,13 @@ LABEL org.opencontainers.image.title="Composite" \
       org.opencontainers.image.url="https://github.com/geontech/composite" \
       org.opencontainers.image.documentation="https://github.com/geontech/composite/blob/main/README.md" \
       org.opencontainers.image.vendor="Geon Technologies, LLC" \
-      org.opencontainers.image.licenses="LGPL-3.0-or-later"
+      org.opencontainers.image.licenses="LGPL-3.0-or-later" \
+      org.opencontainers.image.authors="Geon Technologies, LLC" \
+      name="composite" \
+      version="${IMAGE_VERSION}" \
+      summary="Runtime for the Composite component streaming framework" \
+      vendor="Geon Technologies, LLC" \
+      license="LGPL-3.0-or-later"
 
 RUN microdnf install -y ca-certificates libgcc libstdc++ \
     && microdnf clean all \
@@ -76,6 +103,7 @@ RUN microdnf install -y ca-certificates libgcc libstdc++ \
 
 COPY --from=builder /opt/composite/runtime/ /usr/local/
 COPY LICENSE /usr/share/licenses/composite/LICENSE
+COPY --from=builder /opt/composite/licenses/ /usr/share/licenses/composite/third-party/
 
 RUN printf '%s\n' /usr/local/lib64 > /etc/ld.so.conf.d/composite.conf \
     && ldconfig
@@ -93,6 +121,7 @@ ARG IMAGE_REVISION
 ARG IMAGE_VERSION=0.5.0
 ARG IMAGE_SOURCE=https://github.com/geontech/composite
 
+# See the runtime stage: the Rocky base labels must be restated here too.
 LABEL org.opencontainers.image.title="Composite development SDK" \
       org.opencontainers.image.description="Compiler, headers, and CMake package for building Composite components" \
       org.opencontainers.image.created="${IMAGE_CREATED}" \
@@ -102,10 +131,17 @@ LABEL org.opencontainers.image.title="Composite development SDK" \
       org.opencontainers.image.url="https://github.com/geontech/composite" \
       org.opencontainers.image.documentation="https://github.com/geontech/composite/blob/main/README.md" \
       org.opencontainers.image.vendor="Geon Technologies, LLC" \
-      org.opencontainers.image.licenses="LGPL-3.0-or-later"
+      org.opencontainers.image.licenses="LGPL-3.0-or-later" \
+      org.opencontainers.image.authors="Geon Technologies, LLC" \
+      name="composite-devel" \
+      version="${IMAGE_VERSION}" \
+      summary="Compiler, headers, and CMake package for building Composite components" \
+      vendor="Geon Technologies, LLC" \
+      license="LGPL-3.0-or-later"
 
 COPY --from=builder /opt/composite/devel/ /usr/local/
 COPY LICENSE /usr/share/licenses/composite/LICENSE
+COPY --from=builder /opt/composite/licenses/ /usr/share/licenses/composite/third-party/
 
 RUN printf '%s\n' /usr/local/lib64 > /etc/ld.so.conf.d/composite.conf \
     && ldconfig \

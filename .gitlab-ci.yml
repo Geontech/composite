@@ -16,8 +16,11 @@ stages:
     - apt-get update -qq && apt-get install -y -qq cmake git nlohmann-json3-dev
     - cmake --version && g++ --version | head -1
 
-# Docker-in-Docker is isolated to the image jobs. The runner must permit the
-# pinned dind service to run privileged and share its TLS client certificates.
+# Docker-in-Docker is isolated to the image jobs. These jobs are deliberately
+# untagged: the project's default runners already permit the pinned dind service
+# to run privileged and share its TLS client certificates. If that ever stops
+# being true the jobs fail at `docker version` rather than routing elsewhere, so
+# add a `tags:` entry pointing at a privileged runner instead of relaxing this.
 # Keep the client and daemon versions identical to avoid API drift.
 .docker:
   image: docker:29.1.3-cli
@@ -231,6 +234,32 @@ build:container:
       .
     - test "$(docker image inspect --format '{{.Config.User}}' composite:ci-runtime)" = "10001:10001"
     - test "$(docker run --rm composite:ci-runtime --version)" = "$IMAGE_VERSION"
+    # The Rocky base's own labels are inherited and can only be overwritten, so
+    # assert the restated values survive on both roles — an unnoticed base-image
+    # bump reintroducing `license=BSD-3-Clause` would misdescribe an LGPL image.
+    - |
+      set -eu
+      for role in runtime devel; do
+        img="composite:ci-$role"
+        test "$(docker image inspect --format '{{index .Config.Labels "license"}}' "$img")" = "LGPL-3.0-or-later"
+        test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}' "$img")" = "LGPL-3.0-or-later"
+        test "$(docker image inspect --format '{{index .Config.Labels "vendor"}}' "$img")" = "Geon Technologies, LLC"
+        test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.vendor"}}' "$img")" = "Geon Technologies, LLC"
+        test "$(docker image inspect --format '{{index .Config.Labels "version"}}' "$img")" = "$IMAGE_VERSION"
+        test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img")" = "$IMAGE_VERSION"
+      done
+    # Both images redistribute the header-only dependencies' code, so their MIT
+    # notices must ship with them.
+    - |
+      set -eu
+      for role in runtime devel; do
+        docker run --rm --entrypoint /bin/bash "composite:ci-$role" -c '
+          set -eu
+          for dep in argparse cpp-httplib spdlog nlohmann_json; do
+            ls /usr/share/licenses/composite/third-party/"$dep"/* >/dev/null
+          done
+          test -s /usr/share/licenses/composite/LICENSE'
+      done
     - docker run --rm --entrypoint /bin/bash composite:ci-runtime -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++; test ! -e /usr/local/include/composite'
     - docker run --rm composite:ci-devel cmake --version
     - docker run --rm composite:ci-devel /bin/bash -c 'test "$(id -u)" = 10001; test -f /usr/local/include/composite/composite.hpp; test -f /usr/local/share/composite/cmake/compositeConfig.cmake'

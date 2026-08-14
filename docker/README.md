@@ -58,9 +58,17 @@ The non-TLS server is unauthenticated. Bind the published host port to loopback 
 
 The runtime defaults to UID/GID `10001:10001` and contains no compiler, CMake installation, or framework headers.
 
+## Licensing
+
+Composite itself is LGPL-3.0-or-later; its text is at `/usr/share/licenses/composite/LICENSE` in both images.
+
+Both images also compile in code from Composite's header-only MIT dependencies, and the SDK redistributes the `nlohmann_json` headers outright, so those notices ship at `/usr/share/licenses/composite/third-party/<dependency>/`. The build collects them by hard path and fails if one is missing, rather than publishing an image without a required notice.
+
+The Rocky base image sets its own `name`, `version`, `license`, `vendor`, `summary`, and `org.opencontainers.image.authors` labels. A label can only be overwritten, never removed, so both final stages restate all of them — otherwise a published image reports `license=BSD-3-Clause` alongside the LGPL OCI label. `build:container` asserts the restated values so a base-image bump cannot quietly undo this.
+
 ## GitLab CI
 
-`build:container` runs without registry credentials in normal pipelines. It builds and tests the runtime, SDK, external-component consumer, non-root contract, and SIGTERM path.
+`build:container` runs without registry credentials in normal pipelines. It builds and tests the runtime, SDK, external-component consumer, non-root contract, SIGTERM path, OCI labels, and third-party license notices.
 
 `publish:dockerhub` appears only for tags matching:
 
@@ -90,7 +98,7 @@ The job expects these GitLab CI/CD variables:
 
 These values publish the framework images beneath `geontech/composite`.
 
-The GitLab runner executing the Docker jobs must support privileged Docker-in-Docker and its TLS client certificate directory. The CI pins matching Docker CLI and daemon versions rather than using `latest`. See [GitLab's Docker-in-Docker guidance](https://docs.gitlab.com/ci/docker/docker_in_docker/).
+The GitLab runner executing the Docker jobs must support privileged Docker-in-Docker and its TLS client certificate directory. The project's default runners provide this, so the image jobs carry no `tags:`; if that changes, tag them for a privileged runner rather than weakening the dind setup. The CI pins matching Docker CLI and daemon versions rather than using `latest`. See [GitLab's Docker-in-Docker guidance](https://docs.gitlab.com/ci/docker/docker_in_docker/).
 
 ## Release tags
 
