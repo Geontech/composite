@@ -83,8 +83,14 @@ public:
      * @brief A shared_ptr that shares ownership with this buffer (zero-alloc
      * aliasing pattern used by immutable_buffer to adopt pooled memory).
      */
-    auto ownership_handle() const noexcept -> std::shared_ptr<const void> {
+    auto ownership_handle() const & noexcept -> std::shared_ptr<const void> {
         return std::static_pointer_cast<const void>(m_data);
+    }
+
+    /// Move the existing ownership handle out without an atomic refcount
+    /// increment/decrement pair. The buffer becomes empty.
+    auto ownership_handle() && noexcept -> std::shared_ptr<const void> {
+        return std::static_pointer_cast<const void>(std::move(m_data));
     }
 
     /**

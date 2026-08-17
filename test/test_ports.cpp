@@ -799,6 +799,75 @@ TEST_CASE("immutable to immutable connection", "[port][connection]") {
     }
 }
 
+TEST_CASE("immutable batch moves ownership and aggregates overflow", "[port][batch][immutable]") {
+    output_port<immutable_buffer<std::uint8_t>> out{"out"};
+    input_port<immutable_buffer<std::uint8_t>> in{"in", 2};
+    REQUIRE(out.connect(&in));
+
+    std::size_t callback_calls = 0;
+    std::size_t callback_drops = 0;
+    in.set_overflow_callback([&](std::size_t count) {
+        ++callback_calls;
+        callback_drops += count;
+    });
+
+    metadata md_value;
+    md_value.sample_rate = 2.5e6;
+    const auto md = make_metadata(std::move(md_value));
+    std::vector<immutable_buffer<std::uint8_t>> buffers;
+    for (std::uint8_t value = 1; value <= 4; ++value) {
+        buffers.push_back(make_immutable<std::uint8_t>({value}));
+    }
+
+    out.send_batch(std::span{buffers}, timestamp{}, md);
+
+    // The complete source span is consumed, including the bounded ring's
+    // rejected suffix. Overflow is reported once with the aggregate count.
+    REQUIRE(std::ranges::all_of(buffers, [](const auto& b) { return !b.has_data(); }));
+    REQUIRE(callback_calls == 1);
+    REQUIRE(callback_drops == 2);
+
+    std::array<decltype(in)::queue_type, 4> received;
+    const auto count = in.get_batch(std::span{received});
+    REQUIRE(count == 2);
+    REQUIRE(std::get<0>(received[0])[0] == 1);
+    REQUIRE(std::get<0>(received[1])[0] == 2);
+    REQUIRE(std::get<2>(received[0]) == md);
+    REQUIRE(std::get<2>(received[1]) == md);
+}
+
+TEST_CASE("immutable batch consumes every buffer when entirely rejected", "[port][batch][immutable]") {
+    output_port<immutable_buffer<std::uint8_t>> out{"out"};
+    input_port<immutable_buffer<std::uint8_t>> in{"in", 2};
+    REQUIRE(out.connect(&in));
+
+    out.send_data(make_immutable<std::uint8_t>({10}), timestamp{});
+    out.send_data(make_immutable<std::uint8_t>({11}), timestamp{});
+    REQUIRE(in.is_full());
+
+    std::size_t callback_calls = 0;
+    std::size_t callback_drops = 0;
+    in.set_overflow_callback([&](std::size_t count) {
+        ++callback_calls;
+        callback_drops += count;
+    });
+
+    std::vector<immutable_buffer<std::uint8_t>> rejected;
+    for (std::uint8_t value = 1; value <= 3; ++value) {
+        rejected.push_back(make_immutable<std::uint8_t>({value}));
+    }
+    out.send_batch(std::span{rejected}, timestamp{});
+
+    REQUIRE(std::ranges::all_of(rejected, [](const auto& b) { return !b.has_data(); }));
+    REQUIRE(callback_calls == 1);
+    REQUIRE(callback_drops == rejected.size());
+
+    std::array<decltype(in)::queue_type, 2> received;
+    REQUIRE(in.get_batch(std::span{received}) == 2);
+    REQUIRE(std::get<0>(received[0])[0] == 10);
+    REQUIRE(std::get<0>(received[1])[0] == 11);
+}
+
 TEST_CASE("mutable to immutable connection (promotion)", "[port][connection]") {
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestImmutableSink>();

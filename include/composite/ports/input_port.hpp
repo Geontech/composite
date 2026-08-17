@@ -246,9 +246,38 @@ private:
                 m_doorbell->signal_data();
             }
         }
+        record_drop(in.size() - k); // aggregate the rejected suffix
+        return k;
+    }
+
+    /// Producer-side direct batch for an output whose buffer type exactly
+    /// matches this input. Moves accepted buffers straight into ring slots — no
+    /// temporary packet vector and no second move pass. Rejected suffix buffers
+    /// are consumed too, matching send_batch's contract.
+    auto add_batch(std::span<buffer_type> in, timestamp ts, composite::metadata_ptr md = nullptr) -> std::size_t {
+        const auto tail = m_tail.load(std::memory_order_relaxed);
+        const auto head = m_head.load(std::memory_order_acquire);
+        const auto cur = tail - head;
+        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();
+        const std::size_t room = cap > cur ? static_cast<std::size_t>(cap - cur) : 0;
+        const std::size_t k = room < in.size() ? room : in.size();
+        for (std::size_t i = 0; i < k; ++i) {
+            auto packet_md = (i + 1 == k) ? std::move(md) : md;
+            m_ring[(tail + i) & m_mask] = queue_type{std::move(in[i]), ts, std::move(packet_md)};
+        }
+        // A send consumes the complete span even when bounded admission accepts
+        // only a prefix. Release rejected buffers without constructing packets.
         for (std::size_t i = k; i < in.size(); ++i) {
-            record_drop();
-        } // overflow
+            in[i] = buffer_type{};
+        }
+        if (k != 0) {
+            m_tail.store(tail + k, std::memory_order_release);
+            update_queue_depth_metric(tail + k - head);
+            if (m_doorbell != nullptr && m_head.load(std::memory_order_acquire) == tail) {
+                m_doorbell->signal_data();
+            }
+        }
+        record_drop(in.size() - k);
         return k;
     }
 
@@ -288,12 +317,15 @@ private:
         return result;
     }
 
-    auto record_drop() -> void {
-        m_stats.record_drop();
+    auto record_drop(std::size_t count = 1) -> void {
+        if (count == 0) {
+            return;
+        }
+        m_stats.record_drop(count);
         // Overflow callback is configured at setup; lock guards a runtime re-set.
         const auto lock = std::scoped_lock{m_mtx};
         if (m_overflow_callback) {
-            m_overflow_callback(1);
+            m_overflow_callback(count);
         }
     }
 

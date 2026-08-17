@@ -23,6 +23,7 @@
 #include "composite/ports/output_port.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -133,6 +134,67 @@ void bench_handoff_1to1() {
         auto dt = std::chrono::duration<double>(clk::now() - t0).count();
         std::printf("%-12zu %16.2f %16.1f\n", n, count / dt / 1e6, dt / count * 1e9);
         (void)received;
+    }
+}
+
+// ---- (2b) scalar vs direct batch hand-off --------------------------------
+double measure_batch_handoff(bool batched, std::size_t batch_size, std::string_view metric_id) {
+    constexpr std::size_t count = 3'000'000;
+    output_port<immutable_buffer<std::uint8_t>> out{"out"};
+    input_port<immutable_buffer<std::uint8_t>> in{"in", 4096};
+    out.connect(&in);
+    out.register_port_metrics(metric_id);
+    in.register_port_metrics(metric_id);
+
+    std::atomic<bool> go{false};
+    std::thread consumer([&] {
+        std::array<decltype(in)::queue_type, 256> received;
+        std::size_t n = 0;
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        while (n < count) {
+            n += in.get_batch(std::span{received});
+        }
+    });
+
+    auto seed = make_immutable<std::uint8_t>(64);
+    std::vector<immutable_buffer<std::uint8_t>> buffers;
+    buffers.reserve(batch_size);
+    go.store(true, std::memory_order_release);
+    const auto start = clk::now();
+    for (std::size_t sent = 0; sent < count;) {
+        const auto n = std::min(batch_size, count - sent);
+        while (in.available_capacity() < n) {
+            std::this_thread::yield();
+        }
+        buffers.clear();
+        for (std::size_t i = 0; i < n; ++i) {
+            buffers.emplace_back(seed.share());
+        }
+        if (batched) {
+            out.send_batch(std::span{buffers}, timestamp{});
+        } else {
+            for (auto& buffer : buffers) {
+                out.send_data(std::move(buffer), timestamp{});
+            }
+        }
+        sent += n;
+    }
+    consumer.join();
+    const auto seconds = std::chrono::duration<double>(clk::now() - start).count();
+    return static_cast<double>(count) / seconds / 1e6;
+}
+
+void bench_batch_handoff() {
+    std::printf("\n== immutable 1:1 scalar vs direct batch (registered metrics, batched drain) ==\n");
+    std::printf("%-10s %8s %16s\n", "method", "batch", "Mpkt/s");
+    for (const auto batch_size : {std::size_t{32}, std::size_t{128}}) {
+        const auto scalar_id = std::string{"bench_scalar_"} + std::to_string(batch_size);
+        const auto batch_id = std::string{"bench_batch_"} + std::to_string(batch_size);
+        const auto scalar = measure_batch_handoff(false, batch_size, scalar_id);
+        const auto batch = measure_batch_handoff(true, batch_size, batch_id);
+        std::printf("%-10s %8zu %16.2f\n", "scalar", batch_size, scalar);
+        std::printf("%-10s %8zu %16.2f\n", "batch", batch_size, batch);
     }
 }
 
@@ -368,6 +430,7 @@ int main(int argc, char** argv) {
     bench_alloc();
     bench_pool();
     bench_handoff_1to1();
+    bench_batch_handoff();
     bench_handoff_1toN();
     bench_latency_hops();
     bench_throughput_hops();

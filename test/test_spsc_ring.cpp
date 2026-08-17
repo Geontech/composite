@@ -208,17 +208,18 @@ int main() {
         std::thread cons([&] {
             while (!go.load(std::memory_order_acquire)) {
             }
+            std::array<decltype(in)::queue_type, 64> batch;
             std::uint64_t expect = 0;
             while (expect < N) {
-                auto [buf, ts, md] = in.get_data();
-                if (buf.size() == 0) {
-                    continue;
+                const auto count = in.get_batch(std::span{batch});
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto& buf = std::get<0>(batch[i]);
+                    if (read_seq(buf, bad) != expect) {
+                        bad.store(true, std::memory_order_relaxed);
+                    }
+                    ++expect;
+                    recv.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (read_seq(buf, bad) != expect) {
-                    bad.store(true, std::memory_order_relaxed);
-                }
-                ++expect;
-                recv.fetch_add(1, std::memory_order_relaxed);
             }
         });
         go.store(true, std::memory_order_release);
@@ -247,7 +248,8 @@ int main() {
             std::puts("FAIL: send_batch lost packets (D)");
             return 1;
         }
-        std::printf("SPSC send_batch OK: %llu packets via batched producer, exact order\n", (unsigned long long)N);
+        std::printf("SPSC send_batch+get_batch OK: %llu packets exact-order through both batch ends\n",
+                    (unsigned long long)N);
     }
 
     // ---- E) Regression: raising depth() above the ring capacity on a

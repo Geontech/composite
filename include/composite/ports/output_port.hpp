@@ -195,19 +195,12 @@ public:
         const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr && !ports->front()->is_mutable()) {
             auto* ip = static_cast<input_port<immutable_buffer<T>>*>(ports->front());
-            std::vector<typename input_port<immutable_buffer<T>>::queue_type> batch;
-            batch.reserve(bufs.size());
-            for (std::size_t j = 0; j < bufs.size(); ++j) {
-                m_stats.record_transfer(bufs[j].size() * sizeof(T));
-                // All batch entries share the one metadata instance; the last takes the
-                // pointer by move.
-                if (j + 1 == bufs.size()) {
-                    batch.emplace_back(bufs[j].share(), ts, std::move(md));
-                } else {
-                    batch.emplace_back(bufs[j].share(), ts, md);
-                }
+            std::size_t bytes = 0;
+            for (const auto& b : bufs) {
+                bytes += b.size() * sizeof(T);
             }
-            ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(batch));
+            m_stats.record_transfer(bytes, bufs.size());
+            ip->add_batch(bufs, ts, std::move(md));
             return;
         }
         for (auto& b : bufs) {
@@ -389,24 +382,25 @@ public:
         const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr) {
             auto* port = ports->front();
+            std::size_t bytes = 0;
+            for (const auto& b : bufs) {
+                bytes += b.size() * sizeof(T);
+            }
+            m_stats.record_transfer(bytes, bufs.size());
             if (port->is_mutable()) {
                 auto* ip = static_cast<input_port<mutable_buffer<T>>*>(port);
-                std::vector<typename input_port<mutable_buffer<T>>::queue_type> batch;
-                batch.reserve(bufs.size());
-                for (auto& b : bufs) {
-                    m_stats.record_transfer(b.size() * sizeof(T));
-                    batch.emplace_back(std::move(b), ts, md);
-                }
-                ip->add_batch(std::span<typename input_port<mutable_buffer<T>>::queue_type>(batch));
+                ip->add_batch(bufs, ts, std::move(md));
             } else {
                 auto* ip = static_cast<input_port<immutable_buffer<T>>*>(port);
-                std::vector<typename input_port<immutable_buffer<T>>::queue_type> batch;
-                batch.reserve(bufs.size());
-                for (auto& b : bufs) {
-                    m_stats.record_transfer(b.size() * sizeof(T));
-                    batch.emplace_back(std::move(b).to_immutable(), ts, md);
+                m_immutable_batch_scratch.clear();
+                m_immutable_batch_scratch.reserve(bufs.size());
+                for (std::size_t i = 0; i < bufs.size(); ++i) {
+                    auto packet_md = (i + 1 == bufs.size()) ? std::move(md) : md;
+                    m_immutable_batch_scratch.emplace_back(std::move(bufs[i]).to_immutable(), ts,
+                                                           std::move(packet_md));
                 }
-                ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(batch));
+                ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(m_immutable_batch_scratch));
+                m_immutable_batch_scratch.clear(); // release any rejected suffix immediately
             }
             return;
         }
@@ -419,6 +413,12 @@ public:
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, std::optional<composite::metadata> md) -> void {
         send_batch(bufs, ts, md.has_value() ? composite::make_metadata(std::move(*md)) : composite::metadata_ptr{});
     }
+
+private:
+    // Mutable->immutable conversion needs packet descriptors of the target
+    // type. Retain the scratch allocation across calls; the common exact-type
+    // paths above write directly into the destination ring.
+    std::vector<typename input_port<immutable_buffer<T>>::queue_type> m_immutable_batch_scratch;
 
 }; // output_port<mutable_buffer<T>>
 

@@ -97,9 +97,9 @@ struct port_stats {
     /**
      * @brief Record a dropped packet
      */
-    auto record_drop() -> void {
+    auto record_drop(std::size_t packets = 1) -> void {
         if (m_packets_dropped) {
-            m_packets_dropped->add(1);
+            m_packets_dropped->add(packets);
         }
     }
 

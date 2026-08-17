@@ -133,8 +133,16 @@ public:
      *
      * The external_buffer can be passed by value (moved) for optimal performance.
      */
-    explicit immutable_buffer(external_buffer<T> buf)
-        : m_data(buf.ownership_handle()), m_span(make_byte_span(buf.data(), buf.size())), m_size(buf.size()) {}
+    explicit immutable_buffer(external_buffer<T> buf) {
+        // Capture the view before moving the shared_ptr ownership out. The rvalue
+        // ownership_handle overload avoids a redundant refcount bump followed by
+        // the temporary external_buffer's matching decrement.
+        const auto* ptr = buf.data();
+        const auto count = buf.size();
+        m_span = make_byte_span(ptr, count);
+        m_size = count;
+        m_data = std::move(buf).ownership_handle();
+    }
 
     /**
      * @brief Copy constructor - shares ownership (cheap, only increments refcount)

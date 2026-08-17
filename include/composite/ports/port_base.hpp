@@ -249,7 +249,8 @@ public:
 
     /**
      * @brief Set overflow callback for dropped packets
-     * @param callback Function to call when packets are dropped
+     * @param callback Function to call when packets are dropped. A batch overflow invokes it once
+     *                 with the aggregate rejected-packet count.
      */
     auto set_overflow_callback(overflow_callback callback) -> void {
         const auto lock = std::scoped_lock{m_mtx};

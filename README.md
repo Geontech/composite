@@ -431,7 +431,8 @@ Both port directions expose `stats()` — `packets_transferred()`, `packets_drop
 `bytes_transferred()`, `throughput_mbps()`, `drop_rate()`, `time_since_last_activity()` — and
 `reset_stats()`. (Live queue depth is published separately as the `composite.port.queue_depth`
 metric gauge, not via `stats()`.) Input ports expose `is_full()` / `available_capacity()`, and
-`set_overflow_callback([](std::size_t dropped){ ... })` to be notified of drops.
+`set_overflow_callback([](std::size_t dropped){ ... })` to be notified of drops. A batch overflow
+calls the callback once with the aggregate number rejected, rather than once per packet.
 
 ### External Egress
 

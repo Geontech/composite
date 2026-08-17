@@ -51,7 +51,8 @@ The table below maps the old API to the new one.
 ### Highlights
 
 - **Lock-free data path** — bounded SPSC ring ports with an event-driven doorbell (forward for data,
-  reverse for backpressure); move-on-last-receiver buffer transfer; batched yielding.
+  reverse for backpressure); move-on-last-receiver buffer transfer; direct batched ring handoff.
+  Batch overflow callbacks run once with the aggregate rejected-packet count.
 - **Park-coordinated reconfiguration** — property writes validate-then-commit under a worker park;
   `config<T>` reactions run at the worker loop-top (no torn config/derived-state).
 - **Typed, reflected properties** — `config<T>` + `COMPOSITE_FIELDS` with per-field attributes
