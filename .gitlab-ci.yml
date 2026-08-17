@@ -32,7 +32,6 @@ stages:
     DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_TLS_VERIFY: "1"
     DOCKER_CERT_PATH: "/certs/client"
-    DOCKER_DRIVER: "overlay2"
   before_script:
     # The self-managed runner injects its own DOCKER_AUTH_CONFIG with a
     # credsStore entry so it can pull the job/service images. Docker CLI 29
@@ -43,11 +42,13 @@ stages:
     # with docker login (which writes the job-local config.json).
     - unset DOCKER_AUTH_CONFIG
     - docker version
-    # Buildx cannot persist TLS material inherited only through DOCKER_* variables
-    # when it creates a container-backed builder. Materialize that endpoint and
-    # its client certificates as a Docker context, then bind the builder to it.
+    # Materialize the TLS endpoint supplied through DOCKER_* and select that
+    # context. Every Docker context has an automatic Buildx builder backed by
+    # the daemon's integrated BuildKit. Do not create a docker-container builder
+    # here: that adds a nested executor inside dind, which is the boundary where
+    # this runner exits before evaluating the Dockerfile (reported at line 1).
     - docker context create composite-dind
-    - docker buildx create --name composite-ci --driver docker-container --use composite-dind
+    - export DOCKER_CONTEXT=composite-dind
     - docker buildx inspect --bootstrap
 
 # ---------------------------------------------------------------------------
