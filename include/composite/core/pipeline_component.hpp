@@ -251,13 +251,11 @@ private:
         bool keep{false};
     };
 
-    static auto round_up_pow2(std::size_t n) -> std::size_t {
-        std::size_t p = 1;
-        while (p < n) {
-            p <<= 1;
-        }
-        return p;
-    }
+    /// Shared with the port layer's ring sizing; see composite::detail::round_up_pow2 for
+    /// why this saturates instead of looping (the shift-until-ge form spins forever once n
+    /// exceeds 2^63). Bounded by the worker count here, but kept identical so the two
+    /// copies cannot drift.
+    static auto round_up_pow2(std::size_t n) -> std::size_t { return composite::detail::round_up_pow2(n); }
 
     /// ARRIVAL order, main thread. Return the shared metadata to travel with this packet,
     /// re-running prepare() only when the incoming instance differs from the previous

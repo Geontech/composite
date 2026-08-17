@@ -107,13 +107,13 @@ public:
         explicit auto_stop(component& owner) noexcept : m_owner(&owner) {}
         auto_stop(const auto_stop&) = delete;
         auto_stop& operator=(const auto_stop&) = delete;
-        ~auto_stop() { m_owner->stop(); } // stop() is idempotent
+        ~auto_stop() { m_owner->stop_contained(); } // idempotent, and must not throw from a dtor
     private:
         component* m_owner;
     };
 
     virtual ~component() override {
-        stop();
+        stop_contained(); // a throwing stop (park timeout / staged reaction) must not unwind here
         // Deregister all of this component's metrics (lifecycle + ports + user) by
         // its identity label, so a reload doesn't leak series toward the registry
         // cap and OTel drops the instruments. The registry outlives components.
@@ -150,8 +150,25 @@ public:
         // (so an on_apply that touches the lifecycle cannot self-deadlock). Only when we
         // actually stopped a worker — guards against running a stale reaction during
         // ~component (auto_stop already stopped + drained while the derived was alive).
+        // CONTAINED: stop() runs from destructors and from application teardown loops, so
+        // a wedged-worker park timeout here must not unwind out of it.
         if (had_worker) {
-            run_reactions_parked();
+            run_reactions_contained();
+        }
+    }
+
+    /// stop() that cannot unwind, for destructors and best-effort teardown. stop() is not
+    /// itself noexcept: stop_locked() and the staged-reaction drain can both fail (a worker
+    /// that will not park inside the timeout). Letting that escape ~component or
+    /// ~auto_stop is std::terminate, and letting it escape a teardown loop abandons every
+    /// component after it — so those callers use this and continue.
+    auto stop_contained() noexcept -> void {
+        try {
+            stop();
+        } catch (const std::exception& ex) {
+            log_contained_failure("stop() failed during teardown", ex.what());
+        } catch (...) {
+            log_contained_failure("stop() failed during teardown", "unknown exception");
         }
     }
 
@@ -488,24 +505,58 @@ public:
         if (fr != finish_reason::none) {
             state["finish_reason"] = to_string(fr);
         }
+        // Detail for a failure, so a control plane does not have to scrape the log to learn
+        // WHY a component stopped. Emitted only when there is one (see finish_error()).
+        if (fr == finish_reason::error) {
+            if (auto err = finish_error(); !err.empty()) {
+                state["finish_error"] = std::move(err);
+            }
+        }
         return state;
     }
 
-    /// Property schema as JSON (names / types / configurability). Also advertises the
-    /// `enabled` spec/status virtual so UIs render a lifecycle toggle.
+    /**
+     * @brief The component's properties as ONE JSON Schema 2020-12 document.
+     *
+     * Published by `GET /app/components/:id/schema`. Property names are the keys of
+     * `properties`; composite-specific metadata (units, configurability, power-of-two)
+     * rides as `x-composite-*` vendor extensions, so the document is a conformant schema
+     * a generic validator or form generator can consume directly.
+     *
+     * Also advertises the `enabled` spec/status virtual — it is not a registered value
+     * property (set_properties handles it directly), but it IS a legal key, so a UI needs
+     * it to render a lifecycle toggle.
+     */
     [[nodiscard]] auto property_schema() const -> properties::json {
-        auto schema = m_prop_set.describe();
-        schema.push_back(properties::json{
-            {"name", "enabled"},
+        auto schema = m_prop_set.schema();
+        schema["title"] = m_id;
+        schema["properties"]["enabled"] = properties::json{
             {"type", "boolean"},
-            {"configurability", "runtime"},
             {"default", true},
             {"description", "desired lifecycle state — writing it starts/stops the component"},
-        });
+            {"x-composite-configurability", "runtime"},
+        };
         return schema;
     }
 
     [[nodiscard]] auto property_set() const -> const properties::property_set& { return m_prop_set; }
+
+    /**
+     * @brief Does this component accept @p name in a set_properties() batch?
+     * @return true for a registered plain property, a registered config<T> FIELD, or the
+     *         framework `enabled` virtual.
+     *
+     * Exists for the application-level ("globals") property block, which is broadcast to
+     * every component: a key that applies to some components must be filtered per
+     * component rather than forcing the whole batch to tolerate unknown keys. That lets
+     * the loader run with allow_unknown=false, so a TYPO in a component's own property
+     * block is an error instead of being silently discarded.
+     */
+    [[nodiscard]] auto has_property(std::string_view name) const -> bool {
+        // `enabled` is a spec/status virtual handled directly by set_properties, so it is
+        // deliberately absent from the property set — but it IS a legal key.
+        return name == "enabled" || m_prop_set.contains(name);
+    }
 
     // ========================================================================
     // Property Setting
@@ -584,6 +635,13 @@ public:
             } catch (const std::exception& ex) {
                 logger()->error("{}: property error: {}", m_id, ex.what());
                 throw;
+            } catch (...) {
+                // A non-standard exception out of a validator or a prepare/commit step would
+                // otherwise escape set_properties() entirely — past the REST layer's
+                // std::exception handlers and out of the worker on a self-write. Normalize it
+                // so the failure still surfaces as an error rather than a terminate.
+                logger()->error("{}: property error: unknown exception", m_id);
+                throw std::runtime_error(m_id + ": property error: unknown exception");
             }
         }
 
@@ -602,9 +660,11 @@ public:
                 // If the reconcile STOPPED the worker, a reaction staged by the value batch
                 // above is now undrained — drain it here (the loop-top drain is gone with the
                 // worker). Lock released, so a lifecycle-touching on_apply is safe. If the
-                // reconcile STARTED a worker, it drains at its own loop-top.
+                // reconcile STARTED a worker, it drains at its own loop-top. CONTAINED: the
+                // value batch is already committed and the lifecycle change already took
+                // effect, so a drain failure must not retroactively fail the write.
                 if (!m_park.has_worker()) {
-                    run_reactions_parked();
+                    run_reactions_contained();
                 }
             }
         }
@@ -618,18 +678,7 @@ public:
      * write react narrowly instead of rebuilding everything. Per-property reactions
      * can also be attached via typed_property::on_change().
      */
-    virtual auto property_change_handler(const properties::json& diff) -> void {
-        (void)diff;
-        property_change_handler(); // default: forward to the legacy no-arg hook
-    }
-
-    /**
-     * @brief Legacy no-argument reaction hook.
-     * @deprecated Prefer property_change_handler(const properties::json& diff) — it
-     * tells you which fields changed. Kept so existing overrides keep working;
-     * slated for removal in M3 Phase 3.
-     */
-    virtual auto property_change_handler() -> void {}
+    virtual auto property_change_handler(const properties::json& diff) -> void { (void)diff; }
 
     /**
      * @brief Run @p fn under a shared property read-lock
@@ -672,9 +721,11 @@ public:
         }
         // If the reconcile STOPPED the worker, drain any staged reaction (no worker to do
         // it; lock released so a lifecycle-touching on_apply is safe). If it started one,
-        // the new worker drains it at loop-top.
+        // the new worker drains it at loop-top. CONTAINED: application::start() calls this
+        // per component and reports which ones failed to START — a post-reconcile drain
+        // failure is not a start failure and must not be reported as one.
         if (!m_park.has_worker()) {
-            run_reactions_parked();
+            run_reactions_contained();
         }
     }
 
@@ -690,6 +741,44 @@ public:
         m_park.with_worker_parked([this] { m_prop_set.run_pending_reactions(); });
     }
 
+    /// Record (or clear, with an empty string) the detail behind a finish_reason::error.
+    /// noexcept: called from the worker's own exception handlers and from the start-up
+    /// failure path, where a throw would defeat the point.
+    auto set_finish_error(std::string_view what) noexcept -> void {
+        try {
+            const std::scoped_lock lk{m_finish_error_mtx};
+            m_finish_error.assign(what);
+        } catch (...) { // NOLINT(bugprone-empty-catch) — a failed assign must not mask the real error
+        }
+    }
+
+    /// run_reactions_parked() that cannot unwind. The reactions themselves are already
+    /// contained (property_set::run_pending_reactions), but the PARK can still throw —
+    /// with_worker_parked() raises "worker failed to park within timeout" on a wedged
+    /// worker, which is not user code and can therefore surface on a stop or teardown path
+    /// where unwinding is fatal. Every caller that drains from stop(), a destructor, or a
+    /// lifecycle reconcile uses this; set_properties() keeps the throwing form so a genuine
+    /// park failure still reaches the REST caller.
+    auto run_reactions_contained() noexcept -> void {
+        try {
+            run_reactions_parked();
+        } catch (const std::exception& ex) {
+            log_contained_failure("staged reaction drain failed", ex.what());
+        } catch (...) {
+            log_contained_failure("staged reaction drain failed", "unknown exception");
+        }
+    }
+
+    /// Log a contained failure without ever throwing. The containment wrappers are noexcept
+    /// and run from destructors, so a throwing logger (allocation, formatting) would defeat
+    /// the very guarantee they exist to provide.
+    auto log_contained_failure(const char* what, const char* detail) noexcept -> void {
+        try {
+            logger()->error("{}: {}: {}", m_id, what, detail);
+        } catch (...) { // NOLINT(bugprone-empty-catch) — logging must not defeat containment
+        }
+    }
+
     /// Desired (spec) enabled state — what the operator/config asked for.
     [[nodiscard]] auto is_enabled() const -> bool { return m_desired_enabled.load(std::memory_order_acquire); }
     /// Observed (status) running state — whether a worker is currently live.
@@ -703,6 +792,22 @@ public:
     /// Why the worker self-terminated (none if it did not, or was stopped externally).
     [[nodiscard]] auto finished_reason() const -> finish_reason {
         return m_finish_reason.load(std::memory_order_acquire);
+    }
+
+    /**
+     * @brief Detail for a finish_reason::error — the what() of the exception that ended
+     *        the worker, or "unknown exception" for a non-std throw.
+     * @return The message, or an empty string when the component did not fail.
+     *
+     * finished_reason() says only THAT the component failed; a control plane or an
+     * embedding caller generally needs to know WHY without scraping the log. Set once as
+     * the worker exits (or when start-up itself fails) and cleared on the next start.
+     * Cold path: a mutex, not an atomic — this is read by REST introspection, never on
+     * the data path.
+     */
+    [[nodiscard]] auto finish_error() const -> std::string {
+        const std::scoped_lock lk{m_finish_error_mtx};
+        return m_finish_error;
     }
 
 protected:
@@ -724,6 +829,14 @@ protected:
         // successful PATCH into a 400 (success-with-warnings).
         m_prop_set.set_listener_error_handler([this](const std::string& name, const char* what) {
             logger()->warn("{}: property '{}' change listener failed (value already applied): {}", m_id, name, what);
+        });
+
+        // Same policy for a staged config<T> on_apply reaction, which additionally runs at
+        // the worker loop-top, in ~component, and during graph teardown — boundaries an
+        // exception must never cross. Contained in property_set::run_pending_reactions();
+        // this is where the failure becomes visible.
+        m_prop_set.set_reaction_error_handler([this](const std::string& name, const char* what) {
+            logger()->error("{}: config '{}' on_apply reaction failed (values already applied): {}", m_id, name, what);
         });
 
         add_property("noop_thread_delay", m_delay).units("ns");
@@ -901,6 +1014,8 @@ private:
     // (re)start. m_worker_done + its CV let wait_until_finished() block until the worker exits (for
     // ANY reason). m_worker_done starts true (no worker running yet).
     std::atomic<finish_reason> m_finish_reason{finish_reason::none};
+    mutable std::mutex m_finish_error_mtx; ///< guards m_finish_error (cold: worker exit vs REST read)
+    std::string m_finish_error;            ///< what() behind a finish_reason::error; see finish_error()
     std::mutex m_finished_mtx;
     std::condition_variable m_finished_cv;
     bool m_worker_done{true};
@@ -1048,7 +1163,17 @@ private:
     /// on_worker_stop() never runs concurrently with the pool it tears down.
     auto worker_resources_down() -> void {
         if (m_worker_resources_up.exchange(false, std::memory_order_acq_rel)) {
-            on_worker_stop();
+            // USER hook, reached on every teardown path (stop, disable-reconcile, worker
+            // self-termination, destructor). A throw must not abort the remainder of the
+            // stop sequence, and the exchange above has already marked the resources down,
+            // so a rethrow could not be retried anyway.
+            try {
+                on_worker_stop();
+            } catch (const std::exception& ex) {
+                log_contained_failure("on_worker_stop() failed", ex.what());
+            } catch (...) {
+                log_contained_failure("on_worker_stop() failed", "unknown exception");
+            }
         }
     }
 
@@ -1059,6 +1184,7 @@ private:
         // Clear completion status for the new run: not finished, error counter reset (else a
         // restarted component gives up early on the STALE consecutive-error count from the prior run).
         m_finish_reason.store(finish_reason::none, std::memory_order_release);
+        set_finish_error({}); // a new run has no failure yet; drop the previous run's detail
         m_error_restarts = 0;
         // Re-open our outputs' downstream inputs: a (re)starting producer will send data again, so a
         // stale end-of-stream latch from a prior completed run must not leave downstream reporting
@@ -1101,8 +1227,24 @@ private:
                 m_worker_done = true;
             }
             m_finish_reason.store(finish_reason::error, std::memory_order_release);
+            try {
+                throw; // re-inspect the in-flight exception to record its detail, then rethrow below
+            } catch (const std::exception& e) {
+                set_finish_error(e.what());
+            } catch (...) {
+                set_finish_error("unknown exception");
+            }
             m_worker_resources_up.store(false, std::memory_order_release);
-            on_worker_stop();
+            // Contained: this cleanup hook runs while the START failure is in flight. Letting
+            // it throw here would REPLACE the original exception with a teardown artifact,
+            // losing the reason the start actually failed (already recorded above).
+            try {
+                on_worker_stop();
+            } catch (const std::exception& ex) {
+                log_contained_failure("on_worker_stop() failed while unwinding a failed start", ex.what());
+            } catch (...) {
+                log_contained_failure("on_worker_stop() failed while unwinding a failed start", "unknown exception");
+            }
             throw;
         }
         pthread_setname_np(m_thread->native_handle(), m_id.c_str());
@@ -1128,8 +1270,20 @@ private:
             m_thread->request_stop();
         }
         m_park.cancel_waiters(); // release a writer blocked waiting to park
-        on_park_requested();     // wake a worker blocked in get_data()
-        m_thread.reset();        // the single join site
+        // Best-effort wake for a worker blocked in a custom wait. This is a USER hook sitting
+        // one line before the SINGLE join site, so its failure must never skip the join:
+        // stop() is reached from ~component via stop_contained(), and an unjoined worker
+        // would then keep running against a destroyed derived object. Contain it here —
+        // containing it at the stop() boundary alone would trade a loud terminate for a
+        // silent use-after-free.
+        try {
+            on_park_requested(); // wake a worker blocked in get_data()
+        } catch (const std::exception& ex) {
+            log_contained_failure("on_park_requested() failed during stop", ex.what());
+        } catch (...) {
+            log_contained_failure("on_park_requested() failed during stop", "unknown exception");
+        }
+        m_thread.reset();        // the single join site — ALWAYS reached
         m_park.settle_stopped(); // park state -> NO_WORKER
         // Ensure no EXTERNAL park call is still touching us before teardown. Skip the
         // wait when this stop() is REENTRANT from inside our own with_worker_parked (m_park_owner ==
@@ -1209,7 +1363,19 @@ private:
             // we were parked — on THIS (worker) thread, at loop-top, BEFORE process(). So
             // process() never observes a new config value alongside stale derived state
             // (the fft/psd use-after-free class). No-op when no reaction is staged.
-            m_prop_set.run_pending_reactions();
+            //
+            // Reaction exceptions are contained inside run_pending_reactions() (per binding,
+            // routed to the reaction error sink): this is a bare worker-thread frame, so an
+            // escape here is std::terminate, exactly as it would be from process() — which
+            // is why process() is wrapped below. The belt-and-braces guard keeps that true
+            // even if the property layer ever grows a throwing path of its own.
+            try {
+                m_prop_set.run_pending_reactions();
+            } catch (const std::exception& e) {
+                logger()->error("component '{}' staged reaction drain threw: {}", m_id, e.what());
+            } catch (...) {
+                logger()->error("component '{}' staged reaction drain threw an unknown exception", m_id);
+            }
 
             retval res{};
             bool errored = false; // set if process() threw this iteration (FINISH-with-reason=error)
@@ -1226,10 +1392,12 @@ private:
                 res = process();
             } catch (const std::exception& e) {
                 logger()->error("component '{}' process() threw an exception: {}", m_id, e.what());
+                set_finish_error(e.what()); // retained for finish_error() / property_state()
                 res = FINISH;
                 errored = true;
             } catch (...) {
                 logger()->error("component '{}' process() threw an unknown exception", m_id);
+                set_finish_error("unknown exception");
                 res = FINISH;
                 errored = true;
             }

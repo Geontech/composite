@@ -196,13 +196,30 @@ TEST_CASE_METHOD(rest_fixture, "PATCH component sets a scalar", "[http]") {
     REQUIRE(state["gain"] == 2.5);
 }
 
-TEST_CASE_METHOD(rest_fixture, "PUT single property", "[http]") {
+TEST_CASE_METHOD(rest_fixture, "PATCH single property", "[http]") {
     auto cli = client();
-    auto r = cli.Put("/app/components/c1/properties/gain", R"({"value": 3.0})", "application/json");
+    auto r = cli.Patch("/app/components/c1/properties/gain", R"({"value": 3.0})", "application/json");
     REQUIRE(r);
     REQUIRE(r->status == 200);
     auto one = json::parse(cli.Get("/app/components/c1/properties/gain")->body);
     REQUIRE(one["gain"] == 3.0);
+}
+
+// PUT was withdrawn from the single-property endpoint (see server.cpp): it was an alias for the
+// merge handler, which contradicts HTTP PUT-as-replace. It is answered with an explicit 405 +
+// Allow rather than a bare 404, so a pre-0.5 client gets a usable migration signal. Pin both the
+// status and the no-op so PUT cannot be reintroduced as an alias by accident — if it returns, it
+// must return as a real replace with its own test, not as a second name for PATCH.
+TEST_CASE_METHOD(rest_fixture, "PUT single property is rejected with 405, not silently merged", "[http]") {
+    auto cli = client();
+    const auto before = json::parse(cli.Get("/app/components/c1/properties/gain")->body)["gain"];
+    auto r = cli.Put("/app/components/c1/properties/gain", R"({"value": 3.0})", "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 405);
+    REQUIRE(r->get_header_value("Allow") == "GET, PATCH, DELETE");
+    const auto after = json::parse(cli.Get("/app/components/c1/properties/gain")->body)["gain"];
+    REQUIRE(after == before); // the rejected PUT applied nothing
+    REQUIRE(after != 3.0);
 }
 
 TEST_CASE_METHOD(rest_fixture, "validation -> 400, config -> 403", "[http]") {
@@ -253,19 +270,40 @@ TEST_CASE_METHOD(rest_fixture, "DELETE resets a property to default", "[http]") 
     REQUIRE(json::parse(cli.Get("/app/components/c1/properties")->body)["net"]["port"] == 8080); // default
 }
 
-// GET /app/components/:id/schema returns a property descriptor array incl. the `enabled` virtual.
-TEST_CASE_METHOD(rest_fixture, "GET component schema", "[http]") {
+// GET /app/components/:id/schema returns ONE JSON Schema 2020-12 document describing the
+// component's properties, incl. the `enabled` virtual. This is the published wire contract:
+// a generic validator or form generator must be able to consume it without composite-specific
+// knowledge, so the structural keywords are standard and composite metadata is x-prefixed.
+TEST_CASE_METHOD(rest_fixture, "GET component schema is a JSON Schema 2020-12 document", "[http]") {
     auto cli = client();
     auto r = cli.Get("/app/components/c1/schema");
     REQUIRE(r);
     REQUIRE(r->status == 200);
     auto schema = json::parse(r->body);
-    REQUIRE(schema.is_array());
-    auto has = [&](std::string_view name) {
-        return std::any_of(schema.begin(), schema.end(), [&](const json& e) { return e.value("name", "") == name; });
-    };
-    REQUIRE(has("gain"));    // a registered property
-    REQUIRE(has("enabled")); // the spec/status virtual is advertised for UIs
+
+    REQUIRE(schema.is_object());
+    REQUIRE(schema["$schema"] == "https://json-schema.org/draft/2020-12/schema");
+    REQUIRE(schema["type"] == "object");
+    REQUIRE(schema["additionalProperties"] == false);
+    REQUIRE(schema["title"] == "c1");
+    REQUIRE(!schema.contains("required")); // partial PATCH bodies must validate
+
+    const auto& props = schema.at("properties");
+    REQUIRE(props.contains("gain"));    // a registered property
+    REQUIRE(props.contains("enabled")); // the spec/status virtual is advertised for UIs
+    REQUIRE(props["gain"]["x-composite-configurability"] == "runtime");
+
+    // None of the internal vocabulary may leak into the published document.
+    for (const auto& [name, entry] : props.items()) {
+        INFO("property: " << name);
+        REQUIRE(!entry.contains("fields"));
+        REQUIRE(!entry.contains("choices"));
+        REQUIRE(!entry.contains("unit"));
+        REQUIRE(!entry.contains("powerOfTwo"));
+        REQUIRE(!entry.contains("configurability"));
+        REQUIRE(!entry.contains("name")); // the name is the key
+    }
+
     // Unknown component -> 404.
     REQUIRE(cli.Get("/app/components/nope/schema")->status == 404);
 }
@@ -349,7 +387,6 @@ TEST_CASE_METHOD(rest_fixture, "OpenAPI spec is well-formed and matches the rout
         "get /app/components/{id}/schema",
         "get /app/components/{id}/properties",
         "get /app/components/{id}/properties/{name}",
-        "put /app/components/{id}/properties/{name}",
         "patch /app/components/{id}/properties/{name}",
         "delete /app/components/{id}/properties/{name}",
         "get /app/components/{id}/ports",
@@ -497,9 +534,9 @@ TEST_CASE_METHOD(rest_fixture, "malformed JSON body -> 400 (no connection drop)"
     REQUIRE(r->status == 400);
 }
 
-TEST_CASE_METHOD(rest_fixture, "PUT unknown property -> 404", "[http][hardening]") {
+TEST_CASE_METHOD(rest_fixture, "PATCH unknown property -> 404", "[http][hardening]") {
     auto cli = client();
-    auto r = cli.Put("/app/components/c1/properties/does_not_exist", R"({"value": 1})", "application/json");
+    auto r = cli.Patch("/app/components/c1/properties/does_not_exist", R"({"value": 1})", "application/json");
     REQUIRE(r);
     REQUIRE(r->status == 404);
 }

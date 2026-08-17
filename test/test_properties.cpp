@@ -59,7 +59,7 @@ public:
             .on_change([this](const json& d) { m_last_diff = d; });
     }
     auto process() -> retval override { return retval::FINISH; }
-    auto property_change_handler() -> void override { ++m_handler_calls; }
+    auto property_change_handler(const json& /*diff*/) -> void override { ++m_handler_calls; }
 
     double m_gain{1.0};
     std::int32_t m_buf{1024};
@@ -136,14 +136,31 @@ TEST_CASE("property_state and property_schema", "[properties]") {
     REQUIRE(state.contains("channels"));
     REQUIRE(state.contains("net"));
 
+    // property_schema() is ONE JSON Schema 2020-12 document: names are keys under
+    // "properties", composite metadata rides as x-composite-* vendor extensions.
     auto schema = c.property_schema();
-    REQUIRE(schema.is_array());
-    bool found_gain = false;
-    for (const auto& p : schema) {
-        if (p["name"] == "gain") {
-            found_gain = true;
-            REQUIRE(p["configurability"] == "runtime");
-        }
-    }
-    REQUIRE(found_gain);
+    REQUIRE(schema.is_object());
+    REQUIRE(schema["$schema"] == "https://json-schema.org/draft/2020-12/schema");
+    REQUIRE(schema["type"] == "object");
+    REQUIRE(schema["additionalProperties"] == false);
+    // No "required": every property has a default and PATCH is a merge, so a partial
+    // document must validate (see property_set::schema()).
+    REQUIRE(!schema.contains("required"));
+
+    const auto& props = schema.at("properties");
+    REQUIRE(props.contains("gain"));
+    REQUIRE(props["gain"]["x-composite-configurability"] == "runtime");
+    REQUIRE(props["gain"].contains("default"));
+    REQUIRE(!props["gain"].contains("name")); // the name IS the key now
+
+    // the `enabled` lifecycle virtual is advertised alongside the value properties
+    REQUIRE(props.contains("enabled"));
+    REQUIRE(props["enabled"]["type"] == "boolean");
+    REQUIRE(props["enabled"]["x-composite-configurability"] == "runtime");
+
+    // struct properties expose their members as a nested 2020-12 "properties" map,
+    // never the internal "fields" vocabulary.
+    REQUIRE(props.contains("net"));
+    REQUIRE(props["net"].contains("properties"));
+    REQUIRE(!props["net"].contains("fields"));
 }

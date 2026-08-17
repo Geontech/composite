@@ -304,7 +304,13 @@ public:
             others = m_components; // remaining peers (potential producers into / consumers of target)
         }
         // Stop the target so its worker is not sending/receiving during teardown.
-        target->stop();
+        // CONTAINED: a failed stop (wedged worker / staged reaction) must NOT skip the
+        // disconnect loops below. The caller drops the last reference on return, so an
+        // early exit here would destroy the target while peer producers still hold edges
+        // into its input rings — a use-after-free on the very next send. Disconnecting is
+        // what makes the removal safe, so it happens unconditionally; a target that would
+        // not stop is logged by stop_contained() and still fully unwired.
+        target->stop_contained();
         // Disconnect every peer-producer edge feeding the target's inputs. disconnect()
         // parks the producer's worker, so the producer is not mid-send when the target's
         // input releases its producer-claim.
@@ -336,8 +342,10 @@ public:
             std::unique_lock lk{m_mtx};
             removed.swap(m_components);
         }
+        // Best-effort, same policy as stop(): one component failing to stop must not
+        // abandon the cleanup of every component after it in the vector.
         for (auto& component : removed) {
-            component->stop();
+            component->stop_contained();
         }
     }
 
