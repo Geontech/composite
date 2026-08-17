@@ -247,12 +247,26 @@ int main() {
     check(k->m_sum.load() == EXPECTED_SUM, "app restart: values doubled again");
 
     // ---- (3) RUNTIME disable then enable (reconcile stop_locked/start_locked -> pool stop/start) ----
+    //
+    // QUIESCE THE SOURCE across the whole disable window. Disabling `d` calls
+    // pause_input_ports(), which sets its inputs to depth 0 — and a depth-0 input DISCARDS on
+    // send, by design (see port_base.hpp: "A paused input ... discards on send by design").
+    // `s` is a separate component and keeps running, so resetting s->m_sent while `d` is down
+    // makes `s` re-emit the entire run into a paused, drop-all port. Whether any of it survived
+    // depended on how far `s` got before resume_input_ports() — which made this check fail
+    // ~1-3 runs in 10 (verified pre-existing at a8baced, independent of the AF1/AF2 work).
+    // The subject of this case is the POOL restart, not the drop-on-pause behaviour, so remove
+    // the race rather than widening the timeout: hold the source down, reconfigure, bring the
+    // pipeline back, and only then let the source produce again.
+    s->set_properties(properties::json{{"enabled", false}}, properties::config_type::RUNTIME);
     d->set_properties(properties::json{{"enabled", false}}, properties::config_type::RUNTIME);
     check(!d->is_running(), "runtime disable: pipeline not running");
+    check(!s->is_running(), "runtime disable: source quiesced so nothing is produced into a paused input");
     s->m_sent = 0;
     k->m_sum.store(0);
     k->m_packets.store(0);
     d->set_properties(properties::json{{"enabled", true}}, properties::config_type::RUNTIME);
+    s->set_properties(properties::json{{"enabled", true}}, properties::config_type::RUNTIME);
     check(wait_for_packets(k, N, 3s), "runtime re-enable: pool restarted and processed");
     check(k->m_sum.load() == EXPECTED_SUM, "runtime re-enable: values doubled");
     app.stop();
