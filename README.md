@@ -247,7 +247,7 @@ component->set_properties({{"enabled", false}}, composite::properties::config_ty
 component->set_properties({{"enabled", true}}, composite::properties::config_type::RUNTIME);
 ```
 
-> Over the REST API, `PATCH`/`PUT` writes are always RUNTIME-context, so writing `enabled` there
+> Over the REST API, `PATCH` writes are always RUNTIME-context, so writing `enabled` there
 > starts/stops the component immediately.
 
 ### Process Return Values
@@ -611,10 +611,10 @@ stringified.
 
 | Method & path | Description |
 |---|---|
-| `GET /app/components/:id/schema` | JSON Schema of the component's properties (types, defaults, units, ranges, enum choices) — drives auto-generated config UIs. |
+| `GET /app/components/:id/schema` | A single **JSON Schema 2020-12** document for the component's properties. Names are the keys of `properties`; standard keywords (`type`, `default`, `minimum`/`maximum`, `enum`, `description`, nested `properties`/`items`) carry the shape, and composite-specific metadata rides as vendor extensions (`x-composite-unit`, `x-composite-configurability`, `x-composite-powerOfTwo`). `additionalProperties` is `false`; `required` is omitted so a partial `PATCH` body validates. Drives auto-generated config UIs. |
 | `GET /app/components/:id/properties` | Full property state. |
 | `GET /app/components/:id/properties/:name` | One property value. |
-| `PUT` or `PATCH /app/components/:id/properties/:name` | Set/merge one property. Body is the raw JSON value, or `{ "value": ... }`. |
+| `PATCH /app/components/:id/properties/:name` | Merge one property (RFC-7396). Body is the raw JSON value, or `{ "value": ... }`. For a struct property a partial object patches only the named fields. `PUT` is **not** offered: this operation is a merge, and aliasing `PUT` to it would contradict PUT-as-replace. Use `DELETE` then `PATCH` for replace semantics. |
 | `DELETE /app/components/:id/properties/:name` | Reset to the registered default (RFC-7396 `null`). |
 
 To mutate an element of a list/struct/keyed property, `PATCH` the whole property with a partial JSON
@@ -641,7 +641,7 @@ curl -s http://localhost:5000/app/healthz
 curl -s http://localhost:5000/app/components/my_component/properties
 
 # Set one property (raw value, or {"value": ...} — both accepted) — note: native JSON, not strings
-curl -s -X PUT http://localhost:5000/app/components/my_component/properties/threshold \
+curl -s -X PATCH http://localhost:5000/app/components/my_component/properties/threshold \
   -H 'Content-Type: application/json' -d '75.5'
 
 # Reset a property to its default

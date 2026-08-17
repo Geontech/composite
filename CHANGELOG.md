@@ -12,6 +12,30 @@ All notable changes to **composite** are documented here. The project follows
   (`composite::abi_version`, currently **1**), emitted by the `COMPOSITE_REGISTER_*` macros. The loader
   refuses to call `create()` on a library whose ABI version differs from the framework's, so a stale
   `.so` fails cleanly. Rebuild components whenever the ABI version is bumped.
+- **When the ABI version is bumped.** It is **not** a release counter — it changes whenever a
+  component built against an older framework could no longer run correctly against a newer one:
+  1. the `create()` / `create_args` entry-point contract changes;
+  2. the layout **or vtable** of any type a component inherits from or embeds by value changes
+     (`component`, `pipeline_component`, `source_component`, the port and buffer types,
+     `property_set` / `config<T>`, `park_coordinator`). This includes **adding, removing, or
+     reordering any `virtual` — including appending one at the end of a class**: a component's
+     own overrides are addressed by vtable slot index, so appending to a base vtable silently
+     shifts them. It also includes adding, removing, or reordering **any data member**, which
+     changes object size and member offsets;
+  3. the `COMPOSITE_REGISTER_*` macros change what they emit.
+  Only additions that touch neither the vtable nor the object layout — a non-virtual member
+  function, a `static` function, a free function, a new type — are ABI-neutral. When in doubt,
+  bump: a false positive costs a rebuild, a false negative corrupts memory.
+- **RC1 is the first stable ABI-1 baseline.** ABI 1 is *declared* at RC1, not carried forward
+  from the 0.5 pre-releases. Pre-0.5 components do not export `composite_abi_version()` at all
+  and are refused by the loader outright, so the 0.4 → 0.5 migration needs no bump. But 0.5
+  **pre-release** components do export version 1 while predating layout changes made during
+  development (the redesign itself, and the RC1 hardening, which altered both `component`'s
+  vtable and its data members). The loader therefore **cannot** distinguish a pre-RC1 ABI-1
+  component from an RC1 one: **every component built before RC1 must be rebuilt, and that
+  rebuild is not enforceable by the handshake.** From RC1 onward the number is meaningful, and
+  the criteria above govern it. If a pre-RC1 fleet cannot be rebuilt wholesale, bump to 2 at RC1
+  instead and take the clean refusal.
 
 ---
 
@@ -34,7 +58,9 @@ The table below maps the old API to the new one.
 | **Struct properties** | specialize `property_traits<T>` + `ps.add(...)` | reflect with `COMPOSITE_FIELDS`/`COMPOSITE_STRUCT` and register the `config<T>` member via `add_config(cfg)` |
 | **Struct reaction** | parent change listener | `config<T>::on_apply(prev, changes<T>)` (runs at the worker loop-top) + `config<T>::validate(...)` |
 | **List/keyed properties** | `"prop[0]"`, `"prop[]"`, `"prop.field"` index addressing | `keyed_collection` via `add_keyed`, addressed as nested JSON under the property name (RFC-7396 merge; `null` resets/erases) |
-| **`property_change_handler()`** | no-arg virtual | `property_change_handler(const properties::json& diff)`; the no-arg form is **deprecated** |
+| **`property_change_handler()`** | no-arg virtual | `property_change_handler(const properties::json& diff)`; the no-arg form is **removed** — override the diff-taking one (the `diff` argument may simply be ignored) |
+| **Unknown property keys** | tolerated at config load, rejected at runtime | rejected in **both** paths. The application-level `properties` block is still broadcast to every component, but is now filtered per component to the keys that component actually defines — so a global that applies to only some components still works, while a typo in a component's own `properties` block fails the load instead of being silently discarded. A global matching *no* component is logged as a warning |
+| **Failure detail** | `finish_reason` only (`completed`/`error`/`none`) | adds `component::finish_error()` and a `finish_error` field in the component's property state — the `what()` behind a `finish_reason::error`, so a control plane need not scrape the log |
 | **Component factory** | multi-arity `create()` / `create(type)` / `create(id)` hand-written `extern "C"` | single `create(std::string_view id, const create_args&)` + `composite_abi_version()`, emitted by `COMPOSITE_REGISTER_SIMPLE` / `COMPOSITE_REGISTER_COMPONENT` |
 | **`start()` / `stop()` overrides** | overridable (but silently bypassed by the `enabled` reconcile path) | **`final`** — hook `on_worker_start()` / `on_worker_stop()`, which run on every start/stop path; create heap components via `make_component<T>()` (stops-before-destroy deleter) |
 | **Construction args** | scalar `"create_arg": "cf32"` | `"args": { "type": "cf32" }` (the scalar form still works, mapped to `{"type": ...}`) |
@@ -46,6 +72,8 @@ The table below maps the old API to the new one.
 | **Metric naming** | name auto-prefixed with the component id (`my_comp.packets`) | names used verbatim; identity is the auto-added `component_id` **label** |
 | **REST: list/struct mutation** | `/properties/:name/items[/:index]` and `/properties/:name/fields/:field` routes | removed — `PATCH` the whole property with a partial JSON object/array (`null` resets/erases) |
 | **REST: multi-component PATCH** | "atomic with rollback" across the batch | per-component atomic; **not** transactional across components — returns `207 Multi-Status` on partial failure |
+| **`GET /app/components/:id/schema`** | an ARRAY of per-property descriptors, each with a `name` field, in a bespoke vocabulary (`fields`, `choices`, `unit`, `powerOfTwo`) | a single **JSON Schema 2020-12 document**: `$schema` / `type: object` / `additionalProperties: false` / `title` (the component id) / `properties` keyed by property name. Structural keywords are standard (`properties` not `fields`, `enum` not `choices`, nested `properties`/`items`); composite metadata moved to vendor extensions — `unit` → `x-composite-unit`, `configurability` → `x-composite-configurability`, `powerOfTwo` → `x-composite-powerOfTwo`. `required` is deliberately omitted so a partial `PATCH` body validates. **The 0.5 pre-releases advertised 2020-12 export but did not actually publish it — this makes the endpoint match what the docs always claimed.** A client that walked the array looking for `name` must now index `properties` by key |
+| **REST: `PUT` on a single property** | `PUT` and `PATCH` both accepted on `/app/components/:id/properties/:name`, sharing one handler | **`PUT` removed; use `PATCH`** (identical behavior — the shared handler was always a merge). `PUT` was a misnomer: HTTP defines it as replace, but a `PUT` of `{"port": 5000}` onto a `{ip, port, mtu}` struct property merged and left the other fields untouched. Rather than freeze a verb that does not do what it says, it is withdrawn; it may return later as a genuine replace operation. Replace semantics are available today as `DELETE` (reset to default) followed by `PATCH` |
 | **Logging** | `spdlog::logger` exposed in the public API | `composite::logger` facade (spdlog is private); levels via `composite::log_level` |
 
 ### Highlights
@@ -55,6 +83,23 @@ The table below maps the old API to the new one.
   Batch overflow callbacks run once with the aggregate rejected-packet count.
 - **Park-coordinated reconfiguration** — property writes validate-then-commit under a worker park;
   `config<T>` reactions run at the worker loop-top (no torn config/derived-state).
+- **Callback failure contract (frozen for the v0.5 line).** Validation runs *before* the commit, so a
+  `validate()` rejection fails the whole write and nothing is applied. Everything that runs *after*
+  the commit — `config<T>::on_apply`, `property_change_handler`, `typed_property::on_change`, and a
+  port's overflow callback — is **post-commit**, and the framework guarantees:
+  1. **committed values stay committed.** A failing reaction never rolls back a value that is
+     already live, and never turns a successful write into an error response;
+  2. **no user callback unwinds across a framework boundary.** An exception from any of them is
+     caught and reported at the point of failure, never propagated out of a worker thread, a
+     destructor (`~component`, `auto_stop`), or graph teardown (`remove_component`, `clear`) —
+     each of which would otherwise be `std::terminate`;
+  3. **failures are reported, not swallowed.** Reaction and listener failures are logged against
+     the component and property; contained overflow-callback failures are counted in
+     `input_port_base::overflow_callback_errors()`;
+  4. **a failed reaction does not skip its peers.** Each `config<T>` binding's reaction is contained
+     individually, and a contained failure does not re-arm, so it cannot spin.
+  Consequence to note when migrating: an `on_apply` that throws during an INITIALIZE-time config
+  load is now logged and the load continues, where a pre-release 0.5 build propagated it.
 - **Typed, reflected properties** — `config<T>` + `COMPOSITE_FIELDS` with per-field attributes
   (`runtime`, `range`, `unit`, `doc`, `one_of`, `power_of_two`) and JSON-Schema 2020-12 export.
 - **Single component ABI** — one `create(id, create_args)` entry point with an ABI-version handshake.
