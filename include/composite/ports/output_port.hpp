@@ -396,10 +396,10 @@ public:
                 m_immutable_batch_scratch.reserve(bufs.size());
                 for (std::size_t i = 0; i < bufs.size(); ++i) {
                     auto packet_md = (i + 1 == bufs.size()) ? std::move(md) : md;
-                    m_immutable_batch_scratch.emplace_back(std::move(bufs[i]).to_immutable(), ts,
-                                                           std::move(packet_md));
+                    m_immutable_batch_scratch.emplace_back(std::move(bufs[i]).to_immutable(), ts, std::move(packet_md));
                 }
-                ip->add_batch(std::span<typename input_port<immutable_buffer<T>>::queue_type>(m_immutable_batch_scratch));
+                ip->add_batch(
+                    std::span<typename input_port<immutable_buffer<T>>::queue_type>(m_immutable_batch_scratch));
                 m_immutable_batch_scratch.clear(); // release any rejected suffix immediately
             }
             return;
