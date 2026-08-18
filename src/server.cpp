@@ -230,7 +230,7 @@ inline auto rest_catalog() -> const std::vector<route_doc>& {
         {"get", "/app/metrics/stream", "Server-Sent Events metrics stream"},
         {"get", "/app", "Full application graph"},
         {"post", "/app/start", "Start (reconcile to desired-enabled) all components"},
-        {"post", "/app/stop", "Stop all component workers"},
+        {"post", "/app/stop", "Stop all component workers (207 if any did not stop in time)"},
         {"get", "/app/components", "List all components"},
         {"post", "/app/components", "Create and add a component"},
         {"patch", "/app/components", "Multi-component property batch (207 on partial failure)"},
@@ -509,10 +509,37 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
     });
 
     // POST /app/stop - stop every component's worker. Idempotent; the REST server keeps running.
+    //
+    // BOUNDED, deliberately. application::stop() waits as long as it takes, which is right for
+    // shutdown and wrong here: a component whose process() never returns would block this httplib
+    // worker forever and take the control plane down with it. try_stop() signals everything, waits
+    // against one shared deadline, and reports whatever did not stop — nothing is destroyed, so
+    // such a component is left un-torn-down and still registered (see application::try_stop).
+    // Partial success is 207, matching the multi-component PATCH route.
     endpoint = std::format("/{}/stop", APP);
     server->Post(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
-        app.stop();
-        json_ok(res, {{"success", std::format("stopped application '{}'", app.name())}});
+        static constexpr auto k_stop_budget = std::chrono::seconds(10);
+        const auto not_stopped = app.try_stop(k_stop_budget);
+        if (not_stopped.empty()) {
+            json_ok(res, {{"success", std::format("stopped application '{}'", app.name())}});
+            return;
+        }
+        spdlog::warn("POST /app/stop: {} component(s) did not stop within {}s", not_stopped.size(),
+                     k_stop_budget.count());
+        set_cors(res);
+        res.set_content(
+            nlohmann::json{
+                // "not_stopped", not "still running": a component lands here if its worker did not
+                // exit, OR its lifecycle lock was unavailable, OR a property write was still in
+                // flight. What is true of all three is that it was NOT torn down.
+                {"error", std::format("{} component(s) did not stop within {}s; they were not torn "
+                                      "down and are still registered",
+                                      not_stopped.size(), k_stop_budget.count())},
+                {"not_stopped", not_stopped},
+            }
+                .dump(2),
+            "application/json");
+        res.status = 207; // Multi-Status: the app stopped, but not every component did
     });
 
     // GET components

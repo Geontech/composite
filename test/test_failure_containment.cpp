@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-// AF2 failure-containment contract (v0.5 freeze): a user callback must never unwind across
+// Failure-containment contract (frozen for v0.5): a user callback must never unwind across
 // a worker, destructor, or graph-teardown boundary, and a committed property batch stays
 // committed when its reaction fails. Before this suite, a throwing config<T> on_apply
 // escaped the worker loop-top (std::terminate), escaped ~component / ~auto_stop
 // (std::terminate from a destructor), and a failed stop() inside
 // application::remove_component() skipped the disconnect loops that make the removal safe.
 //
-// Also covers AF1: input_port::depth() must not replace the physical ring while a producer
+// Also covers the port layer: input_port::depth() must not replace the physical ring while a producer
 // is connected (an "observed empty" ring is not producer exclusion), and the power-of-two
 // rounding must not spin forever on an out-of-range depth.
 //
@@ -29,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 using namespace composite;
 using composite::properties::config_type;
@@ -53,6 +54,10 @@ static bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
     }
     return pred();
 }
+
+/// How long slow_wake_comp's on_park_requested() blocks, in case (17c). File scope because a
+/// function-local class cannot hold a static data member.
+constexpr auto k_slow_wake_hook = std::chrono::milliseconds(300);
 
 struct boom_cfg {
     int gen{0};
@@ -240,7 +245,7 @@ int main() {
         check(in.stats().packets_dropped() > 0, "the drop itself is still recorded");
     }
 
-    // ---- (7) AF1: depth() must not replace the ring while a producer is connected ----
+    // ---- (7) depth() must not replace the ring while a producer is connected ----
     {
         input_port<immutable_buffer<float>> in{"in", 4};
         output_port<immutable_buffer<float>> out{"out"};
@@ -261,7 +266,7 @@ int main() {
         check(in.available_capacity() == 1024, "an UNCLAIMED, empty input can still grow its ring");
     }
 
-    // ---- (8) AF1: power-of-two rounding saturates instead of spinning forever ----
+    // ---- (8) power-of-two rounding saturates instead of spinning forever ----
     {
         check(detail::round_up_pow2(0) == 1, "round_up_pow2(0) == 1");
         check(detail::round_up_pow2(1) == 1, "round_up_pow2(1) == 1");
@@ -276,7 +281,7 @@ int main() {
               "round_up_pow2(SIZE_MAX) saturates (no hang)");
     }
 
-    // ---- (9) AF7: has_property() is the globals filter's predicate ----
+    // ---- (9) has_property() is the config loader's per-component globals filter ----
     {
         throwing_reaction_comp c{"props"};
         check(c.has_property("gen"), "has_property() sees a config<T> FIELD");
@@ -294,7 +299,7 @@ int main() {
         check(rejected, "an unknown key is REJECTED when allow_unknown=false");
     }
 
-    // ---- (10) AF2-D: finish_error() carries the detail behind finish_reason::error ----
+    // ---- (10) finish_error() carries the detail behind finish_reason::error ----
     {
         class failing_comp : public component {
         public:
@@ -401,7 +406,7 @@ int main() {
         check(!c.is_running(), "the worker is still joined when on_worker_stop() throws");
     }
 
-    // ---- (13) AF3-I: partial admission must not over-count transferred packets ----
+    // ---- (13) partial admission must not over-count transferred packets ----
     {
         input_port<immutable_buffer<float>> in{"in", 2};
         output_port<immutable_buffer<float>> out{"out"};
@@ -462,10 +467,473 @@ int main() {
               "promotion path: transferred + dropped equals packets offered");
     }
 
+    // ---- (14) a slow process() makes stop() REPORT, and the join still completes ----
+    // The join cannot be abandoned (~component is one of stop()'s callers), so the fix for a
+    // wedged process() is diagnosability, not a timeout. Hold process() past the reporting
+    // interval and prove two things: stop() emits a warning naming the component instead of
+    // waiting mutely, and it still joins cleanly once process() lets go.
+    {
+        class slow_stop_comp : public component {
+        public:
+            explicit slow_stop_comp(std::string_view id) : component(id) {}
+            auto process() -> retval override {
+                m_in_process.store(true, std::memory_order_release);
+                // Deliberately ignore the stop token for longer than the 5s report interval.
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                return retval::NOOP;
+            }
+            std::atomic<bool> m_in_process{false};
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        slow_stop_comp c{"slowstop"};
+        c.start();
+        check(wait_until([&] { return c.m_in_process.load(std::memory_order_acquire); }, std::chrono::seconds(2)),
+              "slow-stop worker entered process()");
+
+        // Release process() from another thread AFTER the first report interval has elapsed, so
+        // stop() is forced through at least one reporting cycle.
+        std::thread releaser{[&c] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5500));
+            c.m_release.store(true, std::memory_order_release);
+        }};
+
+        const auto t0 = std::chrono::steady_clock::now();
+        c.stop(); // must wait (loudly), then join
+        const auto waited = std::chrono::steady_clock::now() - t0;
+        releaser.join();
+
+        check(waited >= std::chrono::seconds(5), "stop() waited for the un-cooperative process(), did not abandon it");
+        check(!c.is_running(), "stop() JOINED the worker once process() returned");
+    }
+
+    // ---- (15) try_stop(): bounded, honest about failure, and RETRYABLE ----
+    // The contract that matters: a false return means "still running, do not destroy me", and a
+    // later stop still completes cleanly. Anything less and the bounded path would just relocate
+    // the hang into a destructor.
+    {
+        class held_comp : public component {
+        public:
+            explicit held_comp(std::string_view id) : component(id) {}
+            auto process() -> retval override {
+                m_in_process.store(true, std::memory_order_release);
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return retval::NOOP;
+            }
+            std::atomic<bool> m_in_process{false};
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        // (a) a cooperative component stops well inside the budget
+        {
+            throwing_reaction_comp c{"trystop_ok"};
+            c.start();
+            check(wait_until([&] { return c.m_iters.load(std::memory_order_acquire) > 0; }, std::chrono::seconds(2)),
+                  "try_stop: cooperative worker started");
+            check(c.try_stop(std::chrono::seconds(2)), "try_stop() returned true for a cooperative component");
+            check(!c.is_running(), "try_stop() success means fully stopped");
+            check(c.try_stop(std::chrono::seconds(2)), "try_stop() on an already-stopped component is true");
+        }
+
+        // (b) a wedged component reports false, stays running, and is NOT torn down
+        {
+            held_comp c{"trystop_wedged"};
+            c.start();
+            check(wait_until([&] { return c.m_in_process.load(std::memory_order_acquire); }, std::chrono::seconds(2)),
+                  "try_stop: wedged worker entered process()");
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool stopped = c.try_stop(std::chrono::milliseconds(300));
+            const auto waited = std::chrono::steady_clock::now() - t0;
+
+            check(!stopped, "try_stop() returned FALSE for a component that would not stop");
+            check(waited < std::chrono::seconds(2), "try_stop() respected its budget instead of waiting it out");
+            check(c.is_running(), "a component that did not stop is left RUNNING, not half-torn-down");
+
+            // Retry after the worker is freed: the latched request means it exits, and the
+            // deferred teardown completes.
+            c.m_release.store(true, std::memory_order_release);
+            check(c.try_stop(std::chrono::seconds(5)), "a retry after the worker frees up COMPLETES the stop");
+            check(!c.is_running(), "retry left the component fully stopped");
+        }
+    }
+
+    // ---- (16) application::try_stop(): reports the wedged ids, stops everything else ----
+    {
+        class held_comp2 : public component {
+        public:
+            explicit held_comp2(std::string_view id) : component(id) {}
+            auto process() -> retval override {
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return retval::NOOP;
+            }
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        application app{"trystop_app"};
+        auto wedged = std::make_shared<held_comp2>("wedged");
+        auto fine = std::make_shared<throwing_reaction_comp>("fine");
+        check(app.add_component(wedged), "added the wedged component");
+        check(app.add_component(fine), "added the cooperative component");
+        app.start();
+        check(wait_until([&] { return fine->m_iters.load(std::memory_order_acquire) > 0; }, std::chrono::seconds(2)),
+              "app try_stop: graph running");
+
+        const auto ids = app.try_stop(std::chrono::milliseconds(500));
+        check(ids.size() == 1 && ids.front() == "wedged", "application::try_stop() named exactly the wedged component");
+        check(!fine->is_running(), "the cooperative component still stopped despite the wedged one");
+        check(wedged->is_running(), "the wedged component is left running, not destroyed");
+
+        // Release it so the fixture can tear down without a blocked destructor.
+        wedged->m_release.store(true, std::memory_order_release);
+        check(app.try_stop(std::chrono::seconds(5)).empty(), "a retry stops the whole application");
+    }
+
+    // ---- (17) the try_stop BUDGET is real, not nominal ----
+    // Regression for two ways a "bounded" API can quietly overrun: a contended lifecycle lock
+    // consuming the budget before the attempt starts, and a multi-component signalling pass
+    // charged on top of the deadline rather than against it.
+    {
+        class held_comp3 : public component {
+        public:
+            explicit held_comp3(std::string_view id) : component(id) {}
+            auto process() -> retval override {
+                m_entered.store(true, std::memory_order_release);
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return retval::NOOP;
+            }
+            std::atomic<bool> m_entered{false};
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        // (a) N wedged components must cost ONE budget, not N budgets.
+        {
+            constexpr int k_components = 4;
+            constexpr auto k_budget = std::chrono::milliseconds(400);
+            application app{"budget_app"};
+            std::vector<std::shared_ptr<held_comp3>> comps;
+            for (int i = 0; i < k_components; ++i) {
+                comps.push_back(std::make_shared<held_comp3>("wedge" + std::to_string(i)));
+                check(app.add_component(comps.back()), "budget: component added");
+            }
+            app.start();
+            // Every worker must be INSIDE the blocking process() before we attempt the stop.
+            // The worker loop tests the stop token at its top, so a component signalled before
+            // it first entered process() exits cleanly and is (correctly) not reported wedged.
+            check(wait_until(
+                      [&] {
+                          for (const auto& c : comps) {
+                              if (!c->m_entered.load(std::memory_order_acquire)) {
+                                  return false;
+                              }
+                          }
+                          return true;
+                      },
+                      std::chrono::seconds(3)),
+                  "budget: every worker is inside process() before the stop attempt");
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto ids = app.try_stop(k_budget);
+            const auto waited = std::chrono::steady_clock::now() - t0;
+
+            check(ids.size() == k_components, "budget: every wedged component is reported");
+            // A per-component budget would take k_components * k_budget; a shared deadline takes
+            // roughly one. Allow generous slack for scheduling, but far below the serial cost.
+            check(waited < k_budget * 2, "budget: a SHARED deadline, not one budget per component");
+
+            for (auto& c : comps) {
+                c->m_release.store(true, std::memory_order_release);
+            }
+            check(app.try_stop(std::chrono::seconds(5)).empty(), "budget: retry stops them all");
+        }
+
+        // (b) REAL lifecycle-lock contention: a concurrent stop() holds m_lifecycle_mtx for as
+        //     long as the wedged worker runs, so try_stop() must give up on the LOCK within its
+        //     budget rather than inheriting the other caller's unbounded wait.
+        {
+            auto c = std::make_shared<held_comp3>("lockheld");
+            c->start();
+            check(wait_until([&] { return c->m_entered.load(std::memory_order_acquire); }, std::chrono::seconds(3)),
+                  "budget: worker inside process() before the contention test");
+
+            // This thread parks in the UNBOUNDED stop(), holding m_lifecycle_mtx throughout.
+            std::thread blocker{[c] { c->stop(); }};
+            std::this_thread::sleep_for(std::chrono::milliseconds(200)); // let it take the lock
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = c->try_stop(std::chrono::milliseconds(300));
+            const auto waited = std::chrono::steady_clock::now() - t0;
+
+            check(!ok, "contention: try_stop() reports false when it cannot take the lifecycle lock");
+            check(waited < std::chrono::seconds(2),
+                  "contention: try_stop() bounded its LOCK acquisition instead of inheriting the blocker's wait");
+
+            c->m_release.store(true, std::memory_order_release);
+            blocker.join();
+            check(!c->is_running(), "contention: the blocking stop() completed once the worker returned");
+        }
+
+        // (c) a property write must not slip in behind the drain and race teardown. With the
+        //     admission gate closed for the duration of the stop, a writer arriving mid-teardown
+        //     waits for it to finish rather than running concurrently with on_worker_stop().
+        {
+            class gated_comp : public component {
+            public:
+                explicit gated_comp(std::string_view id) : component(id) {
+                    add_property("knob", m_knob, config_type::RUNTIME);
+                }
+                auto process() -> retval override { return retval::NOOP; }
+                // Teardown POLLS for overlap for its whole duration. Sampling once would almost
+                // never catch a writer, which is how an earlier version of this test passed even
+                // with the admission gate removed.
+                auto on_worker_stop() -> void override {
+                    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+                    while (std::chrono::steady_clock::now() < until) {
+                        if (m_writer_inside.load(std::memory_order_acquire)) {
+                            m_writer_during_teardown.store(true, std::memory_order_release);
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                // Runs INSIDE with_worker_parked (so it is counted in-flight). Holds the flag for
+                // a real interval, giving the poll above something to observe.
+                auto property_change_handler(const json& /*diff*/) -> void override {
+                    m_writer_inside.store(true, std::memory_order_release);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                    m_writer_inside.store(false, std::memory_order_release);
+                }
+                int m_knob{0};
+                std::atomic<bool> m_tearing_down{false};
+                std::atomic<bool> m_writer_inside{false};
+                std::atomic<bool> m_writer_during_teardown{false};
+                component::auto_stop m_auto_stop{*this};
+            };
+
+            gated_comp c{"gated"};
+            c.start();
+            check(wait_until([&] { return c.is_running(); }, std::chrono::seconds(2)), "gate: component running");
+
+            // Fire property writes continuously while the stop tears down.
+            std::atomic<bool> stop_writing{false};
+            std::thread writer{[&c, &stop_writing] {
+                int n = 0;
+                while (!stop_writing.load(std::memory_order_acquire)) {
+                    try {
+                        c.set_properties(json{{"knob", ++n}}, config_type::RUNTIME);
+                    } catch (...) { // NOLINT(bugprone-empty-catch) — racing teardown; failures are fine
+                    }
+                }
+            }};
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50)); // writers in steady state
+            c.stop();
+            stop_writing.store(true, std::memory_order_release);
+            writer.join();
+
+            check(!c.m_writer_during_teardown.load(std::memory_order_acquire),
+                  "gate: no property write was inside the component while on_worker_stop() ran");
+        }
+    }
+
+    // ---- (17c) the SIGNALLING pass is charged against the budget, not added to it ----
+    // application::try_stop() calls each component's on_park_requested() wake hook before it
+    // starts collecting. That hook is user code and can be slow, so taking the deadline after
+    // that loop silently turns a budget of T into a wall-clock cost of (hook time + T). Give
+    // the hook real cost and assert the total stays near the hook time rather than exceeding it
+    // by a whole budget.
+    {
+        class slow_wake_comp : public component {
+        public:
+            explicit slow_wake_comp(std::string_view id) : component(id) {}
+            auto process() -> retval override {
+                m_entered.store(true, std::memory_order_release);
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return retval::NOOP;
+            }
+            auto on_park_requested() -> void override { std::this_thread::sleep_for(k_slow_wake_hook); }
+            std::atomic<bool> m_entered{false};
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        constexpr int k_n = 2;
+        constexpr auto k_budget = std::chrono::milliseconds(400);
+        const auto signalling_cost = k_slow_wake_hook * k_n;
+
+        application app{"wake_budget_app"};
+        std::vector<std::shared_ptr<slow_wake_comp>> comps;
+        for (int i = 0; i < k_n; ++i) {
+            comps.push_back(std::make_shared<slow_wake_comp>("slowwake" + std::to_string(i)));
+            check(app.add_component(comps.back()), "wake budget: component added");
+        }
+        app.start();
+        check(wait_until(
+                  [&] {
+                      for (const auto& c : comps) {
+                          if (!c->m_entered.load(std::memory_order_acquire)) {
+                              return false;
+                          }
+                      }
+                      return true;
+                  },
+                  std::chrono::seconds(3)),
+              "wake budget: workers inside process() before the stop attempt");
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto ids = app.try_stop(k_budget);
+        const auto waited = std::chrono::steady_clock::now() - t0;
+
+        check(ids.size() == k_n, "wake budget: both wedged components reported");
+        // Deadline taken BEFORE signalling: total ~= signalling_cost (budget already spent).
+        // Deadline taken AFTER  signalling: total ~= signalling_cost + k_budget.
+        check(waited < signalling_cost + k_budget / 2,
+              "wake budget: the wake-hook pass is charged AGAINST the budget, not added on top");
+
+        for (auto& c : comps) {
+            c->m_release.store(true, std::memory_order_release);
+        }
+        check(app.try_stop(std::chrono::seconds(5)).empty(), "wake budget: retry stops them all");
+    }
+
+    // ---- (18) admission gate under concurrent writers: many start/stop cycles ----
+    // The narrow interleaving the gate closes (a writer testing admission, then being
+    // closed-and-drained before it registers) cannot be PROVEN absent by a test — the real
+    // argument is structural: the check and the in-flight registration happen under the same
+    // mutex close_admission() takes, so a writer is either counted before the close or parked
+    // behind it. What this case does is hammer the window from several threads across many
+    // stop cycles, which is where TSan can see a teardown racing a writer if the gate ever
+    // regresses. Run it under TSan for that value.
+    {
+        class churn_comp : public component {
+        public:
+            explicit churn_comp(std::string_view id) : component(id) {
+                add_property("knob", m_knob, config_type::RUNTIME);
+            }
+            auto process() -> retval override { return retval::NOOP; }
+            auto on_worker_stop() -> void override {
+                // Touch state a racing writer would also touch, so a regression is a real race
+                // rather than a benign overlap.
+                m_teardowns.fetch_add(1, std::memory_order_acq_rel);
+                m_scratch.assign(64, 'x');
+            }
+            auto property_change_handler(const json& /*diff*/) -> void override {
+                m_scratch.assign(64, 'y');
+                m_writes.fetch_add(1, std::memory_order_acq_rel);
+            }
+            int m_knob{0};
+            std::string m_scratch;
+            std::atomic<int> m_teardowns{0};
+            std::atomic<int> m_writes{0};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        churn_comp c{"churn"};
+        std::atomic<bool> done{false};
+        std::vector<std::thread> writers;
+        for (int w = 0; w < 3; ++w) {
+            writers.emplace_back([&c, &done, w] {
+                int n = 0;
+                while (!done.load(std::memory_order_acquire)) {
+                    try {
+                        c.set_properties(json{{"knob", ++n + w}}, config_type::RUNTIME);
+                    } catch (...) { // NOLINT(bugprone-empty-catch) — racing lifecycle; expected
+                    }
+                }
+            });
+        }
+        for (int cycle = 0; cycle < 25; ++cycle) {
+            c.start();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            c.stop();
+        }
+        done.store(true, std::memory_order_release);
+        for (auto& t : writers) {
+            t.join();
+        }
+        check(c.m_teardowns.load() > 0, "gate churn: teardowns actually ran");
+        check(c.m_writes.load() > 0, "gate churn: property writes actually landed");
+        check(!c.is_running(), "gate churn: component ends stopped");
+    }
+
+    // ---- (19) a stop hook that writes a property must not deadlock behind its own gate ----
+    // stop() closes admission and THEN calls user hooks. Without an owner bypass, a hook that
+    // calls set_properties() classifies the stopping thread as an external writer and parks it
+    // on a gate only that same thread can reopen — a hard deadlock, and one that worked before
+    // the gate existed. Both hooks are exercised: on_park_requested (before the join) and
+    // on_worker_stop (during teardown).
+    {
+        class writing_hooks_comp : public component {
+        public:
+            explicit writing_hooks_comp(std::string_view id) : component(id) {
+                add_property("knob", m_knob, config_type::RUNTIME);
+            }
+            auto process() -> retval override { return retval::NOOP; }
+            auto on_park_requested() -> void override {
+                try {
+                    set_properties(json{{"knob", 1}}, config_type::RUNTIME);
+                    m_wake_write_ok.store(true, std::memory_order_release);
+                } catch (...) { // NOLINT(bugprone-empty-catch) — a rejection is fine; a HANG is not
+                }
+            }
+            auto on_worker_stop() -> void override {
+                try {
+                    set_properties(json{{"knob", 2}}, config_type::RUNTIME);
+                    m_teardown_write_ok.store(true, std::memory_order_release);
+                } catch (...) { // NOLINT(bugprone-empty-catch) — as above
+                }
+            }
+            int m_knob{0};
+            std::atomic<bool> m_wake_write_ok{false};
+            std::atomic<bool> m_teardown_write_ok{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        // Heap-allocated on purpose: if this ever regresses, the stop deadlocks AND so would the
+        // destructor (auto_stop calls the same stop()), hanging the whole suite at scope exit.
+        // On a wedged run we release the pointer and leak it rather than take the suite down.
+        auto owned = std::make_unique<writing_hooks_comp>("hookwriter");
+        auto& c = *owned;
+        c.start();
+        check(wait_until([&] { return c.is_running(); }, std::chrono::seconds(2)), "hook write: component running");
+
+        // If the gate had no owner bypass this call would never return. Bound the whole thing on
+        // another thread so a regression fails the suite instead of hanging CI forever.
+        std::atomic<bool> returned{false};
+        std::thread stopper{[&c, &returned] {
+            c.stop();
+            returned.store(true, std::memory_order_release);
+        }};
+        const bool finished =
+            wait_until([&] { return returned.load(std::memory_order_acquire); }, std::chrono::seconds(10));
+        check(finished, "hook write: stop() returned — a property-writing hook did not deadlock on its own gate");
+        if (finished) {
+            stopper.join();
+        } else {
+            stopper.detach();      // wedged: leak the thread rather than hang the suite on join
+            (void)owned.release(); // and leak the component — its destructor would deadlock too
+        }
+        check(c.m_teardown_write_ok.load(std::memory_order_acquire),
+              "hook write: the on_worker_stop() property write actually completed");
+    }
+
     if (g_fails != 0) {
         std::fprintf(stderr, "%d containment check(s) FAILED\n", g_fails);
         return 1;
     }
-    std::puts("AF1/AF2 FAILURE-CONTAINMENT TESTS PASSED");
+    std::puts("FAILURE-CONTAINMENT TESTS PASSED");
     return 0;
 }

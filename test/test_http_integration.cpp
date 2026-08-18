@@ -400,6 +400,64 @@ TEST_CASE_METHOD(rest_fixture, "OpenAPI spec is well-formed and matches the rout
     REQUIRE(actual == expected);
 }
 
+// The case above proves the OpenAPI document matches a list maintained in THIS TEST. It does
+// not prove either matches what the server actually serves: a route registered in make_server()
+// but missing from rest_catalog() satisfies both and stays invisible, and a catalogued route
+// that was never registered would too. Probe every advertised route against the live server so
+// the catalog cannot advertise something that does not exist.
+//
+// Probing uses a component id that does not exist, so mutating verbs are no-ops. The signal is
+// the response BODY, not the status: every handler of ours answers with JSON (data or
+// {"error": ...}), whereas a path httplib does not know falls through to its default 404 with
+// an EMPTY body. A 404 is therefore only a failure when the body is empty.
+TEST_CASE_METHOD(rest_fixture, "every advertised route is actually registered", "[http]") {
+    auto cli = client();
+    cli.set_read_timeout(5, 0);
+    auto spec = json::parse(cli.Get("/app/openapi.json")->body);
+
+    auto fill = [](std::string p) {
+        for (const auto* tok : {"{id}", "{name}", "{port_name}"}) {
+            const std::string t{tok};
+            for (auto i = p.find(t); i != std::string::npos; i = p.find(t)) {
+                p.replace(i, t.size(), "__probe_absent__");
+            }
+        }
+        return p;
+    };
+
+    int probed = 0;
+    for (auto& [path, methods] : spec["paths"].items()) {
+        // Server-Sent Events: an open-ended stream, so a probe would block rather than answer.
+        // Its registration is covered by the metrics-stream case elsewhere in this file.
+        if (path == "/app/metrics/stream") {
+            continue;
+        }
+        for (auto& [method, op] : methods.items()) {
+            const std::string url = fill(path);
+            INFO("probe: " << method << " " << url);
+            httplib::Result r;
+            if (method == "get") {
+                r = cli.Get(url);
+            } else if (method == "post") {
+                r = cli.Post(url, "{}", "application/json");
+            } else if (method == "patch") {
+                r = cli.Patch(url, "{}", "application/json");
+            } else if (method == "put") {
+                r = cli.Put(url, "{}", "application/json");
+            } else if (method == "delete") {
+                r = cli.Delete(url);
+            } else {
+                FAIL("unhandled method in the OpenAPI document: " << method);
+            }
+            REQUIRE(r);
+            const bool unregistered = (r->status == 404 && r->body.empty());
+            REQUIRE(!unregistered);
+            ++probed;
+        }
+    }
+    REQUIRE(probed > 15); // guard against the loop silently probing nothing
+}
+
 // Route-diff: every GET route the spec advertises must actually be REGISTERED on the server.
 // An unregistered path returns httplib's default 404 with a non-JSON (empty) body; every real
 // handler returns a JSON body (200 or {"error":...}). So "body parses as JSON" == "route exists".

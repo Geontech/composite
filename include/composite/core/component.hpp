@@ -157,6 +157,110 @@ public:
         }
     }
 
+    /**
+     * @brief Ask the worker to exit, without waiting for it to do so. Idempotent.
+     *
+     * **Does not wait for worker exit — but is not guaranteed to be instantaneous.** It takes
+     * the lifecycle lock (untimed) and invokes the on_park_requested() wake hook, which is user
+     * code. The default hook does not block, but a component whose hook is slow makes this slow
+     * too, and that cost lands inside a caller's shutdown budget. It is "does not join the
+     * worker", not "returns immediately".
+     *
+     * Latches the stop request and nudges the worker awake. The component has NOT stopped when
+     * this returns — pair it with try_stop() to collect the result.
+     *
+     * Deliberately PUBLIC, not an implementation detail of application: signal-then-collect is
+     * what makes a shared-deadline shutdown possible, and an embedder orchestrating its own
+     * shutdown ordering (rather than using composite::application) needs the same primitive.
+     * Calling this WITHOUT a following try_stop()/stop() leaves the component stop-requested
+     * but un-torn-down — always pair it.
+     */
+    auto request_stop() -> void {
+        std::scoped_lock life{m_lifecycle_mtx};
+        if (m_thread.has_value()) {
+            request_worker_exit_locked();
+        }
+    }
+
+    /**
+     * @brief Bounded stop, for callers that must not hang.
+     * @return true if the component is stopped (torn down exactly as stop() leaves it);
+     *         false if it is NOT stopped — which covers three distinct outcomes: the lifecycle
+     *         lock was unavailable within the budget, the worker did not exit, or the worker
+     *         exited but a property write was still in flight. The caller's obligation is the
+     *         same in all three (do not destroy it; retry), which is why this is a bool rather
+     *         than a status enum — but do not report a false as "the worker is still running",
+     *         because it may not be.
+     *
+     * **What the budget covers:** acquiring the lifecycle lock, waiting for the worker to
+     * exit, and waiting out any property write still in flight. All three are deadline-driven
+     * against one shared @p timeout.
+     *
+     * **What it CANNOT cover:** the synchronous user hooks it must call — on_park_requested()
+     * on the way in, and (once the worker has exited) on_worker_stop() during teardown. There
+     * is no way to bound a synchronous callback without abandoning it mid-execution, which is
+     * exactly the use-after-free this API exists to avoid. Both are contained and reported, and
+     * the default on_park_requested() does not block; a component that blocks in either is
+     * violating the process()/hook promptness contract and will be named in the log.
+     *
+     * **A false return means: do not destroy this component.** ~component joins the worker and
+     * that join cannot be abandoned, so dropping the last reference to a component that did not
+     * stop trades a bounded wait for an unbounded one in a destructor. Keep it alive and retry,
+     * or report it and leave it running.
+     *
+     * Retrying is safe and complete from every bail-out point: the stop request stays latched,
+     * park state still accurately reflects a live-or-exiting worker, and nothing has been torn
+     * down. A later try_stop()/stop() joins instantly and finishes the teardown; the
+     * resource-reap is exchange-guarded, so it cannot double-run.
+     */
+    template <typename Rep, typename Period>
+    [[nodiscard]] auto try_stop(std::chrono::duration<Rep, Period> timeout) -> bool {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto left = [&deadline] {
+            const auto r = deadline - std::chrono::steady_clock::now();
+            return r > decltype(r)::zero() ? r : decltype(r)::zero();
+        };
+        bool had_worker = false;
+        {
+            // Bound the lock too: a concurrent start/stop holding m_lifecycle_mtx would
+            // otherwise consume the whole budget before this attempt even starts.
+            //
+            // Polled try_lock() rather than a timed_mutex: timed_mutex::try_lock_until against
+            // steady_clock needs libstdc++'s _M_clocklock, which is not available in every
+            // configuration we build (it breaks the TSan build outright). This is a cold path,
+            // so polling costs nothing and keeps m_lifecycle_mtx a plain std::mutex — no change
+            // to component's layout.
+            std::unique_lock<std::mutex> life{m_lifecycle_mtx, std::defer_lock};
+            while (!life.try_lock()) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            had_worker = m_thread.has_value();
+            if (!had_worker) {
+                return true; // already stopped — idempotent, same as stop()
+            }
+            // Same admission gate as stop(): the bounded drain below is only meaningful if no
+            // new writer can slip in behind it and race the teardown.
+            const park_coordinator::admission_gate gate{m_park};
+            request_worker_exit_locked(); // NOTE: runs the user wake hook; see the caveat above
+            if (!wait_until_finished(left())) {
+                return false; // worker did not exit in budget; nothing torn down
+            }
+            // Drain BEFORE the teardown so this wait is inside the budget too. Bailing here is
+            // just as safe and retryable as bailing above: the worker has exited but nothing is
+            // torn down, so a later try_stop()/stop() joins instantly and finishes the job.
+            if (!m_park.drain_in_flight_for(left())) {
+                return false;
+            }
+            finish_stop_locked(); // its own drain is now a no-op
+        }
+        // Outside m_lifecycle_mtx so a lifecycle-touching on_apply cannot self-deadlock.
+        run_reactions_contained();
+        return true;
+    }
+
     /// stop() that cannot unwind, for destructors and best-effort teardown. stop() is not
     /// itself noexcept: stop_locked() and the staged-reaction drain can both fail (a worker
     /// that will not park inside the timeout). Letting that escape ~component or
@@ -172,6 +276,23 @@ public:
         }
     }
 
+    /**
+     * @brief One unit of work. Implemented by every component.
+     *
+     * **Must return promptly.** stop() joins this worker, and that join cannot be abandoned
+     * (the caller may be ~component), so a process() that does not return wedges shutdown --
+     * and, through application::stop(), the whole graph's shutdown with it. The framework's
+     * own idle path is safe: returning NOOP sleeps on a bounded, stop-token-aware wait.
+     *
+     * If you must wait on something the framework does not own (a blocking socket, a device,
+     * an external queue), then either use a bounded wait and return NOOP between attempts, or
+     * override on_park_requested() to interrupt it -- that hook is called on the stop path
+     * precisely so a custom wait can be broken out of. A stop that has to report progress is
+     * a bug in the component, and stop() will name it in the log.
+     *
+     * An exception thrown here is caught, logged, recorded in finish_error(), and ends the
+     * worker with finish_reason::error; it never escapes the worker thread.
+     */
     virtual auto process() -> retval = 0;
 
     /// Called ONCE on the worker thread when the worker loop terminates on its OWN — i.e. process()
@@ -710,9 +831,14 @@ public:
      * `enabled` is a framework spec/status virtual, not a value property: the desired
      * state starts/stops the worker. A RUNTIME `enabled` write reconciles immediately
      * (the write IS start/stop), so this is only needed after an INITIALIZE-context
-     * `enabled` write (config load) or as an explicit reconcile. Retained for
-     * back-compat; unlike the old version it has no change-pending flag, so it cannot
-     * miss a no-op re-enable after a direct stop (the P1.5/6 trap).
+     * `enabled` write (config load) or as an explicit reconcile.
+     *
+     * NOT a compatibility shim, despite sharing a name with the pre-0.5 two-step API:
+     * this IS the INITIALIZE-context reconcile path, and `application::start()` calls it
+     * per component to bring a config-loaded graph up. Unlike the old version it has no
+     * change-pending flag, so it cannot miss a no-op re-enable after a direct stop:
+     * it reconciles against the worker's ACTUAL state, not against a "something
+     * changed" hint that a direct stop() would have left stale.
      */
     auto apply_lifecycle_changes() -> void {
         {
@@ -888,7 +1014,7 @@ protected:
      * Default wakes every input port so a worker blocked in get_data() returns
      * to a park point promptly (instead of stalling until the receive timeout).
      * Components that run their own threads or long inner loops should override
-     * to also nudge those to a park point (and see RC1 in ASSESSMENT.md §11).
+     * to also nudge those to a park point.
      */
     virtual auto on_park_requested() -> void {
         // With non-blocking SPSC input ports the worker is never blocked in
@@ -1261,13 +1387,70 @@ private:
         }
     }
 
+    /// How long either shutdown wait stays quiet before it starts reporting.
+    static constexpr auto k_stop_report_interval = std::chrono::seconds(5);
+
+    /// Wait for the worker to leave thread_func, REPORTING progress instead of waiting mutely.
+    ///
+    /// The join cannot be abandoned: after a timeout the worker would still be running
+    /// against an object stop() is about to tear down (and ~component is one of stop()'s
+    /// callers), so giving up would trade a diagnosable hang for a use-after-free. The
+    /// framework's own idle wait is bounded AND stop-token-aware, so a worker only fails to
+    /// exit when USER code does not return -- process(), or a hook it calls. What this can
+    /// fix is the silence: name the component, say what to look at, and keep saying it.
+    auto await_worker_exit_reporting() -> void {
+        for (int elapsed = 0;; elapsed += static_cast<int>(k_stop_report_interval.count())) {
+            if (wait_until_finished(k_stop_report_interval)) {
+                break; // worker has left thread_func; the join below returns immediately
+            }
+            logger()->warn("{}: worker still running {}s into stop() — process() (or something it "
+                           "calls) is not returning. It must observe the stop token and use bounded "
+                           "waits; override on_park_requested() to interrupt a custom wait.",
+                           m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
+        }
+    }
+
+    /// Wait out any external property write still inside with_worker_parked(), reporting
+    /// rather than spinning mutely. Same reasoning as join_worker_reporting(): the only way
+    /// this does not finish is a user on_apply / property_change_handler that never returns,
+    /// and we cannot proceed to tear down while one is still touching our data.
+    auto drain_park_reporting() -> void {
+        for (int elapsed = 0; !m_park.drain_in_flight_for(k_stop_report_interval);
+             elapsed += static_cast<int>(k_stop_report_interval.count())) {
+            logger()->warn("{}: a property write has been in flight {}s into stop() — a config "
+                           "on_apply or property_change_handler is not returning.",
+                           m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
+        }
+    }
+
     auto stop_locked() -> void {
         if (!m_thread.has_value()) {
             return;
         } // idempotent
 
-        if (m_thread->get_stop_source().stop_possible()) {
-            m_thread->request_stop();
+        // Close the door on new external property writes for the whole teardown: draining
+        // in-flight writers only means something if no further writer can arrive behind the
+        // drain. RAII so a throw cannot leave the door shut (which would hang every later write).
+        const park_coordinator::admission_gate gate{m_park};
+        request_worker_exit_locked();
+        await_worker_exit_reporting();
+        finish_stop_locked();
+    }
+
+    /// Phase 1 of a stop: latch the exit request and nudge the worker. NON-BLOCKING.
+    /// Idempotent — the stop request is a latch, so re-requesting is a no-op.
+    auto request_worker_exit_locked() -> void {
+        auto source = m_thread->get_stop_source();
+        if (source.stop_possible()) {
+            if (source.stop_requested()) {
+                // Already latched AND nudged by an earlier call (e.g. request_stop() followed by
+                // try_stop()). The nudge only has to land once — the request is a latch, and the
+                // worker's idle wait is stop-token-aware — while on_park_requested() is USER code
+                // that may be slow. Paying for it twice would charge a signal-then-collect
+                // shutdown double the hook cost.
+                return;
+            }
+            source.request_stop();
         }
         m_park.cancel_waiters(); // release a writer blocked waiting to park
         // Best-effort wake for a worker blocked in a custom wait. This is a USER hook sitting
@@ -1283,7 +1466,14 @@ private:
         } catch (...) {
             log_contained_failure("on_park_requested() failed during stop", "unknown exception");
         }
-        m_thread.reset();        // the single join site — ALWAYS reached
+    }
+
+    /// Phase 2 of a stop: the worker HAS exited — finish the teardown. Never call this while
+    /// the worker may still be running: settle_stopped() would publish NO_WORKER against a
+    /// live worker (letting inline writers race it), and worker_resources_down() would tear
+    /// down resources it is still using.
+    auto finish_stop_locked() -> void {
+        m_thread.reset();        // the single join site; the worker has exited, so this returns at once
         m_park.settle_stopped(); // park state -> NO_WORKER
         // Ensure no EXTERNAL park call is still touching us before teardown. Skip the
         // wait when this stop() is REENTRANT from inside our own with_worker_parked (m_park_owner ==
@@ -1292,7 +1482,7 @@ private:
         // excluded (blocked before touching our data), and waiting here would spin forever on our
         // OWN in-flight guard. Non-reentrant stops drain normally.
         if (!m_park.owned_by_current_thread()) {
-            m_park.drain_in_flight();
+            drain_park_reporting();
         }
 
         // Tear down subclass worker resources (e.g. pipeline_component's pool) AFTER the main worker

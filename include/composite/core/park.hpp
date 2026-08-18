@@ -41,7 +41,9 @@ namespace composite {
  *   PARKED    --writer resume--> RESUMING --worker consume--> RUNNING
  *   any       --worker exit--> EXITING (terminal until next worker_started)
  *
- * See ASSESSMENT.md §11 for the full rationale and the H1–H11 fixes folded in.
+ * The state machine above is the whole contract: every rule the rest of this class
+ * enforces (bounded park timeout, RAII resume, inline-writer gating, in-flight drain)
+ * exists to keep a writer and a worker from observing different sides of a swap.
  */
 class park_coordinator {
 public:
@@ -85,6 +87,10 @@ public:
         ~exit_guard() {
             std::scoped_lock lk{c.m_run_mtx};
             c.m_park.store(state::EXITING, std::memory_order_release);
+            // Forget which thread was the worker. The OS reuses thread ids, so a stale value
+            // would let an unrelated thread be mistaken for the worker later and take a bypass
+            // it has no right to (notably the admission gate's).
+            c.m_worker_id.store(std::thread::id{}, std::memory_order_release);
             c.m_run_cv.notify_all();
         }
     };
@@ -198,7 +204,46 @@ public:
     template <typename Fn>
     auto with_worker_parked(Fn&& fn) -> void {
         const auto self = std::this_thread::get_id();
-        in_flight_guard flight{*this};
+        // ADMISSION GATE. Draining in-flight writers is not enough on its own: the count
+        // reaching zero says nothing about the NEXT writer, which can enter immediately after
+        // and race a teardown that has already decided it is alone (worker_resources_down()
+        // runs the user's on_worker_stop() while such a writer holds the data lock). A stopping
+        // thread closes admission FIRST, then drains, so "drained" actually means "and no more
+        // are coming".
+        //
+        // The admission check and the in-flight REGISTRATION must be one atomic step. Testing
+        // the flag and then incrementing leaves a window in which close_admission() + a drain
+        // can both complete between the two — the writer would be uncounted, unblocked, and
+        // running straight into the teardown. Doing both under m_admit_mtx (which
+        // close_admission() also takes) leaves only two possibilities for every external writer:
+        // it is counted BEFORE the close, so the drain waits for it; or it arrives after and
+        // parks on the CV until teardown re-opens the door.
+        //
+        // Reentrant (park-owner) and worker-originated calls bypass the gate deliberately: they
+        // are already inside the machinery being torn down, so making them queue behind it would
+        // deadlock the very thread that has to make progress.
+        // Three bypasses, each for a thread that would otherwise deadlock behind a gate it is
+        // itself inside of:
+        //  - the park owner (a reentrant write from within a parked section);
+        //  - the LIVE worker (its own self-write). Pair the id with the park state: m_worker_id
+        //    is cleared on exit, but the state check means a recycled thread id can never be
+        //    mistaken for the worker even for an instant;
+        //  - the thread that CLOSED the gate. stop() closes admission and then calls user hooks
+        //    (on_park_requested, on_worker_stop); if one of those writes a property, the stopping
+        //    thread would otherwise wait forever for a gate only it can reopen.
+        const auto park_state = m_park.load(std::memory_order_acquire);
+        const bool is_live_worker = m_worker_id.load(std::memory_order_acquire) == self &&
+                                    park_state != state::NO_WORKER && park_state != state::EXITING;
+        const bool external = m_park_owner.load(std::memory_order_acquire) != self && !is_live_worker &&
+                              m_admission_owner.load(std::memory_order_acquire) != self;
+        if (external) {
+            std::unique_lock admit_lk{m_admit_mtx};
+            m_admit_cv.wait(admit_lk, [this] { return !m_admission_closed.load(std::memory_order_acquire); });
+            m_park_calls_in_flight.fetch_add(1, std::memory_order_acq_rel); // counted under the gate
+        } else {
+            m_park_calls_in_flight.fetch_add(1, std::memory_order_acq_rel);
+        }
+        const in_flight_guard flight{*this, in_flight_guard::adopt};
 
         // Reentrancy: already the park owner on this thread — the worker is
         // parked and this thread already holds m_data_mtx. Just run fn.
@@ -336,9 +381,74 @@ public:
     /// lock. Once the worker is gone (state NO_WORKER), in-flight calls take the
     /// quick inline path and drain promptly.
     auto drain_in_flight() -> void {
-        while (m_park_calls_in_flight.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
+        while (!drain_in_flight_for(std::chrono::hours(24))) {
         }
+    }
+
+    /// Close the door on NEW external property writes, so a subsequent drain means "no writer is
+    /// inside, and none can arrive". Reentrant and worker-originated calls still pass (see
+    /// with_worker_parked). Idempotent. ALWAYS pair with open_admission() via RAII — leaving it
+    /// closed would hang every later property write on this component.
+    auto close_admission() -> void {
+        const auto self = std::this_thread::get_id();
+        std::scoped_lock lk{m_admit_mtx};
+        ++m_admission_depth; // depth-counted: a nested close must not re-open on the inner exit
+        m_admission_owner.store(self, std::memory_order_release);
+        m_admission_closed.store(true, std::memory_order_release);
+    }
+
+    /// Re-open admission and release anyone queued behind it.
+    auto open_admission() -> void {
+        {
+            std::scoped_lock lk{m_admit_mtx};
+            if (m_admission_depth > 0 && --m_admission_depth > 0) {
+                return; // an outer close is still in effect
+            }
+            m_admission_owner.store(std::thread::id{}, std::memory_order_release);
+            m_admission_closed.store(false, std::memory_order_release);
+        }
+        m_admit_cv.notify_all();
+    }
+
+    /// RAII closer: guarantees admission re-opens even if teardown throws.
+    class admission_gate {
+    public:
+        explicit admission_gate(park_coordinator& park) : m_park(&park) { m_park->close_admission(); }
+        admission_gate(const admission_gate&) = delete;
+        auto operator=(const admission_gate&) -> admission_gate& = delete;
+        admission_gate(admission_gate&&) = delete;
+        auto operator=(admission_gate&&) -> admission_gate& = delete;
+        ~admission_gate() { m_park->open_admission(); }
+
+    private:
+        park_coordinator* m_park;
+    };
+
+    /// Bounded drain_in_flight(): waits up to @p timeout for the in-flight count to reach 0.
+    /// @return true if it drained, false if @p timeout elapsed first.
+    ///
+    /// An in-flight call is only long-lived if the USER code inside it (a config on_apply
+    /// reaction, a property_change_handler) is slow or wedged, so an unbounded wait here can
+    /// in principle never finish. Callers bound it and REPORT rather than waiting mutely --
+    /// see component::stop_locked().
+    ///
+    /// Backs off to a sleep after a short spin: the common case drains within a few yields,
+    /// but a wedged shutdown would otherwise peg a core for as long as the process lives.
+    [[nodiscard]] auto drain_in_flight_for(std::chrono::nanoseconds timeout) -> bool {
+        constexpr int k_spins_before_sleep = 64;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        int spins = 0;
+        while (m_park_calls_in_flight.load(std::memory_order_acquire) != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            if (++spins < k_spins_before_sleep) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        return true;
     }
 
     [[nodiscard]] auto current_state() const -> state { return m_park.load(std::memory_order_acquire); }
@@ -391,11 +501,24 @@ private:
         }
     };
 
+    std::atomic<bool> m_admission_closed{false};      ///< teardown in progress: hold new external writers
+    std::atomic<std::thread::id> m_admission_owner{}; ///< thread that closed it (bypasses its own gate)
+    int m_admission_depth{0};                         ///< nesting count; guarded by m_admit_mtx
+    std::mutex m_admit_mtx;                           ///< guards the admission flag + its CV
+    std::condition_variable m_admit_cv;               ///< released by open_admission()
+
     struct in_flight_guard {
+        /// Tag: the caller has ALREADY incremented the in-flight count (it had to, to make the
+        /// admission check and the registration atomic — see with_worker_parked). The guard then
+        /// owns only the matching decrement.
+        struct adopt_t {};
+        static constexpr adopt_t adopt{};
+
         park_coordinator& c;
         explicit in_flight_guard(park_coordinator& c) : c(c) {
             c.m_park_calls_in_flight.fetch_add(1, std::memory_order_acq_rel);
         }
+        in_flight_guard(park_coordinator& c, adopt_t) : c(c) {}
         in_flight_guard(const in_flight_guard&) = delete;
         in_flight_guard& operator=(const in_flight_guard&) = delete;
         ~in_flight_guard() { c.m_park_calls_in_flight.fetch_sub(1, std::memory_order_acq_rel); }
