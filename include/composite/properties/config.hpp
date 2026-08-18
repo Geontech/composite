@@ -34,7 +34,7 @@
  * config<T> is a thin facade over ONE typed_property<T> (the existing candidate ->
  * validate -> swap -> diff engine, which already handles reflected T); config_binding
  * wraps it as a property_base and adds per-field configurability + the field-name
- * projection. See PLAN.md M3 Phase 1.
+ * projection.
  */
 namespace composite {
 

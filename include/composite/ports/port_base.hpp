@@ -158,7 +158,7 @@ public:
     }
 
     /**
-     * @brief Wire this input to its owning component's worker doorbell (M4).
+     * @brief Wire this input to its owning component's worker doorbell.
      * @param doorbell The owning component's park_coordinator (or nullptr to detach).
      *
      * Once set, a producer's add_data() can wake the (sleeping) consumer worker on the
@@ -169,7 +169,7 @@ public:
     auto set_doorbell(park_coordinator* doorbell) -> void { m_doorbell = doorbell; }
 
     /**
-     * @brief Wire this input to its PRODUCER's worker for backpressure wake (M4 reverse
+     * @brief Wire this input to its PRODUCER's worker for backpressure wake (the reverse
      * doorbell). @param doorbell The producing component's park_coordinator (or nullptr).
      *
      * Once set, this input's pop() wakes the (sleeping, AWAIT_OUTPUT) producer worker on the

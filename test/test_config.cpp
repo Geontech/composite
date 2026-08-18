@@ -89,7 +89,7 @@ int main() {
         const json d = b.commit();
         check(c->gain == 2.5, "value swapped synchronously at commit (read-your-writes)");
         b.notify(d);
-        check(fires == 0, "B2: notify STAGES the reaction, does not run it");
+        check(fires == 0, "notify STAGES the reaction, does not run it");
         b.run_pending(); // worker loop-top (or inline) drains + runs it
         check(fires == 1, "reaction runs on drain");
         check(gain_ch && !taps_ch, "changes<T> scoped: only gain changed");

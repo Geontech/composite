@@ -106,7 +106,7 @@ public:
     /// live-resize primitive: growing the ring of an input whose producer was disconnected
     /// by a RAW port-level disconnect (rather than the component-level managed disconnect,
     /// which parks the producer's worker first) is still the caller's responsibility to
-    /// sequence. v0.5 does not support live physical resizing — see the release plan, AF1-D.
+    /// sequence. v0.5 does not support live physical resizing at all.
     auto depth(std::size_t value) -> void override {
         const std::size_t want = detail::round_up_pow2(value == 0 ? 1 : value);
         {

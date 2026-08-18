@@ -43,7 +43,7 @@ public:
         }
         return std::move(out).to_immutable();
     }
-    // Count pool teardowns so a test can prove the pool is reaped on SELF-finish (§2.2), not only on
+    // Count pool teardowns so a test can prove the pool is reaped on SELF-finish on self-finish, not only on
     // an explicit stop(). Delegates to the real teardown.
     auto on_worker_stop() -> void override {
         pipeline_component::on_worker_stop();
@@ -54,7 +54,7 @@ public:
 };
 
 // Identity pipeline whose finalize() DROPS every other packet (submission order). Exercises the
-// finalize()-drop path UNDER downstream backpressure (fix round 4 #1): a dropped head must retire
+// finalize()-drop path UNDER downstream backpressure: a dropped head must retire
 // immediately without waiting for output room it never needs, so drops never stall the pipeline.
 class drop_alt_pipeline : public pipeline_component<ibuf, ibuf> {
 public:
@@ -74,7 +74,7 @@ public:
 
 // finalize() THROWS on one packet. With error_restart_max>0, a non-latched throwing finalize() would
 // be replayed on restart; the round-5 latch (set even on throw) + local catch means finalize() runs
-// exactly once per packet and the throwing packet is dropped (not an error exit). [fix round 5]
+// exactly once per packet and the throwing packet is dropped (not an error exit).
 class throw_finalize_pipeline : public pipeline_component<ibuf, ibuf> {
 public:
     explicit throw_finalize_pipeline(std::string_view id) : pipeline_component(id, "in", "out", 1) {}
@@ -254,7 +254,8 @@ int main() {
     // `s` is a separate component and keeps running, so resetting s->m_sent while `d` is down
     // makes `s` re-emit the entire run into a paused, drop-all port. Whether any of it survived
     // depended on how far `s` got before resume_input_ports() — which made this check fail
-    // ~1-3 runs in 10 (verified pre-existing at a8baced, independent of the AF1/AF2 work).
+    // ~1-3 runs in 10, and predates the containment/ports work (verified by stressing
+    // the same case on an unmodified checkout).
     // The subject of this case is the POOL restart, not the drop-on-pause behaviour, so remove
     // the race rather than widening the timeout: hold the source down, reconfigure, bring the
     // pipeline back, and only then let the source produce again.
@@ -271,7 +272,7 @@ int main() {
     check(k->m_sum.load() == EXPECTED_SUM, "runtime re-enable: values doubled");
     app.stop();
 
-    // ---- (4) SELF-COMPLETION through a pipeline_component (lifecycle-followup §2.1 + §2.2) ----
+    // ---- (4) SELF-COMPLETION through a pipeline_component, and pool reap on self-finish ----
     {
         application app2{"pipe2"};
         auto fs = std::make_shared<finishing_src>("fs", N);
@@ -284,21 +285,23 @@ int main() {
         check(d2->connect("out", k2, "in"), "self-complete: connect d2->k2");
         app2.start();
         // The WHOLE graph must self-finish: source FINISH -> EOS -> doubler drains + inputs_at_end ->
-        // FINISH -> EOS -> sink at_end -> FINISH. Before §2.1 the doubler never returned FINISH, so
+        // FINISH -> EOS -> sink at_end -> FINISH. Before self-completion the doubler never returned FINISH, so
         // this bounded wait timed out (the pipeline stage hung forever).
-        check(app2.wait_until_finished(30s), "§2.1: whole pipeline self-finished (bounded wait true)");
-        check(d2->is_finished(), "§2.1: pipeline_component reports finished");
-        check(d2->finished_reason() == finish_reason::completed, "§2.1: pipeline finished == completed");
-        check(k2->m_packets.load() == N, "§2.1: sink received every packet (nothing dropped)");
-        check(k2->m_sum.load() == EXPECTED_SUM, "§2.1: values were doubled end to end");
-        // §2.2: the pool was reaped ON SELF-FINISH, before any explicit stop().
-        check(d2->m_stops.load() >= 1, "§2.2: pool reaped (on_worker_stop) on self-finish, no explicit stop");
+        check(app2.wait_until_finished(30s), "self-completion: whole pipeline self-finished (bounded wait true)");
+        check(d2->is_finished(), "self-completion: pipeline_component reports finished");
+        check(d2->finished_reason() == finish_reason::completed, "self-completion: pipeline finished == completed");
+        check(k2->m_packets.load() == N, "self-completion: sink received every packet (nothing dropped)");
+        check(k2->m_sum.load() == EXPECTED_SUM, "self-completion: values were doubled end to end");
+        // The pool was reaped ON SELF-FINISH, before any explicit stop().
+        check(d2->m_stops.load() >= 1,
+              "self-finish reap: pool reaped (on_worker_stop) on self-finish, no explicit stop");
         const int stops_at_finish = d2->m_stops.load();
         app2.stop(); // idempotent: guard must prevent a SECOND pool teardown
-        check(d2->m_stops.load() == stops_at_finish, "§2.2: explicit stop after self-finish does NOT double-reap");
+        check(d2->m_stops.load() == stops_at_finish,
+              "self-finish reap: explicit stop after self-finish does NOT double-reap");
     }
 
-    // ---- (5) NO DROP under downstream backpressure (fix round 3 #2) ----
+    // ---- (5) NO DROP under downstream backpressure ----
     {
         application app3{"pipe3"};
         auto fs = std::make_shared<finishing_src>("fs", N);
@@ -314,15 +317,16 @@ int main() {
         check(app3.wait_until_finished(30s), "backpressure: pipeline graph finished");
         // The pipeline paces its OUTPUT (retire_ready -> AWAIT_OUTPUT on a full ring), so EVERY doubled
         // packet reaches the slow sink. Before the fix, retire_ready() sent unconditionally, dropped on
-        // the full ring, and §2.1 FINISH still reported completed having swallowed most of the stream.
+        // the full ring, and the self-completion FINISH still reported completed having swallowed
+        // most of the stream.
         check(k3->m_packets.load() == N,
-              "§2 (round3): slow sink received ALL packets — pipeline paced, nothing dropped");
-        check(k3->m_sum.load() == EXPECTED_SUM, "§2 (round3): all values doubled + delivered under backpressure");
+              "backpressure: slow sink received ALL packets — pipeline paced, nothing dropped");
+        check(k3->m_sum.load() == EXPECTED_SUM, "backpressure: all values doubled + delivered under backpressure");
         check(d3->finished_reason() == finish_reason::completed,
-              "§2 (round3): pipeline completed (only after output flushed)");
+              "backpressure: pipeline completed (only after output flushed)");
     }
 
-    // ---- (6) a genuine zero-length packet is submitted to work(), not dropped at ingest (round 3 #5) ----
+    // ---- (6) a genuine zero-length packet is submitted to work(), not dropped at ingest ----
     {
         application app4{"pipe4"};
         constexpr int DATA = 5;
@@ -338,10 +342,11 @@ int main() {
         check(app4.wait_until_finished(30s), "zero-len: graph finished");
         // work() must have run for all DATA packets PLUS the zero-length one — try_get() distinguishes
         // a real size-0 packet from an empty ring, so it is submitted rather than dropped at ingest.
-        check(d4->m_work_calls.load() == DATA + 1, "§5 (round3): zero-length packet submitted to work(), not dropped");
+        check(d4->m_work_calls.load() == DATA + 1,
+              "zero-length packet: zero-length packet submitted to work(), not dropped");
     }
 
-    // ---- (7) finalize()-DROP path under backpressure does not stall (fix round 4 #1) ----
+    // ---- (7) finalize()-DROP path under backpressure does not stall ----
     {
         application app5{"pipe5"};
         auto fs = std::make_shared<finishing_src>("fs", N);
@@ -356,13 +361,13 @@ int main() {
         app5.start();
         // A dropped head needs no output slot; if it were gated on output room (the round-3 bug) it
         // would stall behind the full sink. It must retire immediately so the pipeline completes.
-        check(app5.wait_until_finished(30s), "§1 (round4): finalize-drop pipeline finished (drops didn't stall)");
-        check(dp->finished_reason() == finish_reason::completed, "§1 (round4): drop pipeline completed");
+        check(app5.wait_until_finished(30s), "finalize-drop: finalize-drop pipeline finished (drops didn't stall)");
+        check(dp->finished_reason() == finish_reason::completed, "finalize-drop: drop pipeline completed");
         // Kept = the even-indexed of N submissions = ceil(N/2); dropped packets never reach the sink.
-        check(k5->m_packets.load() == (N + 1) / 2, "§1 (round4): sink got exactly the KEPT packets, no more/less");
+        check(k5->m_packets.load() == (N + 1) / 2, "finalize-drop: sink got exactly the KEPT packets, no more/less");
     }
 
-    // ---- (8) a paused (depth-0) downstream does NOT hang the pipeline (fix round 4 #2) ----
+    // ---- (8) a paused (depth-0) downstream does NOT hang the pipeline ----
     {
         application app6{"pipe6"};
         auto fs = std::make_shared<finishing_src>("fs", N);
@@ -377,12 +382,12 @@ int main() {
         app6.start();
         // producer_can_send() treats a depth-0 port as sendable (drops), so the pipeline sends-and-drops
         // to the paused sink, drains its input, and self-finishes. Before the fix it blocked forever.
-        check(d6->wait_until_finished(30s), "§2 (round4): pipeline with a paused (depth-0) sink still self-finishes");
+        check(d6->wait_until_finished(30s), "paused sink: pipeline with a paused (depth-0) sink still self-finishes");
         check(d6->finished_reason() == finish_reason::completed,
-              "§2 (round4): pipeline completed (paused sink didn't wedge it)");
+              "paused sink: pipeline completed (paused sink didn't wedge it)");
     }
 
-    // ---- (9) a throwing finalize() is caught+dropped, NOT replayed under error-restart (fix round 5) ----
+    // ---- (9) a throwing finalize() is caught+dropped, NOT replayed under error-restart ----
     {
         application app7{"pipe7"};
         constexpr int M = 8;
@@ -398,12 +403,13 @@ int main() {
         check(fs->connect("out", tp, "in"), "finalize-throw: connect fs->tp");
         check(tp->connect("out", k7, "in"), "finalize-throw: connect tp->k7");
         app7.start();
-        check(app7.wait_until_finished(30s), "§round5: finalize-throw pipeline finished");
+        check(app7.wait_until_finished(30s), "finalize-throw: finalize-throw pipeline finished");
         check(tp->finished_reason() == finish_reason::completed,
-              "§round5: completed (finalize-throw caught+dropped, not an error exit)");
+              "finalize-throw: completed (finalize-throw caught+dropped, not an error exit)");
         check(tp->m_fin_calls.load() == M,
-              "§round5: finalize() ran EXACTLY once per packet (throwing packet not replayed)");
-        check(k7->m_packets.load() == M - 1, "§round5: the throwing packet was dropped; the other M-1 delivered");
+              "finalize-throw: finalize() ran EXACTLY once per packet (throwing packet not replayed)");
+        check(k7->m_packets.load() == M - 1,
+              "finalize-throw: the throwing packet was dropped; the other M-1 delivered");
     }
 
     if (g_failures) {

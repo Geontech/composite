@@ -87,7 +87,7 @@ public:
     component::auto_stop m_auto_stop{*this};
 };
 
-// Models pipeline_component's real failure mode (§1): on_worker_start() spawns pool threads then
+// Models pipeline_component's real failure mode: on_worker_start() spawns pool threads then
 // throws PARTWAY (a std::thread ctor hitting resource exhaustion). Without the fix the throw skips
 // on_worker_stop(), so (a) the already-spawned threads leak and (b) a RETRY's m_pool.clear() destroys
 // still-joinable threads -> std::terminate. With the fix the throw path reaps the partial pool, so a
@@ -248,7 +248,7 @@ int main() {
         check(c->wait_until_finished(2s), "onstart-throw: wait_until_finished returns immediately (no hang)");
     }
 
-    // ---- REGRESSION (§1): a throwing on_worker_start() reaps its PARTIAL resources; retry is safe ----
+    // ---- REGRESSION: a throwing on_worker_start() reaps its PARTIAL resources; retry is safe ----
     {
         auto c = std::make_shared<pool_bad_start>("poolbadstart");
         bool threw = false;
@@ -257,11 +257,14 @@ int main() {
         } catch (...) {
             threw = true;
         }
-        check(threw, "§1: first start() propagated the on_worker_start throw");
-        check(c->m_stops.load() == 1, "§1: on_worker_stop ran on the throw (partial pool reaped, not leaked)");
-        check(!c->is_running(), "§1: not running after the failed start");
-        check(c->finished_reason() == finish_reason::error, "§1: failed start reported as error (not 'none')");
-        check(c->wait_until_finished(2s), "§1: wait_until_finished returns (m_worker_done not stranded)");
+        check(threw, "partial-start reap: first start() propagated the on_worker_start throw");
+        check(c->m_stops.load() == 1,
+              "partial-start reap: on_worker_stop ran on the throw (partial pool reaped, not leaked)");
+        check(!c->is_running(), "partial-start reap: not running after the failed start");
+        check(c->finished_reason() == finish_reason::error,
+              "partial-start reap: failed start reported as error (not 'none')");
+        check(c->wait_until_finished(2s),
+              "partial-start reap: wait_until_finished returns (m_worker_done not stranded)");
         // RETRY: with the leak, on_worker_start()'s m_pool.clear() would std::terminate on a joinable
         // prior pool. With the reap the vector is empty, so the (now succeeding) retry runs cleanly.
         c->m_fail.store(false, std::memory_order_release);
@@ -271,16 +274,17 @@ int main() {
         } catch (...) {
             threw2 = true;
         }
-        check(!threw2, "§1: retry after a failed start did NOT throw / std::terminate");
+        check(!threw2, "partial-start reap: retry after a failed start did NOT throw / std::terminate");
         // is_running() becomes true once the worker registers with the park — NOT synchronous with
         // start() returning (the window is wide under a sanitizer's slower thread startup), so poll
         // like the other cases in this file rather than asserting immediately.
         for (int i = 0; i < 500 && !c->is_running(); ++i) {
             std::this_thread::sleep_for(1ms);
         }
-        check(c->is_running(), "§1: retry started the worker");
+        check(c->is_running(), "partial-start reap: retry started the worker");
         c->stop();
-        check(c->m_stops.load() == 2, "§1: on_worker_stop ran exactly once per start (throw + stop), no double/zero");
+        check(c->m_stops.load() == 2,
+              "partial-start reap: on_worker_stop ran exactly once per start (throw + stop), no double/zero");
     }
 
     if (g_failures) {

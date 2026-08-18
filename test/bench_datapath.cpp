@@ -1,5 +1,5 @@
 // Standalone data-path benchmark (Perf-0) — the baseline that drives the
-// performance leg (ASSESSMENT §4.C / §6). Measures the costs the redesign targets:
+// performance leg. Measures the costs the redesign targets:
 //   (1) per-packet buffer allocation (make_mutable / make_immutable heap path)
 //   (2) cross-thread 1:1 and 1:N port hand-off throughput (the mutex+CV+deque
 //       queue the lock-free SPSC ring is meant to replace)
