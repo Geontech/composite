@@ -86,6 +86,13 @@ foreach(t
   composite_standalone_test(${t})
 endforeach()
 
+# OTLP instrument grouping. Only meaningful when the OTel bridge is compiled in, so it is
+# conditional — but it IS a ctest when enabled, because the bug it guards against (N components
+# collapsing into one exported series) is invisible without asserting on the series count.
+if(COMPOSITE_USE_OPENTELEMETRY)
+  composite_standalone_test(test_telemetry_grouping)
+endif()
+
 # Data-path benchmark (Perf-0): built so it cannot rot, but NOT registered as a
 # ctest (it is a timing harness, not pass/fail). Run from a scheduled,
 # non-gating CI job; the table output makes before/after diffs obvious.

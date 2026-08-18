@@ -98,11 +98,42 @@ struct bucket_context : callback_context_base {
  * to ensure the callback isn't invoked with a dangling pointer.
  * C++ destroys members in reverse order of declaration.
  */
-struct instrument_entry {
-    std::unique_ptr<callback_context_base> context;                                  // Destroyed last
-    opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument; // Destroyed first
-    std::string metric_name;                                                         // Native metric name for lookup
-    metrics::labels_t metric_labels; // Labels for distinguishing metrics with same name
+/// Which series an instrument carries. A histogram is exported as several Prometheus-style
+/// instruments, each of which groups independently.
+enum class instrument_role : std::uint8_t { value, hist_count, hist_sum, hist_bucket };
+
+/// One exported time series: a native metric plus the attributes that identify it.
+struct series_entry {
+    void* metric{nullptr};                                       ///< native metric; type fixed by the group
+    std::size_t bucket_idx{0};                                   ///< hist_bucket only
+    std::vector<std::pair<std::string, std::string>> attributes; ///< what Observe() is called with
+    metrics::labels_t raw_labels;                                ///< for deregistration matching
+};
+
+/**
+ * @brief One OTel observable instrument and EVERY series exported through it.
+ *
+ * The OTLP SDK keys instruments by NAME. Creating a second instrument with the same name — as
+ * this used to do, once per label set — does not add a series: the later registration supersedes
+ * the earlier one, so N components publishing the same metric collapsed to whichever registered
+ * last. Histograms were worse still, creating one `_bucket` instrument per bucket, so all but one
+ * bucket vanished.
+ *
+ * So: one instrument per name, one callback, and a list of series that the callback iterates,
+ * calling Observe(value, attributes) once per series.
+ *
+ * `mtx` guards `series` because the callback runs on the SDK's export thread while components may
+ * be registering or deregistering. It is deliberately NOT the manager's instrument_mutex: the
+ * callback must never take that, or an export could deadlock against a registration.
+ */
+struct instrument_group {
+    std::string otel_name; ///< the name handed to the SDK (may carry a histogram suffix)
+    std::string base_name; ///< the native metric name, for deregistration
+    metrics::metric_type type{};
+    instrument_role role{instrument_role::value};
+    opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument;
+    std::mutex mtx;
+    std::vector<series_entry> series;
 };
 
 /**
@@ -124,7 +155,9 @@ struct manager::impl {
     std::mutex instrument_mutex;
 
     // Tracked instruments with their contexts (for proper cleanup)
-    std::vector<instrument_entry> instruments;
+    /// unique_ptr so a group's address is stable: it is handed to AddCallback as the callback
+    /// state and must outlive every export while the instrument exists.
+    std::vector<std::unique_ptr<instrument_group>> instruments;
 };
 
 auto manager::instance() -> manager& {
@@ -507,30 +540,175 @@ static auto labels_match(const metrics::labels_t& a, const metrics::labels_t& b)
     return a_sorted == b_sorted;
 }
 
+namespace {
+
+/// Observe every series in a group. One of these per (type, role); each is the single callback
+/// registered on that group's instrument, and each iterates the group's series list rather than
+/// closing over one metric.
+template <typename Native, typename Value, typename Read>
+void observe_all(opentelemetry::metrics::ObserverResult& result, void* state, Read read) {
+    auto* group = static_cast<instrument_group*>(state);
+    auto* observer =
+        opentelemetry::nostd::get_if<opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<Value>>>(
+            &result);
+    if (observer == nullptr) {
+        return;
+    }
+    const std::lock_guard lock{group->mtx};
+    for (const auto& series : group->series) {
+        (*observer)->Observe(read(static_cast<Native*>(series.metric), series), series.attributes);
+    }
+}
+
+void observe_counter(opentelemetry::metrics::ObserverResult result, void* state) {
+    observe_all<metrics::counter<uint64_t>, int64_t>(
+        result, state, [](auto* m, const series_entry&) { return to_otel_int64(m->value()); });
+}
+
+void observe_updown(opentelemetry::metrics::ObserverResult result, void* state) {
+    observe_all<metrics::updown_counter<int64_t>, int64_t>(result, state,
+                                                           [](auto* m, const series_entry&) { return m->value(); });
+}
+
+void observe_gauge(opentelemetry::metrics::ObserverResult result, void* state) {
+    observe_all<metrics::gauge<double>, double>(result, state, [](auto* m, const series_entry&) { return m->value(); });
+}
+
+void observe_hist_count(opentelemetry::metrics::ObserverResult result, void* state) {
+    observe_all<metrics::histogram, int64_t>(
+        result, state, [](auto* m, const series_entry&) { return static_cast<int64_t>(m->count()); });
+}
+
+void observe_hist_sum(opentelemetry::metrics::ObserverResult result, void* state) {
+    observe_all<metrics::histogram, double>(result, state, [](auto* m, const series_entry&) { return m->sum(); });
+}
+
+void observe_hist_bucket(opentelemetry::metrics::ObserverResult result, void* state) {
+    observe_all<metrics::histogram, int64_t>(result, state, [](auto* m, const series_entry& series) {
+        const auto counts = m->bucket_counts();
+        int64_t cumulative = 0; // Prometheus buckets are cumulative
+        for (std::size_t i = 0; i <= series.bucket_idx && i < counts.size(); ++i) {
+            cumulative += static_cast<int64_t>(counts[i]);
+        }
+        return cumulative;
+    });
+}
+
+} // namespace
+
+auto manager::group_for(const std::string& otel_name, const std::string& base_name, metrics::metric_type type,
+                        int role_raw, const std::string& description, const std::string& unit) -> void* {
+    const auto role = static_cast<instrument_role>(role_raw);
+    for (const auto& group : m_impl->instruments) {
+        if (group->otel_name == otel_name) {
+            return group.get(); // one instrument per NAME — reuse it and append a series
+        }
+    }
+
+    auto group = std::make_unique<instrument_group>();
+    group->otel_name = otel_name;
+    group->base_name = base_name;
+    group->type = type;
+    group->role = role;
+
+    opentelemetry::metrics::ObservableCallbackPtr callback{nullptr};
+    switch (role) {
+    case instrument_role::hist_count:
+        group->instrument = m_impl->meter->CreateInt64ObservableCounter(otel_name, description, "1");
+        callback = &observe_hist_count;
+        break;
+    case instrument_role::hist_sum:
+        group->instrument = m_impl->meter->CreateDoubleObservableGauge(otel_name, description, unit);
+        callback = &observe_hist_sum;
+        break;
+    case instrument_role::hist_bucket:
+        group->instrument = m_impl->meter->CreateInt64ObservableCounter(otel_name, description, "1");
+        callback = &observe_hist_bucket;
+        break;
+    case instrument_role::value:
+        switch (type) {
+        case metrics::metric_type::counter:
+            group->instrument = m_impl->meter->CreateInt64ObservableCounter(otel_name, description, unit);
+            callback = &observe_counter;
+            break;
+        case metrics::metric_type::updown_counter:
+            group->instrument = m_impl->meter->CreateInt64ObservableUpDownCounter(otel_name, description, unit);
+            callback = &observe_updown;
+            break;
+        case metrics::metric_type::gauge:
+            group->instrument = m_impl->meter->CreateDoubleObservableGauge(otel_name, description, unit);
+            callback = &observe_gauge;
+            break;
+        case metrics::metric_type::histogram:
+            break; // handled via the three roles above
+        }
+        break;
+    }
+
+    if (!group->instrument || callback == nullptr) {
+        return nullptr;
+    }
+    // The group's address is the callback state, which is why groups are held by unique_ptr.
+    group->instrument->AddCallback(callback, group.get());
+    auto* raw = group.get();
+    m_impl->instruments.push_back(std::move(group));
+    return raw;
+}
+
+auto manager::add_series(void* group_ptr, void* metric, const metrics::labels_t& raw_labels,
+                         const std::vector<std::pair<std::string, std::string>>& attributes, std::size_t bucket_idx)
+    -> void {
+    if (group_ptr == nullptr) {
+        return;
+    }
+    auto* group = static_cast<instrument_group*>(group_ptr);
+    const std::lock_guard lock{group->mtx};
+    group->series.push_back({metric, bucket_idx, attributes, raw_labels});
+}
+
 /**
- * @brief Remove OTel instruments for a metric that was deregistered
+ * @brief Remove OTel instruments for a metric that was deregistered.
  *
- * This is called by the deregistration observer to clean up OTel instruments
- * when a native metric is removed, preventing use-after-free.
- *
- * Matches by both name AND labels to avoid removing metrics with the same
- * name but different label sets.
+ * Drops only the SERIES belonging to this (name, labels) pair — other components publishing the
+ * same metric name keep exporting. An instrument is destroyed only once its last series goes,
+ * which is also what stops its callback firing against freed metrics.
  */
 auto manager::remove_otel_instrument(const metrics::metric_metadata& meta) -> void {
-    auto lock = std::lock_guard{m_impl->instrument_mutex};
-
-    // Remove all instruments matching this metric name AND labels
-    // (histograms have multiple: _count, _sum, _bucket, but all share the same base name/labels)
-    auto it =
-        std::remove_if(m_impl->instruments.begin(), m_impl->instruments.end(), [&meta](const instrument_entry& entry) {
-            return entry.metric_name == meta.name && labels_match(entry.metric_labels, meta.labels);
-        });
-
-    if (it != m_impl->instruments.end()) {
-        auto count = std::distance(it, m_impl->instruments.end());
-        m_impl->instruments.erase(it, m_impl->instruments.end());
-        spdlog::debug("telemetry: removed {} OTel instrument(s) for '{}'", count, meta.name);
+    if (!m_impl->meter) {
+        return;
     }
+    const auto lock = std::lock_guard{m_impl->instrument_mutex};
+
+    std::size_t dropped = 0;
+    for (auto& group : m_impl->instruments) {
+        if (group->base_name != meta.name) {
+            continue;
+        }
+        const std::lock_guard series_lock{group->mtx};
+        auto it = std::remove_if(group->series.begin(), group->series.end(),
+                                 [&meta](const series_entry& s) { return labels_match(s.raw_labels, meta.labels); });
+        dropped += static_cast<std::size_t>(std::distance(it, group->series.end()));
+        group->series.erase(it, group->series.end());
+    }
+
+    // Retire instruments that no longer carry anything.
+    auto empty = std::remove_if(m_impl->instruments.begin(), m_impl->instruments.end(),
+                                [](const std::unique_ptr<instrument_group>& g) { return g->series.empty(); });
+    m_impl->instruments.erase(empty, m_impl->instruments.end());
+
+    if (dropped != 0) {
+        spdlog::debug("telemetry: removed {} OTel series for '{}'", dropped, meta.name);
+    }
+}
+
+auto manager::exported_series_counts() const -> std::pair<std::size_t, std::size_t> {
+    const auto lock = std::lock_guard{m_impl->instrument_mutex};
+    std::size_t series = 0;
+    for (const auto& group : m_impl->instruments) {
+        const std::lock_guard series_lock{group->mtx};
+        series += group->series.size();
+    }
+    return {m_impl->instruments.size(), series};
 }
 
 auto manager::create_otel_instrument(const metrics::metric_metadata& meta, void* metric_ptr) -> void {
@@ -538,176 +716,43 @@ auto manager::create_otel_instrument(const metrics::metric_metadata& meta, void*
         return;
     }
 
-    auto lock = std::lock_guard{m_impl->instrument_mutex};
+    const auto lock = std::lock_guard{m_impl->instrument_mutex};
 
     try {
-        // Prepare labels as key-value pairs
-        auto labels = labels_to_kv(meta.labels);
+        const auto labels = labels_to_kv(meta.labels);
 
-        switch (meta.type) {
-        case metrics::metric_type::counter: {
-            auto* native = static_cast<metrics::counter<uint64_t>*>(metric_ptr);
-
-            // Create context with proper ownership
-            auto ctx = std::make_unique<callback_context<metrics::counter<uint64_t>>>(native, labels);
-            auto* ctx_ptr = ctx.get(); // Raw pointer for callback
-
-            // Create instrument
-            auto instrument = m_impl->meter->CreateInt64ObservableCounter(meta.name, meta.description, meta.unit);
-
-            // Register callback with raw pointer (context owned by instrument_entry)
-            instrument->AddCallback(
-                [](opentelemetry::metrics::ObserverResult result, void* state) {
-                    auto* c = static_cast<callback_context<metrics::counter<uint64_t>>*>(state);
-                    auto value = to_otel_int64(c->metric->value());
-                    if (auto* obs = opentelemetry::nostd::get_if<
-                            opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
-                            &result)) {
-                        (*obs)->Observe(value, c->labels);
-                    }
-                },
-                ctx_ptr);
-
-            m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
-            spdlog::debug("telemetry: created OTel counter '{}'", meta.name);
-            break;
-        }
-
-        case metrics::metric_type::updown_counter: {
-            auto* native = static_cast<metrics::updown_counter<int64_t>*>(metric_ptr);
-
-            auto ctx = std::make_unique<callback_context<metrics::updown_counter<int64_t>>>(native, labels);
-            auto* ctx_ptr = ctx.get();
-
-            auto instrument = m_impl->meter->CreateInt64ObservableUpDownCounter(meta.name, meta.description, meta.unit);
-
-            instrument->AddCallback(
-                [](opentelemetry::metrics::ObserverResult result, void* state) {
-                    auto* c = static_cast<callback_context<metrics::updown_counter<int64_t>>*>(state);
-                    if (auto* obs = opentelemetry::nostd::get_if<
-                            opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
-                            &result)) {
-                        (*obs)->Observe(c->metric->value(), c->labels);
-                    }
-                },
-                ctx_ptr);
-
-            m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
-            spdlog::debug("telemetry: created OTel updown_counter '{}'", meta.name);
-            break;
-        }
-
-        case metrics::metric_type::gauge: {
-            auto* native = static_cast<metrics::gauge<double>*>(metric_ptr);
-
-            auto ctx = std::make_unique<callback_context<metrics::gauge<double>>>(native, labels);
-            auto* ctx_ptr = ctx.get();
-
-            auto instrument = m_impl->meter->CreateDoubleObservableGauge(meta.name, meta.description, meta.unit);
-
-            instrument->AddCallback(
-                [](opentelemetry::metrics::ObserverResult result, void* state) {
-                    auto* c = static_cast<callback_context<metrics::gauge<double>>*>(state);
-                    if (auto* obs = opentelemetry::nostd::get_if<
-                            opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<double>>>(
-                            &result)) {
-                        (*obs)->Observe(c->metric->value(), c->labels);
-                    }
-                },
-                ctx_ptr);
-
-            m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
-            spdlog::debug("telemetry: created OTel gauge '{}'", meta.name);
-            break;
-        }
-
-        case metrics::metric_type::histogram: {
-            // OTel doesn't have observable histograms - we export as multiple metrics
-            // following Prometheus conventions: count, sum, and bucket metrics
+        if (meta.type == metrics::metric_type::histogram) {
             auto* native = static_cast<metrics::histogram*>(metric_ptr);
             const auto& boundaries = native->boundaries();
 
-            // Export count
-            {
-                auto ctx = std::make_unique<callback_context<metrics::histogram>>(native, labels);
-                auto* ctx_ptr = ctx.get();
+            add_series(group_for(meta.name + "_count", meta.name, meta.type,
+                                 static_cast<int>(instrument_role::hist_count), meta.description + " (count)", "1"),
+                       metric_ptr, meta.labels, labels, 0);
+            add_series(group_for(meta.name + "_sum", meta.name, meta.type, static_cast<int>(instrument_role::hist_sum),
+                                 meta.description + " (sum)", meta.unit),
+                       metric_ptr, meta.labels, labels, 0);
 
-                auto instrument = m_impl->meter->CreateInt64ObservableCounter(meta.name + "_count",
-                                                                              meta.description + " (count)", "1");
-
-                instrument->AddCallback(
-                    [](opentelemetry::metrics::ObserverResult result, void* state) {
-                        auto* c = static_cast<callback_context<metrics::histogram>*>(state);
-                        if (auto* obs = opentelemetry::nostd::get_if<
-                                opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
-                                &result)) {
-                            (*obs)->Observe(static_cast<int64_t>(c->metric->count()), c->labels);
-                        }
-                    },
-                    ctx_ptr);
-
-                m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
-            }
-
-            // Export sum
-            {
-                auto ctx = std::make_unique<callback_context<metrics::histogram>>(native, labels);
-                auto* ctx_ptr = ctx.get();
-
-                auto instrument = m_impl->meter->CreateDoubleObservableGauge(meta.name + "_sum",
-                                                                             meta.description + " (sum)", meta.unit);
-
-                instrument->AddCallback(
-                    [](opentelemetry::metrics::ObserverResult result, void* state) {
-                        auto* c = static_cast<callback_context<metrics::histogram>*>(state);
-                        if (auto* obs = opentelemetry::nostd::get_if<
-                                opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<double>>>(
-                                &result)) {
-                            (*obs)->Observe(c->metric->sum(), c->labels);
-                        }
-                    },
-                    ctx_ptr);
-
-                m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
-            }
-
-            // Export each bucket as a cumulative counter with "le" label
+            // One instrument named "<name>_bucket" carrying a series per bucket, distinguished by
+            // the "le" attribute. Previously each bucket created its own same-named instrument, so
+            // all but one bucket were silently dropped by the SDK.
+            void* bucket_group =
+                group_for(meta.name + "_bucket", meta.name, meta.type, static_cast<int>(instrument_role::hist_bucket),
+                          meta.description + " (bucket)", "1");
             for (std::size_t i = 0; i <= boundaries.size(); ++i) {
-                std::string le_value = (i < boundaries.size()) ? std::to_string(boundaries[i]) : "+Inf";
-
                 auto bucket_labels = labels;
-                bucket_labels.emplace_back("le", le_value);
-
-                auto ctx = std::make_unique<bucket_context>(native, i, bucket_labels);
-                auto* ctx_ptr = ctx.get();
-
-                auto instrument = m_impl->meter->CreateInt64ObservableCounter(meta.name + "_bucket",
-                                                                              meta.description + " (bucket)", "1");
-
-                instrument->AddCallback(
-                    [](opentelemetry::metrics::ObserverResult result, void* state) {
-                        auto* c = static_cast<bucket_context*>(state);
-                        auto counts = c->hist->bucket_counts();
-                        int64_t cumulative = 0;
-                        for (std::size_t j = 0; j <= c->bucket_idx && j < counts.size(); ++j) {
-                            cumulative += static_cast<int64_t>(counts[j]);
-                        }
-                        if (auto* obs = opentelemetry::nostd::get_if<
-                                opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(
-                                &result)) {
-                            (*obs)->Observe(cumulative, c->labels);
-                        }
-                    },
-                    ctx_ptr);
-
-                m_impl->instruments.push_back({std::move(ctx), std::move(instrument), meta.name, meta.labels});
+                bucket_labels.emplace_back("le", (i < boundaries.size()) ? std::to_string(boundaries[i]) : "+Inf");
+                add_series(bucket_group, metric_ptr, meta.labels, bucket_labels, i);
             }
 
-            spdlog::debug("telemetry: created OTel histogram metrics for '{}' ({} buckets)", meta.name,
+            spdlog::debug("telemetry: registered OTel histogram series for '{}' ({} buckets)", meta.name,
                           boundaries.size() + 1);
-            break;
+            return;
         }
-        }
+
+        add_series(group_for(meta.name, meta.name, meta.type, static_cast<int>(instrument_role::value),
+                             meta.description, meta.unit),
+                   metric_ptr, meta.labels, labels, 0);
+        spdlog::debug("telemetry: registered OTel series for '{}'", meta.name);
     } catch (const std::exception& e) {
         spdlog::error("telemetry: failed to create OTel instrument for '{}': {}", meta.name, e.what());
     } catch (...) {

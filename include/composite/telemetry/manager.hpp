@@ -25,7 +25,11 @@
 #include "composite/util/export.hpp"
 #include "config.hpp"
 
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace composite::telemetry {
 
@@ -90,6 +94,17 @@ public:
     COMPOSITE_API
     auto is_initialized() const -> bool;
 
+    /**
+     * @brief Diagnostics: (instrument count, total exported series).
+     *
+     * Exists because the failure this guards against is invisible from outside the process: if
+     * N components publishing the same metric name collapse into one series, the exporter still
+     * looks healthy — you only notice at the collector, where N-1 components are missing. The
+     * invariant worth asserting is that one INSTRUMENT can carry many SERIES.
+     */
+    COMPOSITE_API
+    auto exported_series_counts() const -> std::pair<std::size_t, std::size_t>;
+
     // Disable copy/move (singleton)
     manager(const manager&) = delete;
     manager(manager&&) = delete;
@@ -121,6 +136,17 @@ private:
      * @param meta Metadata of the metric being removed (includes name and labels)
      */
     auto remove_otel_instrument(const metrics::metric_metadata& meta) -> void;
+
+    /// Find-or-create the instrument that carries @p otel_name, returning it as an opaque
+    /// handle (void* so this header need not see the OTel types). One instrument per NAME:
+    /// the SDK keys them that way, so a second instrument with the same name would supersede
+    /// the first rather than adding a series. Returns nullptr if creation failed.
+    auto group_for(const std::string& otel_name, const std::string& base_name, metrics::metric_type type, int role_raw,
+                   const std::string& description, const std::string& unit) -> void*;
+
+    /// Append one exported series to a group obtained from group_for().
+    auto add_series(void* group_ptr, void* metric, const metrics::labels_t& raw_labels,
+                    const std::vector<std::pair<std::string, std::string>>& attributes, std::size_t bucket_idx) -> void;
 
     struct impl;
     std::unique_ptr<impl> m_impl;

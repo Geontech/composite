@@ -107,8 +107,13 @@ build:options-matrix:
       - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
       - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON"
   script:
-    - cmake -B build $OPTS
+    # Tests ON so the option-specific suites are built AND RUN. The OTLP grouping test in
+    # particular only exists under -DCOMPOSITE_USE_OPENTELEMETRY=ON, and the failure it guards
+    # against (N components collapsing into one exported series) compiles perfectly happily —
+    # building without running would not catch it.
+    - cmake -B build $OPTS -DCOMPOSITE_BUILD_TESTS=ON
     - cmake --build build -j"$(nproc)"
+    - ctest --test-dir build --output-on-failure
 
 # DPDK feature build. dpdk_manager.cpp ONLY compiles under -DCOMPOSITE_USE_DPDK=ON
 # (it includes rte_*.h), so it is invisible to every other job and to local dev
