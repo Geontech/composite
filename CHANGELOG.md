@@ -12,6 +12,22 @@ All notable changes to **composite** are documented here. The project follows
   (`composite::abi_version`, currently **1**), emitted by the `COMPOSITE_REGISTER_*` macros. The loader
   refuses to call `create()` on a library whose ABI version differs from the framework's, so a stale
   `.so` fails cleanly. Rebuild components whenever the ABI version is bumped.
+- **Supported toolchains (what CI actually verifies).** C++20 is required
+  (`CMAKE_CXX_STANDARD 20`, `STANDARD_REQUIRED ON`). Components cross the DSO boundary as C++
+  objects, so build them with the *same* compiler and standard library as the framework — the
+  ABI handshake below does not detect a mismatch.
+  - **Gating, on every pipeline:** **GCC 14** with **libstdc++**, on **x86-64**. Covered
+    modes: Debug + `-Wall -Wextra -Wpedantic -Werror` with the full ctest suite (`ci` preset),
+    Release, `-DCOMPOSITE_USE_OPENSSL=ON`, `-DCOMPOSITE_USE_OPENTELEMETRY=ON`,
+    `-DCOMPOSITE_USE_DPDK=ON` (compile-only — no NIC in CI), an installed-package consumer
+    build, ASan+UBSan, and TSan.
+  - **Non-gating:** **arm64** TSan runs with `allow_failure: true` and excludes the HTTP
+    integration suite. Treat arm64 as buildable-and-exercised, not as a supported target,
+    until that job gates.
+  - **NOT verified: Clang, in any version, and libc++.** There is no Clang job in the
+    pipeline. Do not read "GCC and Clang floors" in any planning document as coverage that
+    exists — if Clang support is to be advertised for v0.5, a gating job has to be added
+    first.
 - **When the ABI version is bumped.** It is **not** a release counter — it changes whenever a
   component built against an older framework could no longer run correctly against a newer one:
   1. the `create()` / `create_args` entry-point contract changes;
@@ -73,6 +89,8 @@ The table below maps the old API to the new one.
 | **REST: list/struct mutation** | `/properties/:name/items[/:index]` and `/properties/:name/fields/:field` routes | removed — `PATCH` the whole property with a partial JSON object/array (`null` resets/erases) |
 | **REST: multi-component PATCH** | "atomic with rollback" across the batch | per-component atomic; **not** transactional across components — returns `207 Multi-Status` on partial failure |
 | **`GET /app/components/:id/schema`** | an ARRAY of per-property descriptors, each with a `name` field, in a bespoke vocabulary (`fields`, `choices`, `unit`, `powerOfTwo`) | a single **JSON Schema 2020-12 document**: `$schema` / `type: object` / `additionalProperties: false` / `title` (the component id) / `properties` keyed by property name. Structural keywords are standard (`properties` not `fields`, `enum` not `choices`, nested `properties`/`items`); composite metadata moved to vendor extensions — `unit` → `x-composite-unit`, `configurability` → `x-composite-configurability`, `powerOfTwo` → `x-composite-powerOfTwo`. `required` is deliberately omitted so a partial `PATCH` body validates. **The 0.5 pre-releases advertised 2020-12 export but did not actually publish it — this makes the endpoint match what the docs always claimed.** A client that walked the array looking for `name` must now index `properties` by key |
+| **Stopping** | `stop()` only — unbounded, and silent while it waited | adds a **bounded pair**: `component::request_stop()` (signals without joining the worker — it still takes the lifecycle lock and runs the user wake hook, so it is not instantaneous) and `component::try_stop(timeout) -> bool`, plus `application::try_stop(timeout)` returning a `not_stopped` list of ids. A `false`/non-empty return means **not torn down — do not destroy it**, and covers three cases: the lifecycle lock was unavailable, the worker did not exit, or a property write was still in flight; nothing is torn down, so a later `try_stop()`/`stop()` completes the job. The budget covers the lifecycle lock, the worker-exit wait and any in-flight property write, but cannot cover synchronous user hooks (`on_park_requested`, `on_worker_stop`). `stop()` itself is unchanged in behaviour but now REPORTS on an interval instead of waiting mutely, naming the component and what to look at |
+| **`POST /app/stop`** | ran the unbounded `stop()`; one component whose `process()` never returned blocked the request forever | bounded to a shared 10s budget. `200` when everything stopped, or **`207 Multi-Status`** with a `not_stopped` list. A component lands there if its worker did not exit, its lifecycle lock was unavailable, or a property write was still in flight; in every case it was not torn down and is still registered |
 | **REST: `PUT` on a single property** | `PUT` and `PATCH` both accepted on `/app/components/:id/properties/:name`, sharing one handler | **`PUT` removed; use `PATCH`** (identical behavior — the shared handler was always a merge). `PUT` was a misnomer: HTTP defines it as replace, but a `PUT` of `{"port": 5000}` onto a `{ip, port, mtu}` struct property merged and left the other fields untouched. Rather than freeze a verb that does not do what it says, it is withdrawn; it may return later as a genuine replace operation. Replace semantics are available today as `DELETE` (reset to default) followed by `PATCH` |
 | **Logging** | `spdlog::logger` exposed in the public API | `composite::logger` facade (spdlog is private); levels via `composite::log_level` |
 

@@ -218,6 +218,35 @@ override would run on a direct `start()` but silently not on a reconcile. Subcla
 worker-scoped resources (a receiver thread, a worker pool) hook `on_worker_start()` /
 `on_worker_stop()` instead — those run on **every** start/stop path.
 
+**`process()` must return promptly.** `stop()` joins the worker, and that join cannot be abandoned
+(one of its callers is `~component`), so a `process()` that never returns wedges shutdown — and via
+`application::stop()`, the whole graph's. Returning `NOOP` is always safe: it sleeps on a bounded,
+stop-token-aware wait. If you must wait on something the framework does not own (a blocking socket,
+a device), use a bounded wait and return `NOOP` between attempts, or override `on_park_requested()`
+to interrupt it — that hook is called on the stop path for exactly this purpose. A stop that has to
+wait will say so in the log, naming the component.
+
+**Bounded stop.** `stop()` waits as long as it takes, which is right for shutdown and wrong for a
+request handler. For callers that must not hang there is a bounded pair:
+
+```cpp
+if (!comp->try_stop(2s)) {
+    // NOT TORN DOWN — do not destroy it. Report it, or keep it alive and retry;
+    // dropping the last reference here would move the unbounded wait into ~component.
+    // (False covers three cases: the lifecycle lock was unavailable, the worker did not
+    //  exit, or a property write was still in flight.)
+}
+
+// Several components: signal first, then collect against ONE shared deadline.
+auto not_stopped = app.try_stop(10s);     // ids that did not stop; empty == all stopped
+```
+
+A `false`/non-empty return tears down nothing, so a later `try_stop()`/`stop()` completes the job.
+The budget covers the lifecycle lock, the worker-exit wait, and any in-flight property write; it
+cannot cover the synchronous user hooks it must invoke (`on_park_requested`, `on_worker_stop`),
+since abandoning a running callback is the very use-after-free this API avoids. `REST POST /app/stop`
+uses this and answers `207` rather than hanging.
+
 **Ownership.** Create heap-allocated components with `composite::make_component<T>(args...)`: the
 returned `shared_ptr`'s deleter **stops the component before destruction begins**, while the leaf
 vtable and derived members are still intact — closing the "destroyed while its worker still runs"
@@ -582,8 +611,9 @@ auto property_change_handler(const composite::properties::json& diff) -> void ov
 }
 ```
 
-(The no-argument `property_change_handler()` is deprecated; prefer the `diff` form. For `config<T>`,
-prefer `on_apply` over this hook.)
+(The no-argument `property_change_handler()` was **removed** in 0.5 — override the `diff` form
+above, ignoring the argument if you do not need it. For `config<T>`, prefer `on_apply` over this
+hook.)
 
 ### Runtime Property Control via REST API
 
@@ -599,7 +629,7 @@ stringified.
 | `GET /app/openapi.json` | OpenAPI 3.1 description of this control plane (for client/UI generation). |
 | `GET /app` | Full application graph: `{ name, components, connections }`. |
 | `POST /app/start` | Start (reconcile to desired-`enabled`) every component. |
-| `POST /app/stop` | Stop every component's worker (the server keeps running). |
+| `POST /app/stop` | Stop every component's worker (the server keeps running). **Bounded:** every component is signalled first, then collected against one shared deadline. Returns `200` when all stopped, or `207 Multi-Status` with a `not_stopped` list. A component lands there if its worker did not exit, its lifecycle lock was unavailable, or a property write was still in flight — in every case it was **not** torn down and is still registered. |
 | `GET /app/components` | Array of component documents. |
 | `POST /app/components` | Create + add a component at runtime (`{library, id, properties?}`). `201` on success; `409` on duplicate id. |
 | `GET /app/components/:id` | One component document (`404` if unknown). |
