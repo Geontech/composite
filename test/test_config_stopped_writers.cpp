@@ -78,12 +78,12 @@ int main() {
     w2.join();
 
     // Correctness is TSan's job here; the counters just prove the reactions actually ran.
-    std::printf("K1 stopped-writer TSan: applies=%ld mirror=%s\n", comp->m_applies.load(std::memory_order_relaxed),
+    std::printf("stopped-writer TSan: applies=%ld mirror=%s\n", comp->m_applies.load(std::memory_order_relaxed),
                 comp->m_mirror.c_str());
     if (comp->m_applies.load(std::memory_order_relaxed) == 0) {
         std::fprintf(stderr, "FAIL: no reactions ran\n");
         return 1;
     }
-    std::printf("K1 STOPPED-WRITER TSAN PASSED\n");
+    std::printf("STOPPED-WRITER TSAN PASSED\n");
     return 0;
 }

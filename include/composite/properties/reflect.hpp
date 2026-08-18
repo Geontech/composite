@@ -38,7 +38,7 @@
  *  - equal          : structural equality
  * Field types may be scalars, std::string, bool, enums (with COMPOSITE_ENUM),
  * std::optional<T>, std::vector<T>, nested reflected structs, or nlohmann::json
- * (an opaque 7396-merged leaf). See ASSESSMENT.md §4.A / §11.
+ * (an opaque 7396-merged leaf).
  */
 namespace composite::reflect {
 

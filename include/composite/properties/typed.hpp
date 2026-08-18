@@ -25,7 +25,7 @@
  *        state. A two-phase prepare()/commit() lets a property_set apply several
  *        properties atomically (validate all, then commit all). JSON is the
  *        transport; the worker reads the live member directly (mutated only
- *        while the worker is parked). See ASSESSMENT.md §4.A / §10.2 / §11.
+ *        while the worker is parked).
  */
 namespace composite::properties {
 

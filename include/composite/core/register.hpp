@@ -26,7 +26,7 @@
  * rather than hand-writing the extern "C" block — which previously drifted into three
  * incompatible signatures (create(), create(type), create(id), create(id, arg)) that the
  * loader called through mismatched function pointers (UB) and that silently ignored the
- * configured id. See PLAN.md (#13).
+ * configured id.
  */
 namespace composite {
 

@@ -143,19 +143,15 @@ int main() {
 
     // both schemas expose the same property names (the new form is richer: it also
     // carries range/unit from the attributes — strictly more capable, wire-identical).
+    // property_schema() is a single JSON Schema 2020-12 document; names are the keys of
+    // "properties", so compare those key sets rather than array entries.
     const json so = o.property_schema();
     const json sn = n.property_schema();
-    check(so.size() == sn.size(), "both describe the same number of properties");
-    auto has_named = [](const json& sch, const char* nm) {
-        for (const auto& e : sch) {
-            if (e["name"] == nm) {
-                return true;
-            }
-        }
-        return false;
-    };
+    check(so.at("properties").size() == sn.at("properties").size(), "both describe the same number of properties");
+    auto has_named = [](const json& sch, const char* nm) { return sch.at("properties").contains(nm); };
     check(has_named(sn, "gain") && has_named(sn, "taps") && has_named(sn, "win"),
           "new schema exposes gain/taps/win at top level");
+    check(has_named(so, "gain") && has_named(sn, "gain"), "both forms expose gain by the same key");
 
     if (g_fails != 0) {
         std::fprintf(stderr, "%d round-trip check(s) FAILED\n", g_fails);

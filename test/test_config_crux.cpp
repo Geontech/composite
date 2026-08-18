@@ -74,7 +74,7 @@ int main() {
     {
         const json d = ps.apply(json::parse(R"({"port": 8080})"), config_type::RUNTIME);
         check(cfg->port == 8080, "single-field patch updates the struct (value synchronous)");
-        check(on_apply_fires == 0, "B2: apply stages the reaction; it has not run yet");
+        check(on_apply_fires == 0, "apply STAGES the reaction; it has not run yet");
         ps.run_pending_reactions(); // worker loop-top / inline drain
         check(on_apply_fires == 1 && port_ch && !host_ch, "on_apply ran once on drain, scoped to port");
         check(seen_prev.port == 5000, "on_apply prev is the pre-change value");

@@ -191,9 +191,23 @@ public:
     /// (worker thread, before process()) and inline by the writer when there is no live
     /// worker. No-op when no config<T> is registered (the common case) — a bare loop over
     /// an empty vector. Each binding's run_pending() is itself a no-op when nothing is staged.
+    ///
+    /// A throwing on_apply is CONTAINED per binding and routed to the reaction error sink,
+    /// mirroring the on_change listener policy: the config values are already committed and
+    /// live, and this runs on the worker thread, inside destructors, and during graph
+    /// teardown — none of which may unwind (an escape from the worker loop-top or a
+    /// destructor is std::terminate). run_pending() clears its mailbox BEFORE invoking the
+    /// hook (config.hpp), so a contained failure cannot re-arm and spin. Containing per
+    /// binding also stops one failing reaction from skipping the bindings after it.
     auto run_pending_reactions() -> void {
         for (const auto& b : m_bindings) {
-            b->run_pending();
+            try {
+                b->run_pending();
+            } catch (const std::exception& ex) {
+                report_reaction_error(b->name(), ex.what());
+            } catch (...) {
+                report_reaction_error(b->name(), "unknown exception");
+            }
         }
     }
 
@@ -203,6 +217,13 @@ public:
     /// Receives (property name, what()).
     auto set_listener_error_handler(std::function<void(const std::string&, const char*)> fn) -> void {
         m_listener_error_sink = std::move(fn);
+    }
+
+    /// Optional sink for exceptions thrown by staged config<T> on_apply reactions. Set by
+    /// the owning component; same policy and shape as the listener sink above.
+    /// Receives (binding name, what()).
+    auto set_reaction_error_handler(std::function<void(const std::string&, const char*)> fn) -> void {
+        m_reaction_error_sink = std::move(fn);
     }
 
     /// Apply a single named property/field value. Delegated to the batch path so a
@@ -257,6 +278,39 @@ public:
     /// Schema for introspection (registration order). Each entry is a property's (or
     /// config field's) full describe(): name, type (nested fields / array items / enum
     /// choices / integer range), configurability, default, unit, and attribute hints.
+    /**
+     * @brief The property set as ONE JSON Schema 2020-12 document.
+     *
+     * This is what `GET /app/components/:id/schema` publishes. Each property becomes an entry
+     * in `properties`, keyed by name, with composite-specific metadata carried under
+     * `x-composite-*` vendor extensions (see to_schema_entry()).
+     *
+     * `required` is deliberately OMITTED. Every property has a registered default, and the
+     * write path is an RFC-7396 merge — a partial document is a legal PATCH body. Declaring
+     * properties required would make the schema reject exactly the partial patches the API is
+     * built around. `additionalProperties: false` IS set, matching the loader's strict
+     * unknown-key policy, so a typo fails validation against the schema the same way it fails
+     * against the component.
+     *
+     * describe() below remains the raw per-property list this is assembled from.
+     */
+    [[nodiscard]] auto schema() const -> json {
+        json props = json::object();
+        for (const auto& n : m_order) {
+            if (auto pit = m_props.find(n); pit != m_props.end()) {
+                props[n] = to_schema_entry(pit->second->describe());
+            } else if (auto fit = m_field_owner.find(n); fit != m_field_owner.end()) {
+                props[n] = to_schema_entry(fit->second->describe_field(n));
+            }
+        }
+        return json{
+            {"$schema", "https://json-schema.org/draft/2020-12/schema"},
+            {"type", "object"},
+            {"additionalProperties", false},
+            {"properties", std::move(props)},
+        };
+    }
+
     [[nodiscard]] auto describe() const -> json {
         json arr = json::array();
         for (const auto& n : m_order) {
@@ -276,13 +330,34 @@ private:
         try {
             p->notify(diff);
         } catch (const std::exception& ex) {
-            if (m_listener_error_sink) {
-                m_listener_error_sink(name, ex.what());
-            }
+            report_listener_error(name, ex.what());
         } catch (...) {
+            report_listener_error(name, "unknown exception");
+        }
+    }
+
+    /// As report_reaction_error: the sink formats/allocates/logs, so it can throw. Letting
+    /// that escape would turn a contained listener failure into an uncontained one and, in
+    /// a multi-property batch, skip the notifications that follow.
+    auto report_listener_error(const std::string& name, const char* what) noexcept -> void {
+        try {
             if (m_listener_error_sink) {
-                m_listener_error_sink(name, "unknown exception");
+                m_listener_error_sink(name, what);
             }
+        } catch (...) { // NOLINT(bugprone-empty-catch) — reporting a failure must not become one
+        }
+    }
+
+    /// Route a contained on_apply failure to the reaction sink. Never rethrows — the callers
+    /// of run_pending_reactions() are all no-unwind boundaries, and the sink itself is not
+    /// trustworthy: it formats, allocates, and logs. An escape here would defeat the
+    /// containment it exists to report AND skip the bindings after this one.
+    auto report_reaction_error(const std::string& name, const char* what) noexcept -> void {
+        try {
+            if (m_reaction_error_sink) {
+                m_reaction_error_sink(name, what);
+            }
+        } catch (...) { // NOLINT(bugprone-empty-catch) — reporting a failure must not become one
         }
     }
 
@@ -305,6 +380,7 @@ private:
     std::map<std::string, std::unique_ptr<property_base>, std::less<>> m_props;
     std::vector<std::string> m_order; ///< registration order for stable encode/describe
     std::function<void(const std::string&, const char*)> m_listener_error_sink;
+    std::function<void(const std::string&, const char*)> m_reaction_error_sink;
     // config<T> support: each top-level field name routes to its owning binding;
     // m_bindings owns the binding objects (one per registered config<T>).
     std::map<std::string, config_binding_base*, std::less<>> m_field_owner;

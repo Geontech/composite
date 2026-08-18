@@ -50,6 +50,10 @@ foreach(t
     # K1-fix deadlock regression: a lifecycle-touching on_apply calling stop() during the inline
     # drain (EXITING state) must not spin forever on its own park in-flight guard
     test_reentrant_stop_on_apply
+    # AF1/AF2 v0.5 freeze contract: a throwing on_apply / overflow callback must not unwind
+    # across a worker, destructor, or graph-teardown boundary; depth() must not replace a
+    # live ring; power-of-two rounding must saturate rather than spin
+    test_failure_containment
     test_enabled_lifecycle
     # M6 lifecycle completion: on_finished / is_finished / wait_until_finished
     test_lifecycle_finish

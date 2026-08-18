@@ -194,6 +194,6 @@ int main() {
         std::fprintf(stderr, "%d loop-top check(s) FAILED\n", g_fails);
         return 1;
     }
-    std::puts("CONFIG<T> B2 LOOP-TOP TESTS PASSED");
+    std::puts("CONFIG<T> LOOP-TOP TESTS PASSED");
     return 0;
 }

@@ -12,8 +12,10 @@
 #include "port_base.hpp"
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <new>
 #include <optional>
 #include <span>
@@ -32,12 +34,17 @@ template <typename T>
 struct is_mutable_buffer<mutable_buffer<T>> : std::true_type {};
 
 namespace detail {
+/// Round a ring size up to a power of two, SATURATING at the largest representable one.
+/// The previous loop (`std::size_t p = 1; while (p < n) p <<= 1;`) shifted p to 0 once n
+/// exceeded 2^63 and then spun forever — reachable from the public depth() setter, so one
+/// out-of-range value hung the process. Saturating lets the subsequent allocation fail
+/// loudly (std::length_error / std::bad_alloc) instead, which the caller can report.
 inline auto round_up_pow2(std::size_t n) -> std::size_t {
-    std::size_t p = 1;
-    while (p < n) {
-        p <<= 1;
+    constexpr std::size_t k_max_pow2 = std::size_t{1} << (std::numeric_limits<std::size_t>::digits - 1);
+    if (n <= 1) {
+        return 1;
     }
-    return p;
+    return n > k_max_pow2 ? k_max_pow2 : std::bit_ceil(n);
 }
 } // namespace detail
 
@@ -81,16 +88,37 @@ public:
     auto element_type_id() const -> std::size_t override { return typeid(value_type).hash_code(); }
     auto is_mutable() const -> bool override { return is_mutable_buffer<Buf>::value; }
 
-    /// Set the queue depth (soft limit). Grows the ring to hold @p value only while
-    /// the ring is empty (setup-time); a runtime change (e.g. pause via depth(0))
-    /// just adjusts the limit and never reallocates a live ring.
+    /// Set the queue depth (soft limit). Grows the PHYSICAL ring to hold @p value only
+    /// while this input is UNCLAIMED and empty (setup-time: before connect(), or after an
+    /// explicit disconnect); a change on a connected input (e.g. pause via depth(0)) only
+    /// moves the soft limit and never reallocates a live ring.
+    ///
+    /// The claim — not an empty observation — is what makes the replacement safe. A
+    /// connected producer can sit between its capacity check and its slot write with the
+    /// ring momentarily empty, so `head == tail` does NOT exclude a producer; replacing
+    /// m_ring under it frees the storage it is about to write. The check and the
+    /// replacement are performed under m_resize_mtx, which claim_producer() also takes, so
+    /// a concurrent connect() cannot slip in between them; a release can only make the
+    /// check conservative (declining to grow), never unsafe. The additional empty check
+    /// keeps a grow from silently discarding packets still queued on a disconnected input.
+    ///
+    /// NOTE: this makes physical growth a SETUP-time operation by construction. It is not a
+    /// live-resize primitive: growing the ring of an input whose producer was disconnected
+    /// by a RAW port-level disconnect (rather than the component-level managed disconnect,
+    /// which parks the producer's worker first) is still the caller's responsibility to
+    /// sequence. v0.5 does not support live physical resizing at all.
     auto depth(std::size_t value) -> void override {
         const std::size_t want = detail::round_up_pow2(value == 0 ? 1 : value);
-        if (want > m_ring.size() && m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_acquire)) {
-            m_ring = std::vector<queue_type>(want); // default-construct slots (queue_type is move-only)
-            m_mask = want - 1;
-            m_head.store(0, std::memory_order_relaxed);
-            m_tail.store(0, std::memory_order_relaxed);
+        {
+            const auto lock = std::scoped_lock{m_resize_mtx};
+            const bool unclaimed = !m_has_producer.load(std::memory_order_acquire);
+            const bool empty = m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_acquire);
+            if (want > m_ring.size() && unclaimed && empty) {
+                m_ring = std::vector<queue_type>(want); // default-construct slots (queue_type is move-only)
+                m_mask = want - 1;
+                m_head.store(0, std::memory_order_relaxed);
+                m_tail.store(0, std::memory_order_relaxed);
+            }
         }
         input_port_base::depth(value); // soft limit + capacity gauge
     }
@@ -225,15 +253,23 @@ private:
     /// tail publish; the rest (if the ring fills) are dropped + counted. Symmetric
     /// to get_batch — amortizes the release fence + cache-line bounce over the batch.
     /// @return number of packets accepted.
-    auto add_batch(std::span<queue_type> in) -> std::size_t {
+    /// @param accepted_bytes If non-null, receives the byte count of the ACCEPTED prefix
+    ///        only — summed in the move loop below, so a producer can record an accurate
+    ///        transfer stat on a partial admission (the packets are moved-from on return).
+    auto add_batch(std::span<queue_type> in, std::size_t* accepted_bytes = nullptr) -> std::size_t {
         const auto tail = m_tail.load(std::memory_order_relaxed);
         const auto head = m_head.load(std::memory_order_acquire);
         const auto cur = tail - head;
         const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // clamp to ring capacity
         const std::size_t room = cap > cur ? static_cast<std::size_t>(cap - cur) : 0;
         const std::size_t k = room < in.size() ? room : in.size();
+        std::size_t bytes = 0;
         for (std::size_t i = 0; i < k; ++i) {
+            bytes += std::get<0>(in[i]).size() * sizeof(value_type); // before the move
             m_ring[(tail + i) & m_mask] = std::move(in[i]);
+        }
+        if (accepted_bytes != nullptr) {
+            *accepted_bytes = bytes;
         }
         if (k != 0) {
             m_tail.store(tail + k, std::memory_order_release); // one publish for the batch
@@ -254,16 +290,26 @@ private:
     /// matches this input. Moves accepted buffers straight into ring slots — no
     /// temporary packet vector and no second move pass. Rejected suffix buffers
     /// are consumed too, matching send_batch's contract.
-    auto add_batch(std::span<buffer_type> in, timestamp ts, composite::metadata_ptr md = nullptr) -> std::size_t {
+    /// @param accepted_bytes If non-null, receives the byte count of the ACCEPTED prefix
+    ///        only — summed in the move loop below, so the producer can record an accurate
+    ///        transfer stat on a partial admission without a second pass over the span
+    ///        (the buffers are moved-from once this returns and can no longer be sized).
+    auto add_batch(std::span<buffer_type> in, timestamp ts, composite::metadata_ptr md = nullptr,
+                   std::size_t* accepted_bytes = nullptr) -> std::size_t {
         const auto tail = m_tail.load(std::memory_order_relaxed);
         const auto head = m_head.load(std::memory_order_acquire);
         const auto cur = tail - head;
         const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();
         const std::size_t room = cap > cur ? static_cast<std::size_t>(cap - cur) : 0;
         const std::size_t k = room < in.size() ? room : in.size();
+        std::size_t bytes = 0;
         for (std::size_t i = 0; i < k; ++i) {
+            bytes += in[i].size() * sizeof(value_type); // before the move: in[i] is emptied below
             auto packet_md = (i + 1 == k) ? std::move(md) : md;
             m_ring[(tail + i) & m_mask] = queue_type{std::move(in[i]), ts, std::move(packet_md)};
+        }
+        if (accepted_bytes != nullptr) {
+            *accepted_bytes = bytes;
         }
         // A send consumes the complete span even when bounded admission accepts
         // only a prefix. Release rejected buffers without constructing packets.
@@ -325,7 +371,18 @@ private:
         // Overflow callback is configured at setup; lock guards a runtime re-set.
         const auto lock = std::scoped_lock{m_mtx};
         if (m_overflow_callback) {
-            m_overflow_callback(count);
+            // USER code, invoked on the producer's send path while holding m_mtx. An
+            // exception here would unwind out through add_data()/add_batch() and
+            // output_port::send_data()/send_batch() into the producer's worker — a drop is
+            // a normal bounded-backpressure event, so it must never become a producer
+            // fault. Contain it and count it (no logger at this layer, and a per-drop log
+            // on a saturated port would be a flood); read the count via
+            // overflow_callback_errors().
+            try {
+                m_overflow_callback(count);
+            } catch (...) { // NOLINT(bugprone-empty-catch) — counted below; see comment
+                m_overflow_callback_errors.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 

@@ -189,18 +189,35 @@ public:
      * @brief Send a batch of buffers (sharing one timestamp/metadata) to connected
      *        inputs. With a single immutable consumer this is one amortized
      *        add_batch (single ring publish); otherwise it falls back to per-buffer
-     *        send_data (fan-out / mutable targets). Buffers are consumed.
+     *        send_data (fan-out / mutable targets).
+     *
+     * **Buffer ownership (frozen for the v0.5 line).** The call consumes the ENTIRE
+     * span, whether or not every packet is admitted. The port is bounded, so admission
+     * may accept only a PREFIX of the batch; the rejected suffix is released as well —
+     * every element of @p bufs is left in a moved-from (empty) state on return, and the
+     * caller must not read the buffers back. Rejection is not silent: the drop is counted
+     * in the input's packet-drop statistics and the overflow callback fires ONCE for the
+     * batch with the aggregate rejected-packet count.
+     *
+     * Every admitted packet carries the same @p ts and the same metadata instance.
+     *
+     * @param bufs Buffers to send. Consumed in full (see above).
+     * @param ts   Timestamp applied to every admitted packet.
+     * @param md   Shared metadata carried by every admitted packet (may be null).
      */
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
         const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr && !ports->front()->is_mutable()) {
             auto* ip = static_cast<input_port<immutable_buffer<T>>*>(ports->front());
+            // Record only what was ACTUALLY admitted. Recording the whole span up front
+            // over-counted transfers on a partial admission, while the input separately
+            // counted the rejected suffix as dropped — so transferred + dropped exceeded
+            // packets offered, and drop_rate was wrong exactly when it mattered. add_batch
+            // reports the accepted byte count from the loop it already walks, so this costs
+            // no extra pass and no allocation on the batch fast path.
             std::size_t bytes = 0;
-            for (const auto& b : bufs) {
-                bytes += b.size() * sizeof(T);
-            }
-            m_stats.record_transfer(bytes, bufs.size());
-            ip->add_batch(bufs, ts, std::move(md));
+            const std::size_t accepted = ip->add_batch(bufs, ts, std::move(md), &bytes);
+            m_stats.record_transfer(bytes, accepted);
             return;
         }
         for (auto& b : bufs) {
@@ -376,20 +393,34 @@ public:
      * @brief Send a batch of mutable buffers (sharing one timestamp/metadata) with
      *        one amortized add_batch to a single consumer (moved for mutable,
      *        promoted for immutable); per-buffer send_data fallback for fan-out.
-     *        Buffers are consumed.
+     *
+     * **Buffer ownership (frozen for the v0.5 line).** Identical to the immutable
+     * overload: the call consumes the ENTIRE span whether or not every packet is
+     * admitted. The port is bounded, so admission may accept only a PREFIX; the rejected
+     * suffix is released as well — every element of @p bufs is left in a moved-from
+     * (empty) state on return, and the caller must not read the buffers back. Rejection
+     * is counted in the input's packet-drop statistics, and the overflow callback fires
+     * ONCE for the batch with the aggregate rejected-packet count.
+     *
+     * Every admitted packet carries the same @p ts and the same metadata instance.
+     *
+     * @param bufs Buffers to send. Consumed in full (see above).
+     * @param ts   Timestamp applied to every admitted packet.
+     * @param md   Shared metadata carried by every admitted packet (may be null).
      */
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
         const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
         if (ports->size() == 1 && ports->front() != nullptr) {
             auto* port = ports->front();
+            // Record only what was ACTUALLY admitted, on BOTH branches — recording the whole
+            // span up front over-counted transfers on a partial admission while the input
+            // separately counted the rejected suffix as dropped. add_batch reports the
+            // accepted byte count from the loop it already walks (no extra pass, no alloc).
             std::size_t bytes = 0;
-            for (const auto& b : bufs) {
-                bytes += b.size() * sizeof(T);
-            }
-            m_stats.record_transfer(bytes, bufs.size());
+            std::size_t accepted = 0;
             if (port->is_mutable()) {
                 auto* ip = static_cast<input_port<mutable_buffer<T>>*>(port);
-                ip->add_batch(bufs, ts, std::move(md));
+                accepted = ip->add_batch(bufs, ts, std::move(md), &bytes);
             } else {
                 auto* ip = static_cast<input_port<immutable_buffer<T>>*>(port);
                 m_immutable_batch_scratch.clear();
@@ -398,10 +429,11 @@ public:
                     auto packet_md = (i + 1 == bufs.size()) ? std::move(md) : md;
                     m_immutable_batch_scratch.emplace_back(std::move(bufs[i]).to_immutable(), ts, std::move(packet_md));
                 }
-                ip->add_batch(
-                    std::span<typename input_port<immutable_buffer<T>>::queue_type>(m_immutable_batch_scratch));
+                accepted = ip->add_batch(
+                    std::span<typename input_port<immutable_buffer<T>>::queue_type>(m_immutable_batch_scratch), &bytes);
                 m_immutable_batch_scratch.clear(); // release any rejected suffix immediately
             }
+            m_stats.record_transfer(bytes, accepted);
             return;
         }
         for (auto& b : bufs) {

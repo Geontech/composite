@@ -133,6 +133,13 @@ public:
      * @return true if the claim succeeded (was unclaimed), false if already claimed.
      */
     [[nodiscard]] auto claim_producer(output_port_base* producer) -> bool {
+        // Serialized against a physical ring resize (input_port::depth()). Without this the
+        // resize is a check-then-act: it could read "unclaimed", this CAS could then claim
+        // and begin sending, and the resize would replace the storage under the new
+        // producer. Both sides are cold (connect / setup-time sizing), so the lock costs
+        // nothing on the data path. Held only across the claim itself — the caller takes
+        // its own m_mutate_mtx AFTER this returns, so the two never nest here.
+        const auto lock = std::scoped_lock{m_resize_mtx};
         bool expected = false;
         if (!m_has_producer.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             return false; // fan-in: already claimed
@@ -151,7 +158,7 @@ public:
     }
 
     /**
-     * @brief Wire this input to its owning component's worker doorbell (M4).
+     * @brief Wire this input to its owning component's worker doorbell.
      * @param doorbell The owning component's park_coordinator (or nullptr to detach).
      *
      * Once set, a producer's add_data() can wake the (sleeping) consumer worker on the
@@ -162,7 +169,7 @@ public:
     auto set_doorbell(park_coordinator* doorbell) -> void { m_doorbell = doorbell; }
 
     /**
-     * @brief Wire this input to its PRODUCER's worker for backpressure wake (M4 reverse
+     * @brief Wire this input to its PRODUCER's worker for backpressure wake (the reverse
      * doorbell). @param doorbell The producing component's park_coordinator (or nullptr).
      *
      * Once set, this input's pop() wakes the (sleeping, AWAIT_OUTPUT) producer worker on the
@@ -258,6 +265,18 @@ public:
     }
 
     /**
+     * @brief Number of times the overflow callback threw and was contained.
+     *
+     * The callback is user code invoked on the producer's send path, so an exception from
+     * it is contained rather than unwound into the producer's worker (see
+     * input_port::record_drop). A non-zero count means the drop notification is unreliable
+     * — the drop itself is still counted in packets_dropped().
+     */
+    [[nodiscard]] auto overflow_callback_errors() const -> std::uint64_t {
+        return m_overflow_callback_errors.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Register port metrics with the metrics registry
      * @param component_id ID of the owning component
      */
@@ -294,13 +313,20 @@ protected:
     // own m_mutate_mtx in its destructor); give it access.
     friend class output_port_base;
 
-    mutable std::mutex m_mtx;               ///< Guards the overflow-callback set/read (not the ring)
+    mutable std::mutex m_mtx; ///< Guards the overflow-callback set/read (not the ring)
+    /// Serializes the producer CLAIM against a physical ring resize (input_port::depth()),
+    /// which must not replace storage a producer is about to write. Only claim_producer()
+    /// (which SETS the claim) needs it: a concurrent release can at worst make a resize read
+    /// "still claimed" and conservatively decline to grow. Cold path on both sides.
+    std::mutex m_resize_mtx;
     std::atomic_bool m_has_producer{false}; ///< single-producer claim (set on connect)
     std::atomic<output_port_base*> m_producer{
         nullptr}; ///< back-pointer to the producer (for deregister-on-destroy); cold, never read on the send path
-    std::atomic<std::size_t> m_depth{1024};                  ///< queue depth soft limit (0 = disabled)
-    mutable port_stats m_stats;                              ///< Statistics tracking
-    overflow_callback m_overflow_callback;                   ///< Callback for dropped packets
+    std::atomic<std::size_t> m_depth{1024}; ///< queue depth soft limit (0 = disabled)
+    mutable port_stats m_stats;             ///< Statistics tracking
+    overflow_callback m_overflow_callback;  ///< Callback for dropped packets
+    std::atomic<std::uint64_t> m_overflow_callback_errors{
+        0}; ///< contained throws from m_overflow_callback (see overflow_callback_errors())
     metrics::gauge<double>* m_queue_depth_gauge{nullptr};    ///< Current queue depth gauge
     metrics::gauge<double>* m_queue_capacity_gauge{nullptr}; ///< Queue capacity gauge
     park_coordinator* m_doorbell{nullptr}; ///< consumer worker to wake on empty->non-empty edge (read doorbell); set

@@ -749,7 +749,7 @@ TEST_CASE("mutable to mutable connection", "[port][connection]") {
     }
 }
 
-TEST_CASE("component connect/disconnect bookkeeping (P0.2/P0.3)", "[port][connection]") {
+TEST_CASE("component connect/disconnect bookkeeping", "[port][connection]") {
     auto source = std::make_shared<TestMutableSource>();
     auto sink = std::make_shared<TestMutableSink>();
 
@@ -982,7 +982,7 @@ TEST_CASE("immutable fan-out (zero copy)", "[port][fanout]") {
     }
 }
 
-TEST_CASE("immutable fan-out delivers metadata to every receiver (M4-2 move-for-last)", "[port][fanout][metadata]") {
+TEST_CASE("immutable fan-out delivers metadata to every receiver (moved into the last)", "[port][fanout][metadata]") {
     // send_data moves the metadata into the LAST receiver and copies it into the earlier
     // ones; verify NONE are dropped — all three inputs must see the same metadata.
     output_port<immutable_buffer<float>> out{"out"};

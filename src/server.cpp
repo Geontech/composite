@@ -230,7 +230,7 @@ inline auto rest_catalog() -> const std::vector<route_doc>& {
         {"get", "/app/metrics/stream", "Server-Sent Events metrics stream"},
         {"get", "/app", "Full application graph"},
         {"post", "/app/start", "Start (reconcile to desired-enabled) all components"},
-        {"post", "/app/stop", "Stop all component workers"},
+        {"post", "/app/stop", "Stop all component workers (207 if any did not stop in time)"},
         {"get", "/app/components", "List all components"},
         {"post", "/app/components", "Create and add a component"},
         {"patch", "/app/components", "Multi-component property batch (207 on partial failure)"},
@@ -240,7 +240,6 @@ inline auto rest_catalog() -> const std::vector<route_doc>& {
         {"get", "/app/components/{id}/schema", "JSON Schema of the component's properties"},
         {"get", "/app/components/{id}/properties", "Full property state"},
         {"get", "/app/components/{id}/properties/{name}", "Get one property value"},
-        {"put", "/app/components/{id}/properties/{name}", "Set/replace one property"},
         {"patch", "/app/components/{id}/properties/{name}", "Merge one property (RFC-7396)"},
         {"delete", "/app/components/{id}/properties/{name}", "Reset one property to its default"},
         {"get", "/app/components/{id}/ports", "List ports with connection status"},
@@ -510,10 +509,37 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
     });
 
     // POST /app/stop - stop every component's worker. Idempotent; the REST server keeps running.
+    //
+    // BOUNDED, deliberately. application::stop() waits as long as it takes, which is right for
+    // shutdown and wrong here: a component whose process() never returns would block this httplib
+    // worker forever and take the control plane down with it. try_stop() signals everything, waits
+    // against one shared deadline, and reports whatever did not stop — nothing is destroyed, so
+    // such a component is left un-torn-down and still registered (see application::try_stop).
+    // Partial success is 207, matching the multi-component PATCH route.
     endpoint = std::format("/{}/stop", APP);
     server->Post(endpoint, [&app](const httplib::Request&, httplib::Response& res) {
-        app.stop();
-        json_ok(res, {{"success", std::format("stopped application '{}'", app.name())}});
+        static constexpr auto k_stop_budget = std::chrono::seconds(10);
+        const auto not_stopped = app.try_stop(k_stop_budget);
+        if (not_stopped.empty()) {
+            json_ok(res, {{"success", std::format("stopped application '{}'", app.name())}});
+            return;
+        }
+        spdlog::warn("POST /app/stop: {} component(s) did not stop within {}s", not_stopped.size(),
+                     k_stop_budget.count());
+        set_cors(res);
+        res.set_content(
+            nlohmann::json{
+                // "not_stopped", not "still running": a component lands here if its worker did not
+                // exit, OR its lifecycle lock was unavailable, OR a property write was still in
+                // flight. What is true of all three is that it was NOT torn down.
+                {"error", std::format("{} component(s) did not stop within {}s; they were not torn "
+                                      "down and are still registered",
+                                      not_stopped.size(), k_stop_budget.count())},
+                {"not_stopped", not_stopped},
+            }
+                .dump(2),
+            "application/json");
+        res.status = 207; // Multi-Status: the app stopped, but not every component did
     });
 
     // GET components
@@ -550,8 +576,12 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
             if (comp_json.contains("properties")) {
                 spdlog::trace("setting component-level properties on {}", comp_ptr->id());
+                // Strict: this is a single component's OWN property block — there is no
+                // broadcast globals block here to tolerate, so an unknown key is a caller
+                // error and is reported as one (matching a runtime PATCH, which has always
+                // rejected unknown properties).
                 comp_ptr->set_properties(comp_json["properties"], composite::properties::config_type::INITIALIZE,
-                                         /*allow_unknown=*/true);
+                                         /*allow_unknown=*/false);
             }
 
             if (!app.add_component(comp_ptr)) {
@@ -738,9 +768,19 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         json_ok(res, {{prop_name, state.at(prop_name)}});
     });
 
-    // PUT/PATCH /app/components/:id/properties/:name  -> set/merge a single property
+    // PATCH /app/components/:id/properties/:name  -> merge a single property (RFC-7396)
+    //
+    // PATCH ONLY, deliberately. This operation IS a merge: for a reflected struct property a
+    // partial object patches only the named fields (typed_property::prepare -> reflect::merge),
+    // leaving the rest at their current values. PUT was previously registered as an alias for
+    // this exact handler, which made it a lie — HTTP defines PUT as "replace the resource with
+    // the enclosed representation", so a PUT of {"port": 5000} onto a {ip, port, mtu} struct
+    // should have reset ip and mtu, and did not. Rather than freeze a verb that does not mean
+    // what HTTP says it means, PUT is withdrawn for v0.5; it can be added later as a real
+    // replace operation in its own right. The reset half is already available today via
+    // DELETE (RFC-7396 null -> registered default), so nothing is unexpressible.
     endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);
-    auto put_one = [&app](const httplib::Request& req, httplib::Response& res) {
+    auto patch_one = [&app](const httplib::Request& req, httplib::Response& res) {
         auto comp_id = req.path_params.at("id");
         auto prop_name = req.path_params.at("name");
         auto comp = app.get_component(comp_id);
@@ -755,8 +795,19 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
         }
         res = set_component_properties(comp, {{prop_name, property_handlers::extract_value(body)}});
     };
-    server->Put(endpoint, put_one);
-    server->Patch(endpoint, put_one);
+    server->Patch(endpoint, patch_one);
+    // Explicit 405 for the withdrawn PUT rather than the bare 404 httplib would give for an
+    // unregistered method: PUT worked in pre-0.5, so a client still sending it deserves "that
+    // verb is not allowed here, use PATCH" instead of "no such resource", which would look like
+    // a wrong path or a missing component. Deliberately NOT added to rest_catalog() — this is a
+    // rejection, not an offered operation, so it stays out of the OpenAPI surface.
+    server->Put(endpoint, [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Allow", "GET, PATCH, DELETE");
+        error(res,
+              "PUT is not supported on a single property; use PATCH (merge), or DELETE then PATCH "
+              "for replace semantics",
+              405);
+    });
 
     // DELETE /app/components/:id/properties/:name  -> reset to default (RFC-7396 null)
     endpoint = std::format("/{}/{}/:id/properties/:name", APP, COMPONENTS);

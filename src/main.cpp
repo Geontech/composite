@@ -29,7 +29,9 @@
 #include <httplib.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <spdlog/spdlog.h>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -424,6 +426,12 @@ auto main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
     };
 
+    // Every application-level ("globals") key that matched at least one component. A key
+    // matching NONE of them is almost certainly a typo or a stale entry: it is not an error
+    // (globals are advisory by design), but it silently affects nothing, so it is reported
+    // after the graph is built rather than being swallowed.
+    std::set<std::string> applied_global_keys;
+
     // All config-driven graph construction below can raise nlohmann type/parse
     // errors and component-supplied exceptions; route every one through
     // cleanup_and_exit instead of letting it escape main to std::terminate.
@@ -464,11 +472,25 @@ auto main(int argc, char** argv) -> int {
 
             // Set properties
             try {
-                // Merge application-level properties with component-level properties
+                // Merge application-level ("globals") properties with component-level ones.
+                //
+                // The globals block is broadcast to EVERY component, so it legitimately
+                // carries keys that only some components define. That used to be handled by
+                // applying the merged batch with allow_unknown=true — which also silently
+                // discarded typos in a component's OWN property block (a misspelled key
+                // simply never took effect, with no diagnostic). Instead, filter the globals
+                // to the keys THIS component actually accepts, and then apply the batch
+                // strictly: an unknown key in a component's own block is now an error.
                 auto props_json = nlohmann::json{};
-                if (app_json.contains("properties")) {
-                    spdlog::trace("adding app-level properties to changeset for {}", comp_ptr->id());
-                    props_json.merge_patch(app_json["properties"]);
+                if (app_json.contains("properties") && app_json["properties"].is_object()) {
+                    for (const auto& [key, value] : app_json["properties"].items()) {
+                        if (!comp_ptr->has_property(key)) {
+                            spdlog::trace("global property '{}' does not apply to {}; skipped", key, comp_ptr->id());
+                            continue;
+                        }
+                        applied_global_keys.insert(key);
+                        props_json[key] = value;
+                    }
                 }
                 if (comp.contains("properties")) {
                     spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
@@ -478,7 +500,8 @@ auto main(int argc, char** argv) -> int {
                 // Apply the merged (app-level + component-level) properties as one batch.
                 if (!props_json.empty()) {
                     spdlog::trace("setting properties on component {}", comp_ptr->id());
-                    comp_ptr->set_properties(props_json, composite::properties::config_type::INITIALIZE, true);
+                    comp_ptr->set_properties(props_json, composite::properties::config_type::INITIALIZE,
+                                             /*allow_unknown=*/false);
                 }
             } catch (const std::runtime_error& err) {
                 return cleanup_and_exit(
@@ -489,6 +512,18 @@ auto main(int argc, char** argv) -> int {
             spdlog::trace("adding {} to application '{}'", comp_ptr->id(), app.name());
             if (!app.add_component(comp_ptr)) {
                 return cleanup_and_exit(std::format("component id '{}' already exists in application", comp_ptr->id()));
+            }
+        }
+
+        // A global that reached no component at all affects nothing — surface it rather
+        // than letting a typo hide (the failure mode that made an ineffective
+        // `max_packet_size` look applied). Not fatal: globals are advisory by design.
+        if (app_json.contains("properties") && app_json["properties"].is_object()) {
+            for (const auto& [key, value] : app_json["properties"].items()) {
+                (void)value;
+                if (!applied_global_keys.contains(key)) {
+                    spdlog::warn("application-level property '{}' matched no component and had no effect", key);
+                }
             }
         }
 

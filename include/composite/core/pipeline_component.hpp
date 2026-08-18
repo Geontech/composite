@@ -27,7 +27,7 @@ namespace composite {
  * @brief One-in/one-out component base with an internal worker pool and a
  *        **slot ring** that re-serialises out-of-order completion back to
  *        submission order — the distillation of the ingest-thread + task_queue +
- *        ordered-future-drain pattern that fft/psd hand-roll today (ASSESSMENT §4.D).
+ *        ordered-future-drain pattern that fft/psd hand-roll today.
  *
  * The derived class implements three hooks instead of process():
  *   - prepare(md)                  : main thread, ARRIVAL order (per metadata CHANGE, see below)
@@ -159,9 +159,10 @@ protected:
 
         // 1) Retire DONE slots in submission order (finalize + send, main thread). Pace against a full
         //    downstream: if a finalized packet cannot be sent right now, STOP retiring and AWAIT_OUTPUT
-        //    rather than dropping it (mirrors source_component §2.4). Without this a full downstream
-        //    silently drops-on-full and §2.1's FINISH then reports finish_reason::completed having lost
-        //    data — silent truncation on the exact batch/file use case §2.1 exists to enable.
+        //    rather than dropping it (mirrors how source_component paces). Without this a full
+        //    downstream silently drops-on-full, and the self-completion FINISH below then reports
+        //    finish_reason::completed having lost data — silent truncation on the exact batch/file
+        //    use case that self-completion exists to enable.
         auto rr = retire_ready();
         if (rr.blocked_on_output) {
             return AWAIT_OUTPUT;
@@ -170,8 +171,8 @@ protected:
 
         // 2) Ingest one packet into a free slot (arrival order), if room + data. try_get() (not
         //    get_data()) so a genuine zero-length packet is submitted through work()/finalize() rather
-        //    than mistaken for an empty ring and silently dropped — §2.1's FINISH would otherwise make
-        //    that loss terminal (a lost EOF/flush marker reported as a clean completion).
+        //    than mistaken for an empty ring and silently dropped — self-completion would otherwise
+        //    make that loss terminal (a lost EOF/flush marker reported as a clean completion).
         bool have_free{};
         {
             std::scoped_lock lk{m_mtx};
@@ -246,18 +247,16 @@ private:
         std::exception_ptr err{};
         // Retire-time latches (main-thread only): finalize() runs exactly once per slot even if the
         // send is deferred across an AWAIT_OUTPUT round-trip; `keep` records its decision so a DROPPED
-        // packet retires immediately without waiting for output room it never needs. [fix round 4]
+        // packet retires immediately without waiting for output room it never needs.
         bool finalized{false};
         bool keep{false};
     };
 
-    static auto round_up_pow2(std::size_t n) -> std::size_t {
-        std::size_t p = 1;
-        while (p < n) {
-            p <<= 1;
-        }
-        return p;
-    }
+    /// Shared with the port layer's ring sizing; see composite::detail::round_up_pow2 for
+    /// why this saturates instead of looping (the shift-until-ge form spins forever once n
+    /// exceeds 2^63). Bounded by the worker count here, but kept identical so the two
+    /// copies cannot drift.
+    static auto round_up_pow2(std::size_t n) -> std::size_t { return composite::detail::round_up_pow2(n); }
 
     /// ARRIVAL order, main thread. Return the shared metadata to travel with this packet,
     /// re-running prepare() only when the incoming instance differs from the previous
@@ -323,13 +322,13 @@ private:
                 // FINISH). Backpressure on a KEEP: leave the head DONE (don't advance m_retire) and
                 // AWAIT_OUTPUT; the reverse doorbell re-wakes on the full->not-full edge. The latch
                 // means finalize() is not re-run across that round-trip. Single-producer on m_out:
-                // nothing else fills the downstream ring between this check and the send. [fix round 4]
+                // nothing else fills the downstream ring between this check and the send.
                 if (!s.finalized) {
                     // A throwing finalize() is treated like a throwing work(): log + drop this packet.
                     // Crucially the latch is set REGARDLESS of a throw, so the packet is never
                     // re-finalized — otherwise, under error_restart_max>0, thread_func would catch the
                     // throw, restart, and re-enter retire_ready() on this same un-retired head, running
-                    // finalize() (and its pre-throw side effects) again per retry. [fix round 5]
+                    // finalize() (and its pre-throw side effects) again per retry.
                     try {
                         s.keep = finalize(s.out, s.ts, *s.md);
                     } catch (const std::exception& e) {
@@ -379,7 +378,7 @@ private:
                 // Downstream is full — draining would drop. Defer the resize (re-arm) and hand back to
                 // the main loop, which returns AWAIT_OUTPUT; the reverse doorbell re-runs do_resize once
                 // the output frees. Avoids a busy-spin here (the head-DONE CV predicate is already
-                // satisfied, so wait_for would not block) and never drops. [fix round 3]
+                // satisfied, so wait_for would not block) and never drops.
                 m_resize_pending.store(true, std::memory_order_release);
                 return;
             }

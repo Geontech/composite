@@ -116,6 +116,65 @@ public:
     }
 
     /**
+     * @brief Bounded stop(), for callers that must not hang — the REST control plane above all.
+     * @param timeout Overall budget, shared across every component (not per component).
+     * @return The ids of components that did NOT stop within the budget. Empty means everything
+     *         stopped. "Did not stop" is deliberately broader than "still running": a component
+     *         also lands here if its lifecycle lock was unavailable, or if its worker exited but
+     *         a property write was still in flight. All three carry the same obligation — it was
+     *         not torn down, so do not destroy it.
+     *
+     * stop() waits as long as it takes, which is correct for shutdown but wrong for a request
+     * handler: one component whose process() never returns makes `POST /app/stop` hang
+     * forever, taking the control plane down with it regardless of whose bug it is.
+     *
+     * Signals every component FIRST, then collects against one shared deadline, so a wedged
+     * component drains concurrently with the rest instead of serialising a timeout per
+     * component (which on a large graph is mostly idle waiting). The deadline is taken before
+     * signalling, so the signalling pass is inside the budget rather than on top of it.
+     *
+     * Carries the same caveat as component::try_stop(): the budget cannot bound the synchronous
+     * user hooks it must invoke (on_park_requested / on_worker_stop). A component that blocks
+     * in one of those can overrun the budget, and will be named in the log when it does.
+     *
+     * **Nothing is destroyed.** Components that did not stop are left un-torn-down and still
+     * registered — the registry keeps them alive, which is exactly what a false try_stop()
+     * requires. Report them, and retry or investigate; do NOT clear() an application with a
+     * wedged component, as that drops the last reference and the destructor's join is
+     * unbounded by necessity.
+     */
+    template <typename Rep, typename Period>
+    [[nodiscard]] auto try_stop(std::chrono::duration<Rep, Period> timeout) -> std::vector<std::string> {
+        // The deadline starts NOW — before signalling. Pass 1 calls each component's
+        // on_park_requested() wake hook, which is user code; starting the clock after that loop
+        // would put an unbounded phase outside the caller's budget.
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        auto components = snapshot();
+        // Pass 1: latch the exit request everywhere, without waiting.
+        for (auto& component : components) {
+            try {
+                component->request_stop();
+            } catch (...) { // NOLINT(bugprone-empty-catch) — collected as "did not stop" in pass 2
+            }
+        }
+        std::vector<std::string> not_stopped;
+        for (auto& component : components) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            const auto budget = remaining > decltype(remaining)::zero() ? remaining : decltype(remaining)::zero();
+            bool stopped = false;
+            try {
+                stopped = component->try_stop(budget);
+            } catch (...) {
+                stopped = false; // a throwing stop path is reported, not propagated
+            }
+            if (!stopped) {
+                not_stopped.push_back(component->id());
+            }
+        }
+        return not_stopped;
+    }
+
+    /**
      * @brief Block until every component's worker has exited (self-finished or stopped).
      *
      * Waits on each managed component via component::wait_until_finished(). For a graph whose
@@ -163,7 +222,7 @@ public:
             // Hold the topology lock ONLY for the classify-then-stop-sources-then-EOS phase: a
             // concurrent connect/disconnect/remove during it would race the source classification (a
             // freshly-wired consumer falsely EOS-latched, or a true source missed and hard-stopped
-            // without EOS). [§3] Once every source is stopped and EOS is latched we RELEASE it — no
+            // without EOS). Once every source is stopped and EOS is latched we RELEASE it — no
             // source can produce new data, so a later connect cannot reintroduce the misclassification,
             // and holding the lock across the (possibly full-timeout) wait below would needlessly stall
             // the REST control plane's mutation surface. Lock order is topology-lock then the registry
@@ -273,10 +332,11 @@ public:
      * lookups immediately miss it), then torn down SAFELY off-lock: it is stopped, every
      * peer producer feeding one of its inputs is disconnected (each under that producer's
      * worker park, so no send is in flight when the input's producer-claim is released —
-     * the P0.2 managed-disconnect path), and its own outputs are disconnected from
+     * the managed-disconnect path that parks a producer before releasing its claim), and
+     * its own outputs are disconnected from
      * downstream consumers. The returned shared_ptr is the last owner; when the caller
      * drops it, `~component` runs (idempotent stop) and the deleter-owned dlopen handle
-     * unmaps the library (M0.B). This makes a live DELETE safe against the connection
+     * unmaps the library. This makes a live DELETE safe against the connection
      * layer rather than relying on "destroy a running peer mid-send".
      *
      * @param id The id of the component to remove.
@@ -304,7 +364,13 @@ public:
             others = m_components; // remaining peers (potential producers into / consumers of target)
         }
         // Stop the target so its worker is not sending/receiving during teardown.
-        target->stop();
+        // CONTAINED: a failed stop (wedged worker / staged reaction) must NOT skip the
+        // disconnect loops below. The caller drops the last reference on return, so an
+        // early exit here would destroy the target while peer producers still hold edges
+        // into its input rings — a use-after-free on the very next send. Disconnecting is
+        // what makes the removal safe, so it happens unconditionally; a target that would
+        // not stop is logged by stop_contained() and still fully unwired.
+        target->stop_contained();
         // Disconnect every peer-producer edge feeding the target's inputs. disconnect()
         // parks the producer's worker, so the producer is not mid-send when the target's
         // input releases its producer-claim.
@@ -336,8 +402,10 @@ public:
             std::unique_lock lk{m_mtx};
             removed.swap(m_components);
         }
+        // Best-effort, same policy as stop(): one component failing to stop must not
+        // abandon the cleanup of every component after it in the vector.
         for (auto& component : removed) {
-            component->stop();
+            component->stop_contained();
         }
     }
 

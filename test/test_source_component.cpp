@@ -159,7 +159,7 @@ int main() {
         check(k->finished_reason() == finish_reason::completed, "drain: sink completed via EOS drain");
     }
 
-    // ---- §2.4: a source PACES against a full downstream ring (AWAIT_OUTPUT) instead of dropping ----
+    // ---- a source PACES against a full downstream ring (AWAIT_OUTPUT) instead of dropping ----
     {
         application app{"backpressure"};
         constexpr int N = 40;
@@ -174,26 +174,27 @@ int main() {
         // With AWAIT_OUTPUT pacing the source never overruns the ring, so EVERY item is delivered.
         // Before the fix (produce() then unconditional send_data + NORMAL) the fast source dropped
         // into the full ring and the slow sink saw fewer than N.
-        check(k->m_count.load() == N, "§2.4: sink received ALL items — source paced, nothing dropped");
+        check(k->m_count.load() == N, "output pacing: sink received ALL items — source paced, nothing dropped");
         check(s->finished_reason() == finish_reason::completed, "backpressure: source completed");
     }
 
-    // ---- §2.3: a correctly-written source (leaf auto_stop) is safe to DESTROY while running ----
+    // ---- a correctly-written source (leaf auto_stop) is safe to DESTROY while running ----
     {
         auto s = std::make_shared<dtor_safe_source>("dtor"); // unconnected -> produces (drops) + runs
         s->start();
         for (int i = 0; i < 200 && !s->is_running(); ++i) {
             std::this_thread::sleep_for(1ms);
         }
-        check(s->is_running(), "§2.3: source running before destruction");
+        check(s->is_running(), "destroy-while-running: source running before destruction");
         // Destroy while the worker is actively in process()/produce(). The leaf's own auto_stop (last
         // member) stops the worker while this vtable is still intact, so produce() is never called on
         // a torn-down vtable and m_out is never used after free. Exercised under CPU contention in CI.
         s.reset();
-        check(true, "§2.3: destroyed a running source (leaf auto_stop) — no pure-virtual-call / no UAF");
+        check(true,
+              "destroy-while-running: destroyed a running source (leaf auto_stop) — no pure-virtual-call / no UAF");
     }
 
-    // ---- §2.4 (round 3): done()/EOS is reachable even when the output is UN-SENDABLE ----
+    // ---- done()/EOS is reachable even when the output is UN-SENDABLE ----
     {
         application app{"done-under-backpressure"};
         auto s = std::make_shared<range_source>("s", 0); // produces NO data — first produce() is done()
@@ -208,8 +209,8 @@ int main() {
         // the `data` case is backpressure-gated: done() is reached and FINISH fires regardless of
         // output room (EOS is out-of-band). A finite source must never be starved of completion.
         check(s->wait_until_finished(3s),
-              "§2.4-r3: source with un-sendable output still self-finishes (done not gated)");
-        check(s->finished_reason() == finish_reason::completed, "§2.4-r3: source completed via done()");
+              "un-sendable output: source with un-sendable output still self-finishes (done not gated)");
+        check(s->finished_reason() == finish_reason::completed, "un-sendable output: source completed via done()");
     }
 
     if (g_failures) {

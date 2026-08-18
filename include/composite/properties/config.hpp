@@ -34,7 +34,7 @@
  * config<T> is a thin facade over ONE typed_property<T> (the existing candidate ->
  * validate -> swap -> diff engine, which already handles reflected T); config_binding
  * wraps it as a property_base and adds per-field configurability + the field-name
- * projection. See PLAN.md M3 Phase 1.
+ * projection.
  */
 namespace composite {
 
@@ -425,9 +425,13 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// JSON Schema 2020-12 export (drives GET /schema). Built on the legacy
-// reflect::type_schema<M>() vocabulary + the field attributes. Standalone so it
-// can be tested and called without a property_set.
+// JSON Schema 2020-12 export. Built on the internal reflect::type_schema<M>()
+// vocabulary + the field attributes.
+//
+// to_2020_12()/to_schema_entry() are what GET /app/components/:id/schema
+// publishes, via property_set::schema(). schema_2020_12() below is the
+// standalone whole-struct form for a single config<T> — usable (and tested)
+// without a property_set, e.g. to emit a schema for a config type on its own.
 // ---------------------------------------------------------------------------
 
 /// Map the legacy type_schema vocabulary to JSON Schema 2020-12 (fields->properties,
@@ -453,6 +457,45 @@ inline auto to_2020_12(json node) -> json {
         node.erase("choices");
     }
     return node;
+}
+
+/// Convert ONE describe()/describe_field() entry into a JSON Schema 2020-12 sub-schema.
+///
+/// The entry carries two kinds of key: standard ones that pass straight through (`type`,
+/// `minimum`, `maximum`, `default`, `description`) and composite-specific ones that are not
+/// JSON Schema keywords. The latter are re-emitted under the `x-` vendor-extension prefix so
+/// the result is a conformant schema rather than a lookalike:
+///   `unit`         -> `x-composite-unit`
+///   `powerOfTwo`   -> `x-composite-powerOfTwo`
+///   `configurability` -> `x-composite-configurability`
+/// `name` is dropped: in the published document the property name is the KEY, not a field.
+/// Structural translation (`fields`->`properties`, `choices`->`enum`, recursion through
+/// `items`) is delegated to to_2020_12(), which also handles nested reflected members.
+inline auto to_schema_entry(json entry) -> json {
+    auto take = [&entry](const char* key) -> json {
+        if (!entry.contains(key)) {
+            return json(nullptr);
+        }
+        json v = entry.at(key);
+        entry.erase(key);
+        return v;
+    };
+    const json unit = take("unit");
+    const json configurability = take("configurability");
+    const json power_of_two = take("powerOfTwo");
+    entry.erase("name");
+
+    json out = to_2020_12(std::move(entry));
+    if (!unit.is_null()) {
+        out["x-composite-unit"] = unit;
+    }
+    if (!configurability.is_null()) {
+        out["x-composite-configurability"] = configurability;
+    }
+    if (!power_of_two.is_null()) {
+        out["x-composite-powerOfTwo"] = power_of_two;
+    }
+    return out;
 }
 
 template <reflect::reflected T>
