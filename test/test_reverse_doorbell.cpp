@@ -101,13 +101,27 @@ int main() {
     // With the reverse doorbell, the consumer's drains keep waking the backpressured source, so
     // all N flow quickly. WITHOUT it the source would stall ~4s per fill (~1000 fills) and this
     // would time out far short of N.
-    const bool got_all = wait_until([&] { return sink->consumed.load() >= N; }, 5s);
+    // The claim here is a RATIO, not a wall-clock constant. With the doorbell this is a few tens
+    // of milliseconds of real work; without it the source stalls the full NOOP backoff (4s) on
+    // each of the ~N/depth fills, so draining N would take on the order of an hour. Any bound
+    // between those discriminates perfectly, so pick one that is generous against machine load
+    // and still orders of magnitude below the broken floor.
+    //
+    // The previous bound was 5s, which was tight against the LOADED fast path rather than the
+    // broken one: under contention (CI runs sanitizer jobs alongside) a healthy run drained only
+    // ~2000/4000 within it, failing ~3 runs in 15. The mechanism was never in doubt in those
+    // runs — only the machine's speed was being measured.
+    constexpr long k_no_doorbell_floor_ms = (N / 4) * 4000L; // ~1000 fills x 4s backoff
+    constexpr long k_budget_ms = 60'000;                     // ~65x under the floor, ~1000x over a healthy run
+    static_assert(k_budget_ms * 50 < k_no_doorbell_floor_ms, "budget must stay far below the broken-path floor");
+
+    const bool got_all = wait_until([&] { return sink->consumed.load() >= N; }, std::chrono::milliseconds(k_budget_ms));
     const auto dt_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
     check(got_all, "consumer drained all N (reverse doorbell kept the backpressured source flowing)");
     check(src->produced.load() == N, "source produced exactly N (lossless can_send pacing)");
-    check(dt_ms < 5000, "completed well under the 4s-per-fill no-reverse-doorbell floor");
+    check(dt_ms < k_budget_ms, "completed far below the 4s-per-fill no-reverse-doorbell floor");
     std::printf("reverse doorbell: drained %ld/%ld in %lld ms (produced=%ld)\n", sink->consumed.load(), N,
                 (long long)dt_ms, src->produced.load());
 
