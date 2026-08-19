@@ -393,6 +393,28 @@ publish:dockerhub:
     - export RUNTIME_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA"
     - export DEVEL_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-devel"
     - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
+    # Preflight the EXTERNAL images while authenticated, before spending a build on them.
+    #
+    # Docker selects credentials per REGISTRY HOST, not per repository, so once logged in every
+    # docker.io pull is made with this token — including public images in other namespaces. A
+    # narrowly scoped token then fails these with "insufficient scopes", even though the same
+    # pulls succeed anonymously (which is why build:container, which never logs in, passes).
+    # The org access token needs "Read public repositories" for these to work.
+    #
+    # Kept permanently, not just for debugging: this turns a credential-scope problem into a
+    # two-second failure naming the exact image, instead of one that surfaces partway into a
+    # build. It will recur whenever a token is rotated or a new base image is introduced.
+    #
+    # The pins are READ OUT OF THE DOCKERFILE rather than repeated here, so there is exactly one
+    # place to update when they are refreshed. The `test -n` guards matter: without them a sed
+    # that stopped matching (say the ARG is renamed) would silently degrade into `docker pull ""`
+    # and the preflight would quietly stop checking anything.
+    - export SYNTAX_IMAGE="$(sed -n 's|^# syntax=\(.*\)$|\1|p' docker/Dockerfile.rocky9)"
+    - export ROCKY_BASE_IMAGE="$(sed -n 's|^ARG ROCKY_BASE=\(.*\)$|\1|p' docker/Dockerfile.rocky9)"
+    - test -n "$SYNTAX_IMAGE"
+    - test -n "$ROCKY_BASE_IMAGE"
+    - docker pull "$SYNTAX_IMAGE"
+    - docker pull "$ROCKY_BASE_IMAGE"
     - >-
       docker buildx build
       --file docker/Dockerfile.rocky9

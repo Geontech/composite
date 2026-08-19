@@ -1,4 +1,12 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# Digest-pinned deliberately: this frontend is an EXTERNAL image pulled at build time, and a
+# floating tag is a mutable input to the one pipeline that produces a signed, SBOM'd release
+# artifact. ROCKY_BASE below is pinned for the same reason.
+#
+# THIS FILE IS THE ONLY PLACE THESE PINS LIVE. The publish job's preflight pull reads both of
+# them straight back out of here (sed on `# syntax=` and `ARG ROCKY_BASE=`), so refreshing a
+# digest is a one-line edit. If either line is reshaped, update that sed — it is guarded by a
+# `test -n`, so a stale pattern fails the job rather than silently skipping the check.
 
 # Rocky's organization image is maintained more recently than the legacy
 # library/rockylinux image. Pin the multi-platform index; CI currently selects
