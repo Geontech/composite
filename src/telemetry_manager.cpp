@@ -131,9 +131,32 @@ struct instrument_group {
     std::string base_name; ///< the native metric name, for deregistration
     metrics::metric_type type{};
     instrument_role role{instrument_role::value};
-    opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument;
     std::mutex mtx;
     std::vector<series_entry> series;
+
+    /// The callback registered on `instrument`, kept so the destructor can retire it.
+    opentelemetry::metrics::ObservableCallbackPtr callback{nullptr};
+
+    /// DECLARED LAST so it is DESTROYED FIRST. Members are destroyed in reverse declaration
+    /// order, so an instrument declared above `mtx`/`series` would outlive them — and it owns a
+    /// callback whose state is this very object. A callback firing during teardown would then
+    /// touch an already-destroyed mutex and vector.
+    opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument;
+
+    instrument_group() = default;
+    instrument_group(const instrument_group&) = delete;
+    auto operator=(const instrument_group&) -> instrument_group& = delete;
+    instrument_group(instrument_group&&) = delete;
+    auto operator=(instrument_group&&) -> instrument_group& = delete;
+
+    ~instrument_group() {
+        // Retire the callback EXPLICITLY rather than relying on the shared_ptr going away: the
+        // meter may hold its own reference to the instrument, in which case dropping ours does
+        // not stop callbacks. RemoveCallback is what actually detaches this group as state.
+        if (instrument && callback != nullptr) {
+            instrument->RemoveCallback(callback, this);
+        }
+    }
 };
 
 /**
@@ -600,9 +623,24 @@ auto manager::group_for(const std::string& otel_name, const std::string& base_na
                         int role_raw, const std::string& description, const std::string& unit) -> void* {
     const auto role = static_cast<instrument_role>(role_raw);
     for (const auto& group : m_impl->instruments) {
-        if (group->otel_name == otel_name) {
+        if (group->otel_name != otel_name) {
+            continue;
+        }
+        // Same OTel name — reuse ONLY if the whole schema matches. Matching on the name alone is
+        // a type-confusion bug: the registry's duplicate check is per-collection, so
+        // counter("shared", {a}) and gauge("shared", {b}) both exist happily, and appending the
+        // gauge to the counter's group would have the counter callback static_cast a
+        // gauge<double>* to counter<uint64_t>*. Histogram suffixes collide the same way — a
+        // native counter named "x_count" against a histogram "x" that exports "x_count".
+        if (group->type == type && group->role == role && group->base_name == base_name) {
             return group.get(); // one instrument per NAME — reuse it and append a series
         }
+        spdlog::error("telemetry: metric name collision on '{}' — existing series come from '{}' "
+                      "(type {}, role {}); refusing to add '{}' (type {}, role {}). Rename one of "
+                      "them: exporting both through one instrument would be a type-confused cast.",
+                      otel_name, group->base_name, static_cast<int>(group->type), static_cast<int>(group->role),
+                      base_name, static_cast<int>(type), static_cast<int>(role));
+        return nullptr; // add_series() is a no-op on nullptr
     }
 
     auto group = std::make_unique<instrument_group>();
@@ -649,6 +687,7 @@ auto manager::group_for(const std::string& otel_name, const std::string& base_na
         return nullptr;
     }
     // The group's address is the callback state, which is why groups are held by unique_ptr.
+    group->callback = callback;
     group->instrument->AddCallback(callback, group.get());
     auto* raw = group.get();
     m_impl->instruments.push_back(std::move(group));

@@ -91,6 +91,26 @@ int main() {
         std::printf("counter retired: instruments=%zu series=%zu\n", instruments, series);
     }
 
+    // ---- (5) a NAME COLLISION across metric types must be refused, not type-confused ----
+    // The registry's duplicate check is per-collection, so the same name can exist as a counter
+    // AND a gauge. Grouping on the exported name alone would append the gauge to the counter's
+    // group, and the counter callback would static_cast a gauge<double>* to counter<uint64_t>* —
+    // undefined behaviour on every export. The collision must be refused instead.
+    {
+        const auto [before_instruments, before_series] = mgr.exported_series_counts();
+        reg.get_or_create_counter("collide.me", "counter", "1", labels_for("as_counter"));
+        const auto [mid_instruments, mid_series] = mgr.exported_series_counts();
+        check(mid_series == before_series + 1, "collision: the counter registered normally");
+
+        // Same NAME, different TYPE. Must not join the counter's group.
+        reg.get_or_create_gauge("collide.me", "gauge", "1", labels_for("as_gauge"));
+        const auto [after_instruments, after_series] = mgr.exported_series_counts();
+        check(after_series == mid_series, "collision: the gauge was REFUSED, not appended to the counter's instrument");
+        check(after_instruments == mid_instruments, "collision: no extra instrument was created either");
+        std::printf("collision: instruments %zu->%zu series %zu->%zu (gauge must add nothing)\n", mid_instruments,
+                    after_instruments, mid_series, after_series);
+    }
+
     telemetry::manager::instance().shutdown();
 
     if (g_fails != 0) {

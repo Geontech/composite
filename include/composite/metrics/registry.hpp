@@ -798,11 +798,17 @@ public:
     auto remove_counter(std::string_view name, labels_t labels = {}) -> bool {
         normalize_labels(labels);
         std::optional<metric_metadata> removed_meta;
+        // Hold the removed metric ALIVE until the deregistration observers have run. Destroying
+        // it first (which erase() would do) leaves an observer — the OTLP exporter above all —
+        // detaching a metric that is already gone, while one of its export callbacks may still
+        // be dereferencing the raw pointer. Destroyed at scope exit, after the notify below.
+        std::unique_ptr<counter<uint64_t>> keep_alive_until_observers_return;
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_counters.size(); ++i) {
                 if (m_counter_metadata[i].name == name && labels_equal(m_counter_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_counter_metadata[i]);
+                    keep_alive_until_observers_return = std::move(m_counters[i]);
                     m_counters.erase(m_counters.begin() + static_cast<std::ptrdiff_t>(i));
                     m_counter_metadata.erase(m_counter_metadata.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
@@ -823,12 +829,18 @@ public:
     auto remove_updown_counter(std::string_view name, labels_t labels = {}) -> bool {
         normalize_labels(labels);
         std::optional<metric_metadata> removed_meta;
+        // Hold the removed metric ALIVE until the deregistration observers have run. Destroying
+        // it first (which erase() would do) leaves an observer — the OTLP exporter above all —
+        // detaching a metric that is already gone, while one of its export callbacks may still
+        // be dereferencing the raw pointer. Destroyed at scope exit, after the notify below.
+        std::unique_ptr<updown_counter<int64_t>> keep_alive_until_observers_return;
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_updown_counters.size(); ++i) {
                 if (m_updown_counter_metadata[i].name == name &&
                     labels_equal(m_updown_counter_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_updown_counter_metadata[i]);
+                    keep_alive_until_observers_return = std::move(m_updown_counters[i]);
                     m_updown_counters.erase(m_updown_counters.begin() + static_cast<std::ptrdiff_t>(i));
                     m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
@@ -848,11 +860,17 @@ public:
     auto remove_gauge(std::string_view name, labels_t labels = {}) -> bool {
         normalize_labels(labels);
         std::optional<metric_metadata> removed_meta;
+        // Hold the removed metric ALIVE until the deregistration observers have run. Destroying
+        // it first (which erase() would do) leaves an observer — the OTLP exporter above all —
+        // detaching a metric that is already gone, while one of its export callbacks may still
+        // be dereferencing the raw pointer. Destroyed at scope exit, after the notify below.
+        std::unique_ptr<gauge<double>> keep_alive_until_observers_return;
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_gauges.size(); ++i) {
                 if (m_gauge_metadata[i].name == name && labels_equal(m_gauge_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_gauge_metadata[i]);
+                    keep_alive_until_observers_return = std::move(m_gauges[i]);
                     m_gauges.erase(m_gauges.begin() + static_cast<std::ptrdiff_t>(i));
                     m_gauge_metadata.erase(m_gauge_metadata.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
@@ -872,11 +890,17 @@ public:
     auto remove_histogram(std::string_view name, labels_t labels = {}) -> bool {
         normalize_labels(labels);
         std::optional<metric_metadata> removed_meta;
+        // Hold the removed metric ALIVE until the deregistration observers have run. Destroying
+        // it first (which erase() would do) leaves an observer — the OTLP exporter above all —
+        // detaching a metric that is already gone, while one of its export callbacks may still
+        // be dereferencing the raw pointer. Destroyed at scope exit, after the notify below.
+        std::unique_ptr<histogram> keep_alive_until_observers_return;
         {
             auto lock = std::unique_lock{m_mutex};
             for (std::size_t i = 0; i < m_histograms.size(); ++i) {
                 if (m_histogram_metadata[i].name == name && labels_equal(m_histogram_metadata[i].labels, labels)) {
                     removed_meta = std::move(m_histogram_metadata[i]);
+                    keep_alive_until_observers_return = std::move(m_histograms[i]);
                     m_histograms.erase(m_histograms.begin() + static_cast<std::ptrdiff_t>(i));
                     m_histogram_metadata.erase(m_histogram_metadata.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
@@ -902,6 +926,14 @@ public:
      */
     auto remove_by_prefix(std::string_view prefix) -> std::size_t {
         std::vector<metric_metadata> removed_metrics;
+        // Hold every removed metric ALIVE until the deregistration observers have run: erase()
+        // would destroy them first, leaving an observer (the OTLP exporter above all) detaching
+        // metrics that are already gone while an export callback may still be dereferencing
+        // them. Destroyed at scope exit, after the notify loop below.
+        std::vector<std::unique_ptr<counter<uint64_t>>> keep_alive_m_counters;
+        std::vector<std::unique_ptr<updown_counter<int64_t>>> keep_alive_m_updown_counters;
+        std::vector<std::unique_ptr<gauge<double>>> keep_alive_m_gauges;
+        std::vector<std::unique_ptr<histogram>> keep_alive_m_histograms;
         {
             auto lock = std::unique_lock{m_mutex};
 
@@ -910,6 +942,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_counters.begin());
                 if (m_counter_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_counter_metadata[idx]));
+                    keep_alive_m_counters.push_back(std::move(*it));
                     it = m_counters.erase(it);
                     m_counter_metadata.erase(m_counter_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -922,6 +955,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_updown_counters.begin());
                 if (m_updown_counter_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_updown_counter_metadata[idx]));
+                    keep_alive_m_updown_counters.push_back(std::move(*it));
                     it = m_updown_counters.erase(it);
                     m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() +
                                                     static_cast<std::ptrdiff_t>(idx));
@@ -935,6 +969,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_gauges.begin());
                 if (m_gauge_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_gauge_metadata[idx]));
+                    keep_alive_m_gauges.push_back(std::move(*it));
                     it = m_gauges.erase(it);
                     m_gauge_metadata.erase(m_gauge_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -947,6 +982,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_histograms.begin());
                 if (m_histogram_metadata[idx].name.starts_with(prefix)) {
                     removed_metrics.push_back(std::move(m_histogram_metadata[idx]));
+                    keep_alive_m_histograms.push_back(std::move(*it));
                     it = m_histograms.erase(it);
                     m_histogram_metadata.erase(m_histogram_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -975,6 +1011,14 @@ public:
      */
     auto remove_by_label(std::string_view label_key, std::string_view label_value) -> std::size_t {
         std::vector<metric_metadata> removed_metrics;
+        // Hold every removed metric ALIVE until the deregistration observers have run: erase()
+        // would destroy them first, leaving an observer (the OTLP exporter above all) detaching
+        // metrics that are already gone while an export callback may still be dereferencing
+        // them. Destroyed at scope exit, after the notify loop below.
+        std::vector<std::unique_ptr<counter<uint64_t>>> keep_alive_m_counters;
+        std::vector<std::unique_ptr<updown_counter<int64_t>>> keep_alive_m_updown_counters;
+        std::vector<std::unique_ptr<gauge<double>>> keep_alive_m_gauges;
+        std::vector<std::unique_ptr<histogram>> keep_alive_m_histograms;
         {
             auto lock = std::unique_lock{m_mutex};
 
@@ -990,6 +1034,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_counters.begin());
                 if (has_label(m_counter_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_counter_metadata[idx]));
+                    keep_alive_m_counters.push_back(std::move(*it));
                     it = m_counters.erase(it);
                     m_counter_metadata.erase(m_counter_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1002,6 +1047,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_updown_counters.begin());
                 if (has_label(m_updown_counter_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_updown_counter_metadata[idx]));
+                    keep_alive_m_updown_counters.push_back(std::move(*it));
                     it = m_updown_counters.erase(it);
                     m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() +
                                                     static_cast<std::ptrdiff_t>(idx));
@@ -1015,6 +1061,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_gauges.begin());
                 if (has_label(m_gauge_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_gauge_metadata[idx]));
+                    keep_alive_m_gauges.push_back(std::move(*it));
                     it = m_gauges.erase(it);
                     m_gauge_metadata.erase(m_gauge_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1027,6 +1074,7 @@ public:
                 auto idx = static_cast<std::size_t>(it - m_histograms.begin());
                 if (has_label(m_histogram_metadata[idx].labels)) {
                     removed_metrics.push_back(std::move(m_histogram_metadata[idx]));
+                    keep_alive_m_histograms.push_back(std::move(*it));
                     it = m_histograms.erase(it);
                     m_histogram_metadata.erase(m_histogram_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
