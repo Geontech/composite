@@ -106,9 +106,17 @@ using error_callback =
  * Observers are notified when metrics are removed. This enables
  * external systems (like OTel bridge) to clean up corresponding instruments.
  *
+ * Mirrors registration_callback: the POINTER is the identity to match on, not the name. Names
+ * are reusable — removing "x" and creating "x" again is legal and produces a different metric —
+ * so a consumer that keys its bookkeeping by name alone will retract the live replacement when
+ * the retraction of the original arrives. The pointer is valid for the duration of the callback
+ * (the registry holds the metric alive across the notification) and MUST NOT be dereferenced
+ * after it returns.
+ *
  * @param metadata Metadata of the metric being removed
+ * @param ptr The metric being removed — match this against what the registration callback gave
  */
-using deregistration_callback = std::function<void(const metric_metadata&)>;
+using deregistration_callback = std::function<void(const metric_metadata&, void* ptr)>;
 
 /**
  * @brief Exception thrown when a duplicate metric is detected
@@ -352,7 +360,8 @@ using deregistration_observer_map =
  * The registry is a singleton that owns all metric instances. It provides:
  * - Factory methods for creating metrics
  * - Query interface for REST/SSE consumers
- * - Thread-safe access for concurrent writers and readers
+ * - Thread-safe access for concurrent writers and readers (with one documented exception for
+ *   observer callbacks — see add_observer())
  *
  * Design principles:
  * - Metric creation is NOT hot-path (happens at component construction)
@@ -448,6 +457,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -460,6 +470,7 @@ public:
             meta_copy = m_counter_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -484,6 +495,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -497,6 +509,7 @@ public:
             meta_copy = m_counter_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -526,6 +539,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -538,6 +552,7 @@ public:
             meta_copy = m_updown_counter_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -559,6 +574,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -572,6 +588,7 @@ public:
             meta_copy = m_updown_counter_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -601,6 +618,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -612,6 +630,7 @@ public:
             meta_copy = m_gauge_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -633,6 +652,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -645,6 +665,7 @@ public:
             meta_copy = m_gauge_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -675,6 +696,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -687,6 +709,7 @@ public:
             meta_copy = m_histogram_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -708,6 +731,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -721,6 +745,7 @@ public:
             meta_copy = m_histogram_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -751,6 +776,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -763,6 +789,7 @@ public:
             meta_copy = m_histogram_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -784,6 +811,7 @@ public:
         metric_metadata meta_copy;
         decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
+        publication_guard pub; // armed under m_mutex below; see publication_guard
 
         {
             auto lock = std::unique_lock{m_mutex};
@@ -797,6 +825,7 @@ public:
             meta_copy = m_histogram_metadata.back();
             observers_copy = m_observers;
             error_handler_copy = m_error_handler;
+            pub.arm(this); // last statement under the lock: counts this publication
         }
 
         // Notify observers outside lock to prevent slow observers from blocking
@@ -837,10 +866,11 @@ public:
                 }
             }
         }
-        // Notify outside lock to prevent slow observers from blocking. Wait out any enumeration
-        // FIRST: one already publishing this metric must finish registering it (it is still alive
-        // — keep_alive above holds it) before the retraction below, or the series it adds would
-        // be stranded pointing at a metric this function is about to destroy.
+        // Notify outside lock to prevent slow observers from blocking. Wait out any PUBLICATION
+        // first — an in-flight enumeration OR an in-flight create_* notification: one already
+        // handing out this metric must finish registering it (it is still alive, keep_alive above
+        // holds it) before the retraction below, or the series it adds would be stranded pointing
+        // at a metric this function is about to destroy.
         if (removed_meta) {
             finish_removal(std::move(keep_alive_until_observers_return), *removed_meta);
             return true;
@@ -950,15 +980,11 @@ public:
      * @return Number of metrics removed
      */
     auto remove_by_prefix(std::string_view prefix) -> std::size_t {
-        std::vector<metric_metadata> removed_metrics;
-        // Hold every removed metric ALIVE until the deregistration observers have run: erase()
-        // would destroy them first, leaving an observer (the OTLP exporter above all) detaching
-        // metrics that are already gone while an export callback may still be dereferencing
-        // them. Destroyed at scope exit, after the notify loop below.
-        std::vector<std::unique_ptr<counter<uint64_t>>> keep_alive_m_counters;
-        std::vector<std::unique_ptr<updown_counter<int64_t>>> keep_alive_m_updown_counters;
-        std::vector<std::unique_ptr<gauge<double>>> keep_alive_m_gauges;
-        std::vector<std::unique_ptr<histogram>> keep_alive_m_histograms;
+        // Each entry pairs the metadata with the owning pointer, which keeps the metric ALIVE
+        // until the deregistration observers have run: erase() would destroy it first, leaving
+        // an observer (the OTLP exporter above all) detaching a metric that is already gone
+        // while an export callback may still be dereferencing it.
+        std::vector<deferred_removal> batch;
         {
             auto lock = std::unique_lock{m_mutex};
 
@@ -966,8 +992,8 @@ public:
             for (auto it = m_counters.begin(); it != m_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_counters.begin());
                 if (m_counter_metadata[idx].name.starts_with(prefix)) {
-                    removed_metrics.push_back(std::move(m_counter_metadata[idx]));
-                    keep_alive_m_counters.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(m_counter_metadata[idx]), ptr});
                     it = m_counters.erase(it);
                     m_counter_metadata.erase(m_counter_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -979,8 +1005,9 @@ public:
             for (auto it = m_updown_counters.begin(); it != m_updown_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_updown_counters.begin());
                 if (m_updown_counter_metadata[idx].name.starts_with(prefix)) {
-                    removed_metrics.push_back(std::move(m_updown_counter_metadata[idx]));
-                    keep_alive_m_updown_counters.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    auto& meta = m_updown_counter_metadata[idx];
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(meta), ptr});
                     it = m_updown_counters.erase(it);
                     m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() +
                                                     static_cast<std::ptrdiff_t>(idx));
@@ -993,8 +1020,8 @@ public:
             for (auto it = m_gauges.begin(); it != m_gauges.end();) {
                 auto idx = static_cast<std::size_t>(it - m_gauges.begin());
                 if (m_gauge_metadata[idx].name.starts_with(prefix)) {
-                    removed_metrics.push_back(std::move(m_gauge_metadata[idx]));
-                    keep_alive_m_gauges.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(m_gauge_metadata[idx]), ptr});
                     it = m_gauges.erase(it);
                     m_gauge_metadata.erase(m_gauge_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1006,8 +1033,8 @@ public:
             for (auto it = m_histograms.begin(); it != m_histograms.end();) {
                 auto idx = static_cast<std::size_t>(it - m_histograms.begin());
                 if (m_histogram_metadata[idx].name.starts_with(prefix)) {
-                    removed_metrics.push_back(std::move(m_histogram_metadata[idx]));
-                    keep_alive_m_histograms.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(m_histogram_metadata[idx]), ptr});
                     it = m_histograms.erase(it);
                     m_histogram_metadata.erase(m_histogram_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1016,34 +1043,9 @@ public:
             }
         }
 
-        // Same rule as the single-removal paths: defer when reentrant, otherwise drain first.
-        if (!removed_metrics.empty()) {
-            if (enumeration_depth() > 0) {
-                const std::lock_guard lk{m_deferred_mtx};
-                for (auto& owner : keep_alive_m_counters) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (auto& owner : keep_alive_m_updown_counters) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (auto& owner : keep_alive_m_gauges) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (auto& owner : keep_alive_m_histograms) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (const auto& meta : removed_metrics) {
-                    m_deferred_removals.push_back(meta);
-                }
-                return removed_metrics.size();
-            }
-            wait_for_enumerations();
-        }
-        for (const auto& meta : removed_metrics) {
-            notify_deregistration_unlocked(meta);
-        }
-
-        return removed_metrics.size();
+        const auto removed = batch.size();
+        finish_removals(std::move(batch)); // one rule for every removal path: defer or drain
+        return removed;
     }
 
     /**
@@ -1057,15 +1059,11 @@ public:
      * @return Number of metrics removed
      */
     auto remove_by_label(std::string_view label_key, std::string_view label_value) -> std::size_t {
-        std::vector<metric_metadata> removed_metrics;
-        // Hold every removed metric ALIVE until the deregistration observers have run: erase()
-        // would destroy them first, leaving an observer (the OTLP exporter above all) detaching
-        // metrics that are already gone while an export callback may still be dereferencing
-        // them. Destroyed at scope exit, after the notify loop below.
-        std::vector<std::unique_ptr<counter<uint64_t>>> keep_alive_m_counters;
-        std::vector<std::unique_ptr<updown_counter<int64_t>>> keep_alive_m_updown_counters;
-        std::vector<std::unique_ptr<gauge<double>>> keep_alive_m_gauges;
-        std::vector<std::unique_ptr<histogram>> keep_alive_m_histograms;
+        // Each entry pairs the metadata with the owning pointer, which keeps the metric ALIVE
+        // until the deregistration observers have run: erase() would destroy it first, leaving
+        // an observer (the OTLP exporter above all) detaching a metric that is already gone
+        // while an export callback may still be dereferencing it.
+        std::vector<deferred_removal> batch;
         {
             auto lock = std::unique_lock{m_mutex};
 
@@ -1080,8 +1078,8 @@ public:
             for (auto it = m_counters.begin(); it != m_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_counters.begin());
                 if (has_label(m_counter_metadata[idx].labels)) {
-                    removed_metrics.push_back(std::move(m_counter_metadata[idx]));
-                    keep_alive_m_counters.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(m_counter_metadata[idx]), ptr});
                     it = m_counters.erase(it);
                     m_counter_metadata.erase(m_counter_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1093,8 +1091,9 @@ public:
             for (auto it = m_updown_counters.begin(); it != m_updown_counters.end();) {
                 auto idx = static_cast<std::size_t>(it - m_updown_counters.begin());
                 if (has_label(m_updown_counter_metadata[idx].labels)) {
-                    removed_metrics.push_back(std::move(m_updown_counter_metadata[idx]));
-                    keep_alive_m_updown_counters.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    auto& meta = m_updown_counter_metadata[idx];
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(meta), ptr});
                     it = m_updown_counters.erase(it);
                     m_updown_counter_metadata.erase(m_updown_counter_metadata.begin() +
                                                     static_cast<std::ptrdiff_t>(idx));
@@ -1107,8 +1106,8 @@ public:
             for (auto it = m_gauges.begin(); it != m_gauges.end();) {
                 auto idx = static_cast<std::size_t>(it - m_gauges.begin());
                 if (has_label(m_gauge_metadata[idx].labels)) {
-                    removed_metrics.push_back(std::move(m_gauge_metadata[idx]));
-                    keep_alive_m_gauges.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(m_gauge_metadata[idx]), ptr});
                     it = m_gauges.erase(it);
                     m_gauge_metadata.erase(m_gauge_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1120,8 +1119,8 @@ public:
             for (auto it = m_histograms.begin(); it != m_histograms.end();) {
                 auto idx = static_cast<std::size_t>(it - m_histograms.begin());
                 if (has_label(m_histogram_metadata[idx].labels)) {
-                    removed_metrics.push_back(std::move(m_histogram_metadata[idx]));
-                    keep_alive_m_histograms.push_back(std::move(*it));
+                    void* const ptr = it->get();
+                    batch.push_back({std::shared_ptr<void>{std::move(*it)}, std::move(m_histogram_metadata[idx]), ptr});
                     it = m_histograms.erase(it);
                     m_histogram_metadata.erase(m_histogram_metadata.begin() + static_cast<std::ptrdiff_t>(idx));
                 } else {
@@ -1130,34 +1129,9 @@ public:
             }
         }
 
-        // Same rule as the single-removal paths: defer when reentrant, otherwise drain first.
-        if (!removed_metrics.empty()) {
-            if (enumeration_depth() > 0) {
-                const std::lock_guard lk{m_deferred_mtx};
-                for (auto& owner : keep_alive_m_counters) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (auto& owner : keep_alive_m_updown_counters) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (auto& owner : keep_alive_m_gauges) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (auto& owner : keep_alive_m_histograms) {
-                    m_deferred_owners.emplace_back(std::move(owner));
-                }
-                for (const auto& meta : removed_metrics) {
-                    m_deferred_removals.push_back(meta);
-                }
-                return removed_metrics.size();
-            }
-            wait_for_enumerations();
-        }
-        for (const auto& meta : removed_metrics) {
-            notify_deregistration_unlocked(meta);
-        }
-
-        return removed_metrics.size();
+        const auto removed = batch.size();
+        finish_removals(std::move(batch)); // one rule for every removal path: defer or drain
+        return removed;
     }
 
     // ========================================================================
@@ -1174,6 +1148,18 @@ public:
      * @param callback Function to call when metrics are created
      * @param notify_existing If true, call callback for existing metrics
      * @return Observer ID that can be used to unregister
+     *
+     * **What an observer callback may and may not do.** Callbacks run with no registry lock
+     * held, so they may create metrics, remove metrics, and add or remove observers — including
+     * removing THEMSELVES. Two restrictions apply:
+     *
+     *  - Removing a DIFFERENT observer that is executing concurrently on another thread is NOT
+     *    supported: if each callback synchronously removes the other, both block waiting for the
+     *    other to finish. Removing yourself is fine, and so is removing an observer that is not
+     *    currently running.
+     *  - A metric removed from inside an observer callback is destroyed only once every in-flight
+     *    publication (an enumeration OR a create_* notification) completes, so it is not visible to other
+     *    threads until then.
      */
     auto add_observer(registration_callback callback, bool notify_existing = true) -> std::size_t {
         std::size_t id{};
@@ -1185,17 +1171,13 @@ public:
         // snapshot; one that arrives after blocks on this until the callbacks have run, and its
         // own keep-alive holds the metric valid throughout.
         std::shared_ptr<detail::observer_slot<registration_callback>> slot;
+        publication_guard pub;
         {
             auto lock = std::unique_lock{m_mutex};
 
             id = m_next_observer_id++;
             slot = std::make_shared<detail::observer_slot<registration_callback>>(callback);
             m_observers[id] = slot;
-            // Counted under m_mutex, so it is atomic with the snapshot below: a removal either
-            // sees this enumeration and waits it out, or erases first and is simply absent here.
-            if (notify_existing) {
-                m_enumerations_in_flight.fetch_add(1, std::memory_order_seq_cst);
-            }
             error_handler_copy = m_error_handler;
 
             if (notify_existing) {
@@ -1215,38 +1197,14 @@ public:
                 for (std::size_t i = 0; i < m_histograms.size(); ++i) {
                     existing_metrics.emplace_back(m_histogram_metadata[i], m_histograms[i].get());
                 }
+                // Armed as the LAST statement under m_mutex, so the count is atomic with the
+                // snapshot above: a removal either sees this publication and waits it out, or
+                // erases first and is simply absent from what was collected.
+                pub.arm(this);
             }
         }
 
-        // Notify for existing metrics outside lock to prevent slow observers from blocking.
-        // RAII so the enumeration count is released even if a callback throws.
-        struct enumeration_guard {
-            registry* self;
-            bool active;
-            explicit enumeration_guard(registry* s, bool a) : self(s), active(a) {
-                if (active) {
-                    ++enumeration_depth();
-                }
-            }
-            enumeration_guard(const enumeration_guard&) = delete;
-            auto operator=(const enumeration_guard&) -> enumeration_guard& = delete;
-            enumeration_guard(enumeration_guard&&) = delete;
-            auto operator=(enumeration_guard&&) -> enumeration_guard& = delete;
-            ~enumeration_guard() {
-                if (!active) {
-                    return;
-                }
-                const bool outermost = --enumeration_depth() == 0;
-                if (self->m_enumerations_in_flight.fetch_sub(1, std::memory_order_seq_cst) == 1) {
-                    const std::lock_guard lk{self->m_drain_mtx};
-                    self->m_drain_cv.notify_all();
-                }
-                if (outermost) {
-                    self->flush_deferred_removals(); // retract, then destroy, now it is safe
-                }
-            }
-        } guard{this, notify_existing};
-
+        // Notify for existing metrics outside the lock so a slow observer cannot block writers.
         for (const auto& [meta, ptr] : existing_metrics) {
             try {
                 invoke_observer(slot, [&](const registration_callback& cb) { cb(meta, ptr); });
@@ -1268,6 +1226,18 @@ public:
      * @brief Remove an observer
      *
      * @param observer_id ID returned from add_observer
+     *
+     * **What an observer callback may and may not do.** Callbacks run with no registry lock
+     * held, so they may create metrics, remove metrics, and add or remove observers — including
+     * removing THEMSELVES. Two restrictions apply:
+     *
+     *  - Removing a DIFFERENT observer that is executing concurrently on another thread is NOT
+     *    supported: if each callback synchronously removes the other, both block waiting for the
+     *    other to finish. Removing yourself is fine, and so is removing an observer that is not
+     *    currently running.
+     *  - A metric removed from inside an observer callback is destroyed only once every in-flight
+     *    publication (an enumeration OR a create_* notification) completes, so it is not visible to other
+     *    threads until then.
      */
     auto remove_observer(std::size_t observer_id) -> void {
         // m_observer_mtx first: a notification may be running RIGHT NOW with a copy of the
@@ -1297,6 +1267,18 @@ public:
      *
      * @param callback Function to call when metrics are removed
      * @return Observer ID that can be used to unregister
+     *
+     * **What an observer callback may and may not do.** Callbacks run with no registry lock
+     * held, so they may create metrics, remove metrics, and add or remove observers — including
+     * removing THEMSELVES. Two restrictions apply:
+     *
+     *  - Removing a DIFFERENT observer that is executing concurrently on another thread is NOT
+     *    supported: if each callback synchronously removes the other, both block waiting for the
+     *    other to finish. Removing yourself is fine, and so is removing an observer that is not
+     *    currently running.
+     *  - A metric removed from inside an observer callback is destroyed only once every in-flight
+     *    publication (an enumeration OR a create_* notification) completes, so it is not visible to other
+     *    threads until then.
      */
     auto add_deregistration_observer(deregistration_callback callback) -> std::size_t {
         auto lock = std::unique_lock{m_mutex};
@@ -1439,43 +1421,31 @@ public:
      * observers from blocking.
      */
     void clear() {
-        // Collect all metadata while locked
-        std::vector<metric_metadata> all_metadata;
+        // ONE lock scope, taking ownership as it goes. Snapshotting the metadata and emptying
+        // the containers as two separate critical sections silently drops every metric created
+        // in between: destroyed with no deregistration notice, so an observer that picked it up
+        // through the registration path is left holding a dangling pointer permanently. Handing
+        // the batch to finish_removals() also puts clear() under the same rule as every other
+        // removal path — defer when called from inside a callback, otherwise drain the
+        // publications that may still be handing out these pointers.
+        std::vector<deferred_removal> batch;
         {
             auto lock = std::unique_lock{m_mutex};
-            all_metadata.reserve(m_counter_metadata.size() + m_updown_counter_metadata.size() +
-                                 m_gauge_metadata.size() + m_histogram_metadata.size());
-            for (const auto& meta : m_counter_metadata) {
-                all_metadata.push_back(meta);
-            }
-            for (const auto& meta : m_updown_counter_metadata) {
-                all_metadata.push_back(meta);
-            }
-            for (const auto& meta : m_gauge_metadata) {
-                all_metadata.push_back(meta);
-            }
-            for (const auto& meta : m_histogram_metadata) {
-                all_metadata.push_back(meta);
-            }
+            batch.reserve(m_counters.size() + m_updown_counters.size() + m_gauges.size() + m_histograms.size());
+            auto take = [&batch](auto& metrics, auto& metadata) {
+                for (std::size_t i = 0; i < metrics.size(); ++i) {
+                    void* const ptr = metrics[i].get();
+                    batch.push_back({std::shared_ptr<void>{std::move(metrics[i])}, std::move(metadata[i]), ptr});
+                }
+                metrics.clear();
+                metadata.clear();
+            };
+            take(m_counters, m_counter_metadata);
+            take(m_updown_counters, m_updown_counter_metadata);
+            take(m_gauges, m_gauge_metadata);
+            take(m_histograms, m_histogram_metadata);
         }
-
-        // Notify deregistration observers outside the lock
-        for (const auto& meta : all_metadata) {
-            notify_deregistration_unlocked(meta);
-        }
-
-        // Now clear everything while locked
-        {
-            auto lock = std::unique_lock{m_mutex};
-            m_counters.clear();
-            m_counter_metadata.clear();
-            m_updown_counters.clear();
-            m_updown_counter_metadata.clear();
-            m_gauges.clear();
-            m_gauge_metadata.clear();
-            m_histograms.clear();
-            m_histogram_metadata.clear();
-        }
+        finish_removals(std::move(batch));
     }
 #endif // COMPOSITE_TESTING
 
@@ -1525,7 +1495,7 @@ private:
      * Called WITHOUT lock held to prevent slow observers from blocking.
      * Copies the observer map to allow concurrent modifications.
      */
-    auto notify_deregistration_unlocked(const metric_metadata& meta) -> void {
+    auto notify_deregistration_unlocked(const metric_metadata& meta, void* ptr) -> void {
         // Copy observers under lock
         decltype(m_deregistration_observers) observers_copy;
         error_callback error_handler_copy;
@@ -1538,7 +1508,7 @@ private:
         // Call observers without lock
         for (const auto& [id, slot] : observers_copy) {
             try {
-                invoke_observer(slot, [&](const deregistration_callback& callback) { callback(meta); });
+                invoke_observer(slot, [&](const deregistration_callback& callback) { callback(meta, ptr); });
             } catch (...) {
                 if (error_handler_copy) {
                     try {
@@ -1711,11 +1681,12 @@ private:
     ///    admission and wait for its callback to finish. Copying the observer map under m_mutex
     ///    is not enough on its own: the copy predates the call, so an erase could otherwise
     ///    return while a copied callback was about to run against torn-down state.
-    ///  - m_enumerations_in_flight covers add_observer(notify_existing), which publishes raw
-    ///    metric pointers after releasing m_mutex. A removal waits this out BEFORE announcing the
-    ///    deregistration, so an enumeration that is mid-flight registers the metric (still alive
-    ///    via the remover's keep-alive) and the retraction lands afterwards rather than being
-    ///    lost.
+    ///  - m_enumerations_in_flight counts PUBLICATIONS: add_observer(notify_existing), which walks
+    ///    a snapshot, and every create_*/get_or_create_*, which announces one new metric. Both hand
+    ///    out raw metric pointers after releasing m_mutex, so both must be waited out. A removal
+    ///    waits BEFORE announcing the deregistration, so a publication that is mid-flight registers
+    ///    the metric (still alive via the remover's keep-alive) and the retraction lands afterwards
+    ///    rather than being lost.
     mutable std::mutex m_drain_mtx;
     mutable std::condition_variable m_drain_cv;
     std::atomic<int> m_enumerations_in_flight{0};
@@ -1734,7 +1705,90 @@ private:
         return slots;
     }
 
-    /// Block until no enumeration is publishing metric pointers. Cold path (removal only).
+    /// One removal waiting for the last publication to finish. The POINTER is part of the record,
+    /// not just the metadata: name+labels does not identify a metric across a delete/recreate, and
+    /// a callback is allowed to do exactly that (remove "x", create "x") while the enumeration
+    /// that deferred the removal is still running. Retracting by name alone then cancels the
+    /// LIVE replacement and leaves the dead original's series in place — a silently unexported
+    /// metric plus a dangling pointer, which is worse than the race it was meant to close.
+    struct deferred_removal {
+        std::shared_ptr<void> owner; ///< adopts the unique_ptr's deleter; keeps the metric alive
+        metric_metadata meta;
+        void* ptr; ///< identity of the metric being retracted
+    };
+
+    /// Counts one in-progress PUBLICATION — any handoff of a raw metric pointer to an observer
+    /// callback. Two paths publish: add_observer(notify_existing), which walks a snapshot, and
+    /// every create_*/get_or_create_*, which announces one new metric. Both must be counted:
+    /// a removal that waited only for the enumeration would happily destroy a metric whose
+    /// registration callback is still running on another thread, and — because the retraction
+    /// then lands BEFORE the registration — leave the observer holding a dangling pointer
+    /// permanently rather than merely transiently.
+    ///
+    /// arm() MUST be called with m_mutex held, so the count is atomic with the container state
+    /// the publication is about to hand out. Declare the guard OUTSIDE the lock scope and arm it
+    /// as the last statement inside: anything that throws before arming never needed the count,
+    /// and anything that throws after it is unwound by ~publication_guard. (Incrementing inline
+    /// and relying on a guard constructed after the lock scope leaves a throw in between to leak
+    /// the count forever, which wedges every future removal registry-wide.)
+    class publication_guard {
+    public:
+        publication_guard() = default;
+        publication_guard(const publication_guard&) = delete;
+        auto operator=(const publication_guard&) -> publication_guard& = delete;
+        publication_guard(publication_guard&&) = delete;
+        auto operator=(publication_guard&&) -> publication_guard& = delete;
+        ~publication_guard() {
+            if (m_self == nullptr) {
+                return;
+            }
+            // CONTAINED: this destructor is implicitly noexcept, and end_publication() both
+            // allocates (it copies the observer map to notify retractions) and runs third-party
+            // deregistration callbacks. Letting either escape would turn a failed retraction into
+            // std::terminate for the whole process.
+            try {
+                m_self->end_publication();
+            } catch (...) { // NOLINT(bugprone-empty-catch) — nothing safe to do from a destructor
+            }
+        }
+        /// Call with m_mutex held.
+        auto arm(registry* self) -> void {
+            ++enumeration_depth();
+            self->m_enumerations_in_flight.fetch_add(1, std::memory_order_seq_cst);
+            m_self = self;
+        }
+
+    private:
+        registry* m_self{nullptr};
+    };
+
+    /// Close a publication: drop the counts and, if this was the last one anywhere, run the
+    /// removals that reentrant callbacks deferred.
+    auto end_publication() -> void {
+        --enumeration_depth(); // this thread's nesting bookkeeping
+        std::vector<deferred_removal> pending;
+        {
+            // The decrement and the queue handoff are ONE critical section. Deciding "last one
+            // out" and then flushing as two steps leaves a window in which a new publication
+            // starts, defers a removal, and has that removal destroyed underneath it by the
+            // thread still finishing the old one. The queue is global; the decision about it
+            // must be too.
+            const std::lock_guard lk{m_deferred_mtx};
+            if (m_enumerations_in_flight.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                pending.swap(m_deferred);
+            }
+        }
+        {
+            const std::lock_guard lk{m_drain_mtx};
+            m_drain_cv.notify_all();
+        }
+        for (const auto& entry : pending) {
+            notify_deregistration_unlocked(entry.meta, entry.ptr); // retract...
+        }
+        // ...then destroy: `pending` dies here, after every observer has let the pointers go.
+    }
+
+    /// Block until no publication is handing out metric pointers. Cold path (removal only).
     /// Callers must handle the reentrant case themselves — see finish_removal().
     auto wait_for_enumerations() const -> void {
         std::unique_lock lk{m_drain_mtx};
@@ -1743,44 +1797,39 @@ private:
 
     /// Complete a removal: retract the series, then destroy the metric.
     ///
-    /// Reentrant case (this thread is inside an enumeration): DEFER both. The enumeration holds
-    /// raw pointers to a snapshot it has not finished walking, so destroying this metric now
-    /// would leave a later entry dangling — and retracting now would let the enumeration register
-    /// the metric AFTERWARDS, stranding a series. Both are queued and run when the outermost
-    /// enumeration finishes, which puts the retraction after the registration and the destruction
-    /// after both.
+    /// Reentrant case (this thread is inside a publication): DEFER both. The publication holds raw
+    /// pointers it has not finished handing out, so destroying this metric now would leave a later
+    /// entry dangling — and retracting now would let the publication register the metric
+    /// AFTERWARDS, stranding a series. Both are queued and run when the last publication anywhere
+    /// finishes, which puts the retraction after the registration and the destruction after both.
     template <typename Metric>
     auto finish_removal(std::unique_ptr<Metric> owner, const metric_metadata& meta) -> void {
+        void* const ptr = owner.get();
+        std::vector<deferred_removal> one;
+        one.push_back({std::shared_ptr<void>{std::move(owner)}, meta, ptr});
+        finish_removals(std::move(one));
+    }
+
+    /// The single rule every removal path goes through, bulk or not.
+    auto finish_removals(std::vector<deferred_removal> batch) -> void {
+        if (batch.empty()) {
+            return;
+        }
         if (enumeration_depth() > 0) {
             const std::lock_guard lk{m_deferred_mtx};
-            m_deferred_owners.emplace_back(std::move(owner)); // shared_ptr<void> adopts the deleter
-            m_deferred_removals.push_back(meta);
+            m_deferred.insert(m_deferred.end(), std::make_move_iterator(batch.begin()),
+                              std::make_move_iterator(batch.end()));
             return;
         }
         wait_for_enumerations();
-        notify_deregistration_unlocked(meta);
-        // `owner` dies here, after every observer has retracted it.
-    }
-
-    /// Run the removals deferred by reentrant callbacks. Called when the outermost enumeration
-    /// on this thread completes.
-    auto flush_deferred_removals() -> void {
-        std::vector<std::shared_ptr<void>> owners;
-        std::vector<metric_metadata> removals;
-        {
-            const std::lock_guard lk{m_deferred_mtx};
-            owners.swap(m_deferred_owners);
-            removals.swap(m_deferred_removals);
+        for (const auto& entry : batch) {
+            notify_deregistration_unlocked(entry.meta, entry.ptr);
         }
-        for (const auto& meta : removals) {
-            notify_deregistration_unlocked(meta);
-        }
-        // owners destroyed here, after the retractions above.
+        // `batch` dies here, after every observer has retracted its entries.
     }
 
     mutable std::mutex m_deferred_mtx;
-    std::vector<std::shared_ptr<void>> m_deferred_owners; ///< kept alive until enumeration ends
-    std::vector<metric_metadata> m_deferred_removals;     ///< retractions owed once it does
+    std::vector<deferred_removal> m_deferred;
 
     std::vector<std::unique_ptr<counter<uint64_t>>> m_counters;
     std::vector<metric_metadata> m_counter_metadata;
@@ -1814,7 +1863,13 @@ private:
             flight_guard(flight_guard&&) = delete;
             auto operator=(flight_guard&&) -> flight_guard& = delete;
             ~flight_guard() {
-                if (slot->in_flight.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                const bool was_last = slot->in_flight.fetch_sub(1, std::memory_order_seq_cst) == 1;
+                // A retiring thread may be waiting for the count to come down to its OWN
+                // in-flight frames rather than to zero, so the 1->0 edge is not the only one
+                // worth announcing. seq_cst makes this sufficient: retire_observer stores
+                // `closed` before reading in_flight, so if it saw a count it must still wait
+                // for, this decrement is ordered after that store and sees `closed` set.
+                if (was_last || slot->closed.load(std::memory_order_seq_cst)) {
                     const std::lock_guard lk{self->m_drain_mtx};
                     self->m_drain_cv.notify_all();
                 }
@@ -1839,17 +1894,21 @@ private:
             return;
         }
         slot->closed.store(true, std::memory_order_seq_cst);
-        // An observer removing ITSELF from inside its own callback must not wait: the only
-        // in-flight count is this very call, and only its return can decrement it. `closed` is
-        // already set, so no further invocation can start — which is the guarantee callers
-        // actually need. (Two observers each removing the other, concurrently, would still
-        // deadlock; that is documented as unsupported rather than defended against.)
+        // An observer removing ITSELF from inside its own callback cannot wait for in_flight to
+        // reach zero: this very call is one of the counts, and only its return can drop it. But
+        // waiting for zero is not the same as not waiting at all — the SAME observer is routinely
+        // executing on other threads too (every create_* on every thread invokes it), and those
+        // frames are exactly what the caller is promised have stopped. So wait the count down to
+        // this thread's OWN contribution rather than skipping the wait outright.
+        //
+        // Only one thread can ever reach here for a given slot (the caller erased it from the
+        // observer map first, so a concurrent remove of the same id finds nothing), which is what
+        // keeps two self-removers from waiting on each other.
         const auto& active = invoking_slots();
-        if (std::find(active.begin(), active.end(), static_cast<const void*>(slot.get())) != active.end()) {
-            return;
-        }
+        const auto own =
+            static_cast<int>(std::count(active.begin(), active.end(), static_cast<const void*>(slot.get())));
         std::unique_lock lk{m_drain_mtx};
-        m_drain_cv.wait(lk, [&slot] { return slot->in_flight.load(std::memory_order_seq_cst) == 0; });
+        m_drain_cv.wait(lk, [&slot, own] { return slot->in_flight.load(std::memory_order_seq_cst) <= own; });
     }
 
     registration_observer_map m_observers;

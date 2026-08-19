@@ -1025,7 +1025,7 @@ TEST_CASE("Deregistration observer notifications", "[metrics][registry][removal]
     SECTION("Observer is called when metric is removed") {
         std::vector<std::string> removed_names;
         auto observer_id = registry::instance().add_deregistration_observer(
-            [&](const metric_metadata& meta) { removed_names.push_back(meta.name); });
+            [&](const metric_metadata& meta, void*) { removed_names.push_back(meta.name); });
 
         registry::instance().create_counter("observer.test1");
         registry::instance().create_counter("observer.test2");
@@ -1040,7 +1040,7 @@ TEST_CASE("Deregistration observer notifications", "[metrics][registry][removal]
     SECTION("Observer is called for bulk removal") {
         std::vector<std::string> removed_names;
         auto observer_id = registry::instance().add_deregistration_observer(
-            [&](const metric_metadata& meta) { removed_names.push_back(meta.name); });
+            [&](const metric_metadata& meta, void*) { removed_names.push_back(meta.name); });
 
         registry::instance().create_counter("bulk.a");
         registry::instance().create_counter("bulk.b");

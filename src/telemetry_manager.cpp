@@ -21,6 +21,7 @@
 
 #include "composite/metrics/metrics.hpp"
 #include "composite/telemetry/manager.hpp"
+#include "telemetry_boundary_format.hpp"
 
 #include <opentelemetry/exporters/otlp/otlp_http_metric_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_http_metric_exporter_options.h>
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdlib>
+#include <format>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -127,8 +129,10 @@ struct series_entry {
  * callback must never take that, or an export could deadlock against a registration.
  */
 struct instrument_group {
-    std::string otel_name; ///< the name handed to the SDK (may carry a histogram suffix)
-    std::string base_name; ///< the native metric name, for deregistration
+    std::string otel_name;   ///< the name handed to the SDK (may carry a histogram suffix)
+    std::string base_name;   ///< the native metric name, for deregistration
+    std::string unit;        ///< as handed to the SDK; later series reusing the name inherit it
+    std::string description; ///< likewise
     metrics::metric_type type{};
     instrument_role role{instrument_role::value};
     std::mutex mtx;
@@ -137,10 +141,14 @@ struct instrument_group {
     /// The callback registered on `instrument`, kept so the destructor can retire it.
     opentelemetry::metrics::ObservableCallbackPtr callback{nullptr};
 
-    /// DECLARED LAST so it is DESTROYED FIRST. Members are destroyed in reverse declaration
-    /// order, so an instrument declared above `mtx`/`series` would outlive them — and it owns a
-    /// callback whose state is this very object. A callback firing during teardown would then
-    /// touch an already-destroyed mutex and vector.
+    /// DECLARED LAST so it is DESTROYED FIRST — defence in depth, not the actual guarantee.
+    ///
+    /// What really makes teardown safe is that the SDK's ObservableRegistry::Observe() holds its
+    /// callbacks_m_ mutex across the entire callback loop, and RemoveCallback (below) takes the
+    /// same mutex — so ~instrument_group blocks until any in-flight export has finished. If an SDK
+    /// upgrade ever moves to a per-callback or lock-free callback list, that guarantee is gone and
+    /// this declaration order is all that is left, which is NOT sufficient on its own. Treat a
+    /// change to that SDK internal as a breaking change for this file.
     opentelemetry::nostd::shared_ptr<otel_metrics::ObservableInstrument> instrument;
 
     instrument_group() = default;
@@ -169,6 +177,10 @@ struct manager::impl {
 
     // OTel meter for creating instruments
     opentelemetry::nostd::shared_ptr<otel_metrics::Meter> meter;
+
+    /// OUR provider, kept so shutdown() can flush it. Reaching for the global provider instead
+    /// would flush whatever happens to be installed at the time, which is not necessarily ours.
+    opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> provider;
 
     // Observer registration IDs from the metrics registry
     std::optional<std::size_t> registration_observer_id;
@@ -475,6 +487,7 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
 
         // Set as global provider (convert unique_ptr to nostd::shared_ptr)
         opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> shared_provider(provider.release());
+        m_impl->provider = shared_provider;
         otel_metrics::Provider::SetMeterProvider(shared_provider);
 
         // Get meter for our instrumentation
@@ -492,20 +505,52 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         // released, and if the deregistration observer were installed only afterwards, the notice
         // would find no observer and the series for a now-destroyed metric would be stranded.
         // Subscribing in this order means the retraction always has somewhere to land.
+        // Unsubscribe again if anything below throws. add_observer(notify_existing) allocates a
+        // snapshot of the whole registry and runs user callbacks, so it is not throw-free. Leaving
+        // the deregistration observer behind on that path would be permanent: shutdown() and
+        // ~manager both early-out on `initialized`, which is false by then, so nothing would ever
+        // remove a subscription that still holds `this` — and a retry would overwrite the id and
+        // orphan the first one on top of that.
+        struct subscription_guard {
+            manager::impl* impl;
+            metrics::registry* reg;
+            bool committed{false};
+            ~subscription_guard() {
+                if (committed) {
+                    return;
+                }
+                if (impl->registration_observer_id) {
+                    reg->remove_observer(*impl->registration_observer_id);
+                    impl->registration_observer_id.reset();
+                }
+                if (impl->deregistration_observer_id) {
+                    reg->remove_deregistration_observer(*impl->deregistration_observer_id);
+                    impl->deregistration_observer_id.reset();
+                }
+            }
+        } subs{m_impl.get(), &registry};
+
         m_impl->deregistration_observer_id = registry.add_deregistration_observer(
-            [this](const metrics::metric_metadata& meta) { remove_otel_instrument(meta); });
+            [this](const metrics::metric_metadata& meta, void* ptr) { remove_otel_instrument(meta, ptr); });
 
         m_impl->registration_observer_id =
             registry.add_observer([this](const metrics::metric_metadata& meta,
                                          void* metric_ptr) { create_otel_instrument(meta, metric_ptr); },
                                   true // notify for existing metrics
             );
+        subs.committed = true;
 
         spdlog::info("telemetry: OTLP export initialized (interval: {}ms)", m_impl->config.export_interval.count());
         return true;
 
     } catch (const std::exception& e) {
         spdlog::error("telemetry: failed to initialize OTLP export: {}", e.what());
+        {
+            const auto inst_lock = std::lock_guard{m_impl->instrument_mutex};
+            m_impl->instruments.clear();
+        }
+        m_impl->meter = opentelemetry::nostd::shared_ptr<otel_metrics::Meter>{};
+        m_impl->provider = opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider>{};
         m_impl->initialized.store(false);
         return false;
     }
@@ -520,53 +565,63 @@ auto manager::shutdown() -> void {
 
     spdlog::debug("telemetry: shutting down OTLP export");
 
-    // Unregister from metrics registry
+    // ORDER MATTERS, and it is the reverse of the intuitive one. The deregistration observer is
+    // what keeps a series from outliving its native metric, so it must be the LAST thing removed —
+    // it has to stay installed for as long as any observable callback can still fire. Removing
+    // both observers up front left a window in which a concurrent remove_counter() destroyed its
+    // metric with nobody listening, while an export callback still held that raw pointer and
+    // dereferenced it on the very next collect (including the ForceFlush below).
+    //
+    //   1. registration observer off  — no NEW series can appear from here on
+    //   2. deregistration observer STAYS — retractions still land while callbacks can run
+    //   3. flush                      — the final collect, callbacks still live
+    //   4. clear instruments          — RemoveCallback retires each callback synchronously
+    //   5. deregistration observer off — nothing can dereference a metric any more
     auto& registry = metrics::registry::instance();
     if (m_impl->registration_observer_id) {
         registry.remove_observer(*m_impl->registration_observer_id);
         m_impl->registration_observer_id.reset();
     }
-    if (m_impl->deregistration_observer_id) {
-        registry.remove_deregistration_observer(*m_impl->deregistration_observer_id);
-        m_impl->deregistration_observer_id.reset();
+
+    // Flush BEFORE clearing. Clearing retires every observable callback (~instrument_group calls
+    // RemoveCallback), so a collect after that point observes nothing — the whole last export
+    // interval, which is exactly the data that explains why a component exited, would be discarded
+    // on every clean shutdown.
+    if (m_impl->provider) {
+        try {
+            static_cast<sdk_metrics::MeterProvider*>(m_impl->provider.get())->ForceFlush();
+        } catch (const std::exception& e) {
+            spdlog::warn("telemetry: final flush failed: {}", e.what());
+        }
     }
 
-    // Clear instruments and their contexts (prevents memory leaks)
+    // Clear instruments and their contexts (prevents memory leaks). ~instrument_group's
+    // RemoveCallback serializes against the SDK's callback loop, so once this returns no callback
+    // is running or can start.
     {
         auto inst_lock = std::lock_guard{m_impl->instrument_mutex};
         m_impl->instruments.clear(); // unique_ptr contexts are automatically deleted
     }
 
+    // Only NOW is it safe to stop listening for retractions: nothing is left that could hold a
+    // native metric pointer. remove_deregistration_observer() waits out any retraction already
+    // executing, so this also cannot cut one short.
+    if (m_impl->deregistration_observer_id) {
+        registry.remove_deregistration_observer(*m_impl->deregistration_observer_id);
+        m_impl->deregistration_observer_id.reset();
+    }
+
     // Reset meter. Assignment, not .reset(): nostd::shared_ptr only grew reset() in newer
     // opentelemetry-cpp releases, and this must compile against distro packages (1.19).
     m_impl->meter = opentelemetry::nostd::shared_ptr<otel_metrics::Meter>{};
+    m_impl->provider = opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider>{};
 
-    // Replace global provider with noop to flush pending exports
+    // Replace the global provider with a noop so nothing keeps exporting after us
     opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> noop_provider(new otel_metrics::NoopMeterProvider());
     otel_metrics::Provider::SetMeterProvider(noop_provider);
 
     m_impl->initialized.store(false);
     spdlog::info("telemetry: OTLP export shutdown complete");
-}
-
-/**
- * @brief Check if two label sets are equal (order-independent)
- */
-static auto labels_match(const metrics::labels_t& a, const metrics::labels_t& b) -> bool {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    auto a_sorted = a;
-    auto b_sorted = b;
-    auto by_key = [](const metrics::label_pair& left, const metrics::label_pair& right) {
-        if (left.first != right.first) {
-            return left.first < right.first;
-        }
-        return left.second < right.second;
-    };
-    std::sort(a_sorted.begin(), a_sorted.end(), by_key);
-    std::sort(b_sorted.begin(), b_sorted.end(), by_key);
-    return a_sorted == b_sorted;
 }
 
 namespace {
@@ -612,15 +667,40 @@ void observe_hist_sum(opentelemetry::metrics::ObserverResult result, void* state
     observe_all<metrics::histogram, double>(result, state, [](auto* m, const series_entry&) { return m->sum(); });
 }
 
+/// Cumulative bucket values for ONE histogram, computed from ONE snapshot.
+///
+/// Re-reading bucket_counts() per series (the obvious shape, and what observe_all() would give)
+/// takes an independent sample of a concurrently-mutating array for every bucket, so bucket `le=10`
+/// can be sampled later than `le=5` and come out SMALLER. Cumulative buckets that decrease are not
+/// a rounding artefact: a consumer differences adjacent buckets to get populations, so it computes
+/// a negative count and histogram_quantile() returns garbage. One snapshot also turns an O(B^2)
+/// summation with B allocations into O(B) with one.
 void observe_hist_bucket(opentelemetry::metrics::ObserverResult result, void* state) {
-    observe_all<metrics::histogram, int64_t>(result, state, [](auto* m, const series_entry& series) {
-        const auto counts = m->bucket_counts();
-        int64_t cumulative = 0; // Prometheus buckets are cumulative
-        for (std::size_t i = 0; i <= series.bucket_idx && i < counts.size(); ++i) {
-            cumulative += static_cast<int64_t>(counts[i]);
+    auto* group = static_cast<instrument_group*>(state);
+    auto* observer = opentelemetry::nostd::get_if<
+        opentelemetry::nostd::shared_ptr<opentelemetry::metrics::ObserverResultT<int64_t>>>(&result);
+    if (observer == nullptr) {
+        return;
+    }
+    const std::lock_guard lock{group->mtx};
+    const void* cached = nullptr;
+    std::vector<int64_t> cumulative; // prefix sums of one snapshot
+    for (const auto& series : group->series) {
+        if (series.metric != cached) {
+            // create_otel_instrument() appends a histogram's buckets consecutively, so this
+            // re-snapshots once per histogram rather than once per bucket.
+            cached = series.metric;
+            const auto data = static_cast<metrics::histogram*>(series.metric)->snapshot();
+            cumulative.assign(data.bucket_counts.size(), 0);
+            int64_t running = 0;
+            for (std::size_t i = 0; i < data.bucket_counts.size(); ++i) {
+                running += static_cast<int64_t>(data.bucket_counts[i]);
+                cumulative[i] = running;
+            }
         }
-        return cumulative;
-    });
+        const auto value = series.bucket_idx < cumulative.size() ? cumulative[series.bucket_idx] : 0;
+        (*observer)->Observe(value, series.attributes);
+    }
 }
 
 } // namespace
@@ -639,6 +719,28 @@ auto manager::group_for(const std::string& otel_name, const std::string& base_na
         // gauge<double>* to counter<uint64_t>*. Histogram suffixes collide the same way — a
         // native counter named "x_count" against a histogram "x" that exports "x_count".
         if (group->type == type && group->role == role && group->base_name == base_name) {
+            // UNIT MISMATCH IS A REFUSAL, not a warning. Unit is part of an instrument's identity
+            // in the OTel spec, but the registry's uniqueness rule is per name+labels, so two
+            // components can legitimately register the same name with different units. Every
+            // series of one instrument carries the FIRST registration's unit, so appending here
+            // would export the second component's milliseconds labelled as seconds — silently
+            // wrong data, which is worse than an absent series. Same treatment as the type
+            // collision below: refuse, and say exactly what to do about it.
+            if (group->unit != unit) {
+                spdlog::error("telemetry: unit collision on '{}' — existing series from '{}' are "
+                              "exported with unit '{}'; refusing to add a series with unit '{}'. "
+                              "One instrument carries one unit: rename the metric, or make the "
+                              "units agree.",
+                              otel_name, group->base_name, group->unit, unit);
+                return nullptr; // add_series() is a no-op on nullptr
+            }
+            // Description is cosmetic — it does not change what a value MEANS — so a mismatch is
+            // reported and the first one wins rather than dropping the series.
+            if (group->description != description) {
+                spdlog::warn("telemetry: '{}' reused with a different description (keeping '{}', "
+                             "ignoring '{}').",
+                             otel_name, group->description, description);
+            }
             return group.get(); // one instrument per NAME — reuse it and append a series
         }
         spdlog::error("telemetry: metric name collision on '{}' — existing series come from '{}' "
@@ -654,6 +756,8 @@ auto manager::group_for(const std::string& otel_name, const std::string& base_na
     group->base_name = base_name;
     group->type = type;
     group->role = role;
+    group->unit = unit;
+    group->description = description;
 
     opentelemetry::metrics::ObservableCallbackPtr callback{nullptr};
     switch (role) {
@@ -662,7 +766,19 @@ auto manager::group_for(const std::string& otel_name, const std::string& base_na
         callback = &observe_hist_count;
         break;
     case instrument_role::hist_sum:
-        group->instrument = m_impl->meter->CreateDoubleObservableGauge(otel_name, description, unit);
+        // An UpDownCounter: a cumulative SUM that does NOT claim monotonicity.
+        //
+        // Neither obvious choice is right. A Gauge puts this third of the histogram family on a
+        // different aggregation temporality from `_count` and `_bucket`, so a collector cannot
+        // reconstruct the histogram. A monotonic Counter would be a lie: histogram::record()
+        // accepts negative observations (metrics/types.hpp), so the sum genuinely can decrease —
+        // and a decreasing OTLP counter is read as a COUNTER RESET, making the collector add the
+        // whole new value and invent an enormous spurious rate.
+        //
+        // UpDownCounter is the honest encoding: same Sum type and temporality as the other two,
+        // is_monotonic=false. If negative observations are ever rejected at record(), this can
+        // become a plain Counter and rate() over `_sum` becomes meaningful.
+        group->instrument = m_impl->meter->CreateDoubleObservableUpDownCounter(otel_name, description, unit);
         callback = &observe_hist_sum;
         break;
     case instrument_role::hist_bucket:
@@ -718,7 +834,7 @@ auto manager::add_series(void* group_ptr, void* metric, const metrics::labels_t&
  * same metric name keep exporting. An instrument is destroyed only once its last series goes,
  * which is also what stops its callback firing against freed metrics.
  */
-auto manager::remove_otel_instrument(const metrics::metric_metadata& meta) -> void {
+auto manager::remove_otel_instrument(const metrics::metric_metadata& meta, void* metric_ptr) -> void {
     if (!m_impl->meter) {
         return;
     }
@@ -726,24 +842,20 @@ auto manager::remove_otel_instrument(const metrics::metric_metadata& meta) -> vo
 
     std::size_t dropped = 0;
     for (auto& group : m_impl->instruments) {
-        // Match on TYPE as well as name. A metric refused by group_for() as a type collision
-        // still has metadata with the same name and labels as the accepted one, so removing the
-        // refused metric would otherwise strip the surviving metric's series — leaving a live
-        // metric silently unexported.
-        if (group->base_name != meta.name || group->type != meta.type) {
-            continue;
-        }
+        // Match on the POINTER, which is what a series actually is. Name+labels does not identify
+        // a metric: removing "x" and creating "x" again is legal, and the retraction for the
+        // original then arrives while the replacement is live — cancelling the replacement's
+        // series and leaving the dead original's in place. Pointer identity also makes the
+        // type-collision case fall out for free (a refused metric is a different object) and
+        // sweeps all three of a histogram's roles, which share one native metric.
         const std::lock_guard series_lock{group->mtx};
         auto it = std::remove_if(group->series.begin(), group->series.end(),
-                                 [&meta](const series_entry& s) { return labels_match(s.raw_labels, meta.labels); });
+                                 [metric_ptr](const series_entry& s) { return s.metric == metric_ptr; });
         dropped += static_cast<std::size_t>(std::distance(it, group->series.end()));
         group->series.erase(it, group->series.end());
     }
 
-    // Retire instruments that no longer carry anything.
-    auto empty = std::remove_if(m_impl->instruments.begin(), m_impl->instruments.end(),
-                                [](const std::unique_ptr<instrument_group>& g) { return g->series.empty(); });
-    m_impl->instruments.erase(empty, m_impl->instruments.end());
+    prune_empty_groups();
 
     if (dropped != 0) {
         spdlog::debug("telemetry: removed {} OTel series for '{}'", dropped, meta.name);
@@ -760,6 +872,13 @@ auto manager::exported_series_counts() const -> std::pair<std::size_t, std::size
     return {m_impl->instruments.size(), series};
 }
 
+/// Retire instruments that no longer carry any series. Call with instrument_mutex held.
+auto manager::prune_empty_groups() -> void {
+    auto empty = std::remove_if(m_impl->instruments.begin(), m_impl->instruments.end(),
+                                [](const std::unique_ptr<instrument_group>& g) { return g->series.empty(); });
+    m_impl->instruments.erase(empty, m_impl->instruments.end());
+}
+
 auto manager::create_otel_instrument(const metrics::metric_metadata& meta, void* metric_ptr) -> void {
     if (!m_impl->meter) {
         return;
@@ -774,22 +893,50 @@ auto manager::create_otel_instrument(const metrics::metric_metadata& meta, void*
             auto* native = static_cast<metrics::histogram*>(metric_ptr);
             const auto& boundaries = native->boundaries();
 
-            add_series(group_for(meta.name + "_count", meta.name, meta.type,
-                                 static_cast<int>(instrument_role::hist_count), meta.description + " (count)", "1"),
-                       metric_ptr, meta.labels, labels, 0);
-            add_series(group_for(meta.name + "_sum", meta.name, meta.type, static_cast<int>(instrument_role::hist_sum),
-                                 meta.description + " (sum)", meta.unit),
-                       metric_ptr, meta.labels, labels, 0);
-
+            // ALL THREE OR NONE. A histogram is exported as three instruments, and group_for()
+            // refuses per role — so an existing native counter called "x_count", or a second
+            // histogram "x" with a different unit, used to knock out one role while the other two
+            // registered anyway. The result is a malformed family (buckets and a sum with no
+            // count, say) whose exact shape depends on registration order, and no collector can
+            // reconstruct a histogram from it. Preflight all three, then commit.
+            void* count_group =
+                group_for(meta.name + "_count", meta.name, meta.type, static_cast<int>(instrument_role::hist_count),
+                          meta.description + " (count)", "1");
+            void* sum_group =
+                group_for(meta.name + "_sum", meta.name, meta.type, static_cast<int>(instrument_role::hist_sum),
+                          meta.description + " (sum)", meta.unit);
             // One instrument named "<name>_bucket" carrying a series per bucket, distinguished by
             // the "le" attribute. Previously each bucket created its own same-named instrument, so
             // all but one bucket were silently dropped by the SDK.
             void* bucket_group =
                 group_for(meta.name + "_bucket", meta.name, meta.type, static_cast<int>(instrument_role::hist_bucket),
                           meta.description + " (bucket)", "1");
+            if (count_group == nullptr || sum_group == nullptr || bucket_group == nullptr) {
+                spdlog::error("telemetry: refusing to export histogram '{}' — one of its three instruments "
+                              "({}_count / {}_sum / {}_bucket) collided with an existing instrument (see the "
+                              "error above). Exporting a partial family is worse than exporting none: a "
+                              "collector cannot reconstruct a histogram from buckets with no count. Rename "
+                              "the metric, or the instrument it collides with.",
+                              meta.name, meta.name, meta.name, meta.name);
+                prune_empty_groups(); // drop whichever of the three we just created but never filled
+                return;
+            }
+
+            add_series(count_group, metric_ptr, meta.labels, labels, 0);
+            add_series(sum_group, metric_ptr, meta.labels, labels, 0);
             for (std::size_t i = 0; i <= boundaries.size(); ++i) {
                 auto bucket_labels = labels;
-                bucket_labels.emplace_back("le", (i < boundaries.size()) ? std::to_string(boundaries[i]) : "+Inf");
+                // SHORTEST ROUND-TRIP representation, via to_chars. to_string is fixed 6-decimal
+                // and {:g} defaults to 6 significant digits — both render distinct nearby bounds
+                // identically (1e-7 and 2e-7 both become "0.000000"; 1.0000000000000002 and 1.0
+                // both become "1"). Two series with identical attribute sets in one group is
+                // exactly the collapse this grouping rewrite exists to prevent: ObserverResultT
+                // keys measurements by attribute set, so one bucket would silently overwrite the
+                // other. to_chars emits the fewest digits that recover the exact double, so two
+                // different doubles can never produce the same label — and ordinary bounds still
+                // read as "1", "5", "10" rather than 17-digit noise.
+                bucket_labels.emplace_back("le",
+                                           (i < boundaries.size()) ? detail::format_boundary(boundaries[i]) : "+Inf");
                 add_series(bucket_group, metric_ptr, meta.labels, bucket_labels, i);
             }
 

@@ -95,12 +95,22 @@ public:
     auto is_initialized() const -> bool;
 
     /**
-     * @brief Diagnostics: (instrument count, total exported series).
+     * @brief SUPPORTED diagnostics: (instrument count, total exported series).
      *
-     * Exists because the failure this guards against is invisible from outside the process: if
-     * N components publishing the same metric name collapse into one series, the exporter still
-     * looks healthy — you only notice at the collector, where N-1 components are missing. The
-     * invariant worth asserting is that one INSTRUMENT can carry many SERIES.
+     * Deliberately part of the public v0.5 surface, not a test hook. Export cardinality is the
+     * main operational hazard of an OTLP bridge — an unbounded label set costs money at the
+     * collector long before it costs anything here — and this is the only way to see it from
+     * inside the process.
+     *
+     * It also pins the invariant one INSTRUMENT carries many SERIES, whose violation is otherwise
+     * invisible locally: if N components publishing the same metric name collapse into a single
+     * series, this side still looks healthy and you only discover the loss at the collector, where
+     * N-1 components have silently gone missing.
+     *
+     * Kept unconditional rather than gated behind COMPOSITE_TESTING because that macro is scoped
+     * to the test directory: gating the declaration but not the definition breaks the build, and
+     * gating both makes the library's exported symbols depend on whether tests were enabled.
+     * A public API that appears and disappears with a build flag is worse than a small one.
      */
     COMPOSITE_API
     auto exported_series_counts() const -> std::pair<std::size_t, std::size_t>;
@@ -130,12 +140,18 @@ private:
      *
      * Called by the deregistration observer when native metrics are removed.
      * Prevents use-after-free by cleaning up instruments before the native
-     * metric is destroyed. Matches by both name AND labels to avoid removing
-     * metrics with the same name but different label sets.
+     * metric is destroyed.
      *
-     * @param meta Metadata of the metric being removed (includes name and labels)
+     * Matches on the POINTER, not on name+labels. A name is reusable — removing "x" and creating
+     * "x" again produces a different metric — so name matching would cancel a live replacement
+     * when the original's retraction arrives. Pointer identity also sweeps all three of a
+     * histogram's roles, which share one native metric, and makes a refused type/unit collision a
+     * non-event (a refused metric is a different object).
+     *
+     * @param meta       Metadata of the metric being removed (used for diagnostics)
+     * @param metric_ptr The metric being removed — the identity every series is matched against
      */
-    auto remove_otel_instrument(const metrics::metric_metadata& meta) -> void;
+    auto remove_otel_instrument(const metrics::metric_metadata& meta, void* metric_ptr) -> void;
 
     /// Find-or-create the instrument that carries @p otel_name, returning it as an opaque
     /// handle (void* so this header need not see the OTel types). One instrument per NAME:
@@ -143,6 +159,9 @@ private:
     /// the first rather than adding a series. Returns nullptr if creation failed.
     auto group_for(const std::string& otel_name, const std::string& base_name, metrics::metric_type type, int role_raw,
                    const std::string& description, const std::string& unit) -> void*;
+
+    /// Drop instruments that carry no series. Call with instrument_mutex held.
+    auto prune_empty_groups() -> void;
 
     /// Append one exported series to a group obtained from group_for().
     auto add_series(void* group_ptr, void* metric, const metrics::labels_t& raw_labels,
