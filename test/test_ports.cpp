@@ -3898,3 +3898,80 @@ TEST_CASE("Component lifecycle memory management", "[lifecycle][memory]") {
         sink->stop();
     }
 }
+
+// Transfer accounting must charge BYTES on the same basis as PACKETS. record_transfer() adds the
+// two independently, so a rejected packet reported as (bytes, 0 packets) still booked all its bytes
+// as successfully transferred — an output with nothing connected, or every destination full, showed
+// a rising bytes_transferred against zero packets.
+TEST_CASE("rejected packets contribute no transferred bytes", "[port][stats]") {
+    // The stat counters are nullptr until a port is registered (normally via add_port), so every
+    // assertion below would read a vacuous 0 without this. Each section uses a distinct component
+    // id so the registry hands it its own counters rather than ones a previous section advanced.
+    SECTION("unconnected output transfers nothing") {
+        output_port<immutable_buffer<float>> out{"out"};
+        out.register_port_metrics("stats_unconnected");
+        out.send_data(make_immutable<float>({1.0F, 2.0F, 3.0F}), timestamp{});
+        REQUIRE(out.stats().packets_transferred() == 0);
+        REQUIRE(out.stats().bytes_transferred() == 0);
+    }
+
+    SECTION("full destination ring transfers nothing") {
+        output_port<immutable_buffer<float>> out{"out"};
+        input_port<immutable_buffer<float>> in{"in", 2};
+        out.register_port_metrics("stats_full");
+        in.register_port_metrics("stats_full");
+        REQUIRE(out.connect(&in));
+
+        // Fill the ring (depth rounds up to 2), then overflow it.
+        for (int i = 0; i < 2; ++i) {
+            out.send_data(make_immutable<float>({1.0F}), timestamp{});
+        }
+        const auto packets_when_full = out.stats().packets_transferred();
+        const auto bytes_when_full = out.stats().bytes_transferred();
+        REQUIRE(packets_when_full > 0);
+        REQUIRE(bytes_when_full > 0);
+
+        for (int i = 0; i < 5; ++i) {
+            out.send_data(make_immutable<float>({1.0F, 2.0F, 3.0F, 4.0F}), timestamp{});
+        }
+        // Every one of those was dropped at the input, so NEITHER counter may have moved.
+        REQUIRE(out.stats().packets_transferred() == packets_when_full);
+        REQUIRE(out.stats().bytes_transferred() == bytes_when_full);
+        REQUIRE(in.stats().packets_dropped() == 5);
+    }
+
+    SECTION("fan-out with every destination full transfers nothing") {
+        output_port<immutable_buffer<float>> out{"out"};
+        input_port<immutable_buffer<float>> a{"a", 1};
+        input_port<immutable_buffer<float>> b{"b", 1};
+        out.register_port_metrics("stats_fanout_full");
+        REQUIRE(out.connect(&a));
+        REQUIRE(out.connect(&b));
+
+        out.send_data(make_immutable<float>({1.0F}), timestamp{}); // fills both (depth 1)
+        const auto packets = out.stats().packets_transferred();
+        const auto bytes = out.stats().bytes_transferred();
+
+        out.send_data(make_immutable<float>({1.0F, 2.0F}), timestamp{}); // rejected by both
+        REQUIRE(out.stats().packets_transferred() == packets);
+        REQUIRE(out.stats().bytes_transferred() == bytes);
+    }
+
+    SECTION("fan-out with one destination accepting counts the packet once") {
+        output_port<immutable_buffer<float>> out{"out"};
+        input_port<immutable_buffer<float>> full{"full", 1};
+        input_port<immutable_buffer<float>> roomy{"roomy", 8};
+        out.register_port_metrics("stats_fanout_partial");
+        REQUIRE(out.connect(&full));
+        REQUIRE(out.connect(&roomy));
+
+        out.send_data(make_immutable<float>({1.0F}), timestamp{}); // both accept
+        const auto packets = out.stats().packets_transferred();
+        const auto bytes = out.stats().bytes_transferred();
+
+        // `full` rejects, `roomy` accepts: one packet transferred, its bytes charged once.
+        out.send_data(make_immutable<float>({1.0F, 2.0F}), timestamp{});
+        REQUIRE(out.stats().packets_transferred() == packets + 1);
+        REQUIRE(out.stats().bytes_transferred() == bytes + (2 * sizeof(float)));
+    }
+}

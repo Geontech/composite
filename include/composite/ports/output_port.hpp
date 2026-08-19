@@ -117,31 +117,44 @@ public:
      * If an input port is full, the packet is dropped at that port (not here).
      */
     auto send_data(buffer_type buffer, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
-        // Update outgoing statistics
-        m_stats.record_transfer(buffer.size() * sizeof(T));
+        const auto bytes = buffer.size() * sizeof(T);
+        // Statistics are recorded at the END, from what was actually ADMITTED — BYTES as well as
+        // packets, because port_stats::record_transfer() adds the two independently: passing the
+        // full byte count with a packet count of zero would report every rejected packet's bytes
+        // as successfully transferred. Recording up front counted a packet as transferred even
+        // with nothing connected and even when every consumer's ring was full, while the inputs
+        // separately counted the same packet as dropped. send_batch()'s fast path was already
+        // fixed to count admissions; this is the other half, so drop_rate() and bytes_transferred
+        // mean the same thing on every topology instead of depending on fan-out and mutability.
+        bool admitted = false;
 
         // Lock-free snapshot of the fan-out list (mutated only via connect/disconnect).
-        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
+        // BY VALUE: producer_snapshot() returns a reference to a mutable cache slot, and the
+        // add_data() calls below can reach user code (an input's overflow callback) that is
+        // free to connect/disconnect this very output — which reassigns that slot underneath a
+        // loop still indexing the old list.
+        const auto ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
 
         if (ports->empty()) {
-            return;
+            return; // nothing connected: no transfer, and no bytes to attribute to one
         }
 
         if (ports->size() == 1) {
             auto* port = ports->front();
             if (port == nullptr) {
-                return;
+                return; // null slot: nothing transferred
             }
             if (port->is_mutable()) {
                 // immutable → mutable: deep copy (mutable needs independent storage)
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
                 auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
-                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, std::move(md));
+                admitted = mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, std::move(md));
             } else {
                 // immutable → immutable, sole receiver: move the buffer + metadata (no copy)
                 auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                immutable_port->add_data(std::move(buffer), ts, std::move(md));
+                admitted = immutable_port->add_data(std::move(buffer), ts, std::move(md));
             }
+            m_stats.record_transfer(admitted ? bytes : 0, admitted ? 1 : 0);
             return;
         }
 
@@ -155,10 +168,10 @@ public:
             if (port->is_mutable()) {
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
                 auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
-                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, md);
+                admitted |= mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, md);
             } else {
                 auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                immutable_port->add_data(buffer.share(), ts, md);
+                admitted |= immutable_port->add_data(buffer.share(), ts, md);
             }
         }
         // Last receiver: move the buffer (immutable) + metadata.
@@ -167,12 +180,15 @@ public:
             if (last_port->is_mutable()) {
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(last_port);
                 auto vec = std::make_unique<std::vector<T>>(buffer.begin(), buffer.end());
-                mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, std::move(md));
+                admitted |= mutable_port->add_data(mutable_buffer<T>{std::move(vec)}, ts, std::move(md));
             } else {
                 auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(last_port);
-                immutable_port->add_data(std::move(buffer), ts, std::move(md));
+                admitted |= immutable_port->add_data(std::move(buffer), ts, std::move(md));
             }
         }
+        // Fan-out counts the PACKET, not the deliveries: one packet accepted by any consumer is
+        // one transfer, matching what the single-consumer paths report.
+        m_stats.record_transfer(admitted ? bytes : 0, admitted ? 1 : 0);
     }
 
     /**
@@ -206,7 +222,7 @@ public:
      * @param md   Shared metadata carried by every admitted packet (may be null).
      */
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
-        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
+        const auto ports = producer_snapshot(); // BY VALUE — see send_data()
         if (ports->size() == 1 && ports->front() != nullptr && !ports->front()->is_mutable()) {
             auto* ip = static_cast<input_port<immutable_buffer<T>>*>(ports->front());
             // Record only what was ACTUALLY admitted. Recording the whole span up front
@@ -323,30 +339,32 @@ public:
      * each receiver gets independent ownership of the data.
      */
     auto send_data(buffer_type buffer, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
-        // Update statistics
-        m_stats.record_transfer(buffer.size() * sizeof(T));
+        const auto bytes = buffer.size() * sizeof(T);
+        bool admitted = false; // recorded at the end, from real admissions — see the immutable overload
 
         // Lock-free snapshot of the fan-out list (mutated only via connect/disconnect).
-        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
+        // BY VALUE: add_data() can reach an input's overflow callback, which may connect or
+        // disconnect this output and so reassign the cache slot a reference would name.
+        const auto ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
 
         if (ports->empty()) {
-            return;
+            return; // nothing connected: no transfer, and no bytes to attribute to one
         };
 
         if (ports->size() == 1) {
             auto* port = ports->front();
             if (port == nullptr) {
-                return;
+                return; // null slot: nothing transferred
             };
 
             if (port->is_mutable()) {
                 // Mutable to mutable: direct move
                 auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
-                mutable_port->add_data(std::move(buffer), ts, std::move(md));
+                admitted = mutable_port->add_data(std::move(buffer), ts, std::move(md));
             } else {
                 // Mutable to immutable: promote
                 auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
+                admitted = immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
             }
         } else {
             // Fan-out: handle multiple outputs (all share the one metadata instance)
@@ -358,10 +376,10 @@ public:
 
                 if (port->is_mutable()) {
                     auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
-                    mutable_port->add_data(buffer.copy(), ts, md);
+                    admitted |= mutable_port->add_data(buffer.copy(), ts, md);
                 } else {
                     auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
-                    immutable_port->add_data(buffer.copy().to_immutable(), ts, md);
+                    admitted |= immutable_port->add_data(buffer.copy().to_immutable(), ts, md);
                 }
             }
 
@@ -370,13 +388,14 @@ public:
             if (last_port != nullptr) {
                 if (last_port->is_mutable()) {
                     auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(last_port);
-                    mutable_port->add_data(std::move(buffer), ts, std::move(md));
+                    admitted |= mutable_port->add_data(std::move(buffer), ts, std::move(md));
                 } else {
                     auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(last_port);
-                    immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
+                    admitted |= immutable_port->add_data(std::move(buffer).to_immutable(), ts, std::move(md));
                 }
             }
         }
+        m_stats.record_transfer(admitted ? bytes : 0, admitted ? 1 : 0);
     }
 
     /**
@@ -409,7 +428,7 @@ public:
      * @param md   Shared metadata carried by every admitted packet (may be null).
      */
     auto send_batch(std::span<buffer_type> bufs, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
-        const auto& ports = producer_snapshot(); // single-producer send path: cached, lock-free in steady state
+        const auto ports = producer_snapshot(); // BY VALUE — see send_data()
         if (ports->size() == 1 && ports->front() != nullptr) {
             auto* port = ports->front();
             // Record only what was ACTUALLY admitted, on BOTH branches — recording the whole

@@ -187,21 +187,40 @@ public:
         }
     }
     auto is_full() const -> bool override {
-        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
+        const auto cap = clamped_capacity();
         return size() >= cap;
     }
     auto available_capacity() const -> std::size_t override {
-        const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
+        const auto cap = clamped_capacity();
         const auto s = size();
         return s >= cap ? 0 : cap - s;
     }
 
 private:
+    /// depth() clamped to the PHYSICAL ring size — add_data()'s clamp, but taken under
+    /// m_resize_mtx.
+    ///
+    /// These two are the INTROSPECTION path (can_send() reaches them from REST threads), not the
+    /// producer path. The producer may read m_ring/m_mask unlocked because a claimed input is
+    /// never resized — the claim and the resize share m_resize_mtx — but an arbitrary reader has
+    /// no such exclusion, and depth(value) reassigns the vector wholesale. Reading .size() while
+    /// that happens is a torn read of a pointer/size pair, which is a data race outright and a
+    /// bad clamp in practice. Both callers are cold, so the lock costs nothing.
+    auto clamped_capacity() const -> std::size_t {
+        const auto lock = std::scoped_lock{m_resize_mtx};
+        const auto physical = m_ring.size();
+        const auto soft = depth();
+        return soft < physical ? soft : physical;
+    }
+
+public:
+private:
     template <typename>
     friend class output_port;
 
     /// Producer side (single thread). Enqueue or drop-if-full.
-    auto add_data(buffer_type data, timestamp ts, composite::metadata_ptr md = nullptr) -> void {
+    /// @return true if the packet was admitted; false if it was dropped (full, or paused).
+    auto add_data(buffer_type data, timestamp ts, composite::metadata_ptr md = nullptr) -> bool {
         const auto tail = m_tail.load(std::memory_order_relaxed); // only the producer writes tail
         const auto head = m_head.load(std::memory_order_acquire); // observe consumer progress
         // Clamp the effective limit to the PHYSICAL ring capacity. depth() is a
@@ -212,7 +231,7 @@ private:
         const auto cap = depth() < m_ring.size() ? depth() : m_ring.size();
         if (tail - head >= cap) { // full (or paused: depth()==0)
             record_drop();
-            return;
+            return false;
         }
         m_ring[tail & m_mask] = queue_type{std::move(data), ts, std::move(md)};
         // Release: the slot write above happens-before a consumer that acquire-loads
@@ -247,6 +266,7 @@ private:
         if (m_doorbell != nullptr && m_head.load(std::memory_order_acquire) == tail) {
             m_doorbell->signal_data();
         }
+        return true;
     }
 
     /// Producer side (single thread). Enqueue up to in.size() packets with a single
@@ -368,10 +388,17 @@ private:
             return;
         }
         m_stats.record_drop(count);
-        // Overflow callback is configured at setup; lock guards a runtime re-set.
-        const auto lock = std::scoped_lock{m_mtx};
-        if (m_overflow_callback) {
-            // USER code, invoked on the producer's send path while holding m_mtx. An
+        // COPY the callback under the lock, then invoke it OUTSIDE. m_mtx is a plain
+        // (non-recursive) mutex that set_overflow_callback() also takes, so holding it across the
+        // call deadlocked the producer on the most natural idiom there is: a callback that
+        // disarms or rate-limits itself by re-setting the callback from inside itself.
+        overflow_callback callback;
+        {
+            const auto lock = std::scoped_lock{m_mtx};
+            callback = m_overflow_callback;
+        }
+        if (callback) {
+            // USER code, invoked on the producer's send path. An
             // exception here would unwind out through add_data()/add_batch() and
             // output_port::send_data()/send_batch() into the producer's worker — a drop is
             // a normal bounded-backpressure event, so it must never become a producer
@@ -379,7 +406,7 @@ private:
             // on a saturated port would be a flood); read the count via
             // overflow_callback_errors().
             try {
-                m_overflow_callback(count);
+                callback(count);
             } catch (...) { // NOLINT(bugprone-empty-catch) — counted below; see comment
                 m_overflow_callback_errors.fetch_add(1, std::memory_order_relaxed);
             }

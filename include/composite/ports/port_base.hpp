@@ -318,7 +318,7 @@ protected:
     /// which must not replace storage a producer is about to write. Only claim_producer()
     /// (which SETS the claim) needs it: a concurrent release can at worst make a resize read
     /// "still claimed" and conservatively decline to grow. Cold path on both sides.
-    std::mutex m_resize_mtx;
+    mutable std::mutex m_resize_mtx;        ///< mutable: the const introspection readers take it too
     std::atomic_bool m_has_producer{false}; ///< single-producer claim (set on connect)
     std::atomic<output_port_base*> m_producer{
         nullptr}; ///< back-pointer to the producer (for deregister-on-destroy); cold, never read on the send path
@@ -384,6 +384,12 @@ public:
             output_port_base* expected = this;
             if (port->m_producer.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel)) {
                 port->m_has_producer.store(false, std::memory_order_release);
+                // Clear the EOS latch too, exactly as release_producer() does on an ordinary
+                // disconnect. Without this, a source that sent EOS and was then destroyed leaves
+                // the surviving input latched closed: reconnected to a NEW producer, at_end()
+                // goes true the moment the ring drains and the consumer auto-FINISHes before the
+                // new producer has sent anything. The two teardown paths must agree.
+                port->m_producer_closed.store(false, std::memory_order_release);
             }
             // Clear the reverse-doorbell pointer too: our owning component's park (which it
             // pointed at) dies with us, so the surviving input must not signal it from pop().
