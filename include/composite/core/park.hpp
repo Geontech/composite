@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -59,7 +60,8 @@ public:
     /// (e.g. wake() all input ports). (Invoked while a teardown guard is held.)
     auto set_poke(std::function<void()> poke) -> void { m_poke = std::move(poke); }
 
-    /// Bounded wait before a park request gives up (and throws). Never spins forever.
+    /// Bounded wait before a park request (or a closed admission gate) gives up and throws.
+    /// Never spins forever.
     auto set_timeout(std::chrono::milliseconds t) -> void { m_timeout = t; }
 
     // ------------------------------------------------------------------ worker
@@ -76,6 +78,28 @@ public:
         m_park.store(state::RUNNING, std::memory_order_release);
         m_run_cv.notify_all();
     }
+
+    /// RAII: counts one caller currently inside with_worker_parked(), from before its first look
+    /// at any gate state until it returns (normally or by throwing).
+    struct entry_guard {
+        park_coordinator& c;
+        explicit entry_guard(park_coordinator& coord) : c(coord) {
+            c.m_entered_total.fetch_add(1, std::memory_order_seq_cst);
+        }
+        entry_guard(const entry_guard&) = delete;
+        auto operator=(const entry_guard&) -> entry_guard& = delete;
+        entry_guard(entry_guard&&) = delete;
+        auto operator=(entry_guard&&) -> entry_guard& = delete;
+        ~entry_guard() {
+            c.m_exited_total.fetch_add(1, std::memory_order_seq_cst);
+            // Only pay a mutex acquisition when a teardown is actually waiting. On the ordinary
+            // property-write path this is a single relaxed-ish load and nothing else.
+            if (c.m_permanent_pending.load(std::memory_order_acquire)) {
+                const std::lock_guard lk{c.m_admit_mtx};
+                c.m_admit_cv.notify_all();
+            }
+        }
+    };
 
     /// RAII guard a worker constructs at thread entry; publishes EXITING on every
     /// exit path so a waiting writer is released instead of hanging.
@@ -198,12 +222,30 @@ public:
      *
      * @c fn may mutate the worker's data members in place (or swap them). On
      * return the mutation is published to the worker via the resume edge.
-     * Throws std::runtime_error if the worker fails to park within the timeout
-     * (the request is rolled back first, so the worker keeps running).
+     * Throws std::runtime_error if the worker fails to park within the timeout (the request is
+     * rolled back first, so the worker keeps running), or if the component is being torn down and
+     * admission does not reopen within the timeout. Both are BOUNDED by set_timeout().
      */
     template <typename Fn>
     auto with_worker_parked(Fn&& fn) -> void {
         const auto self = std::this_thread::get_id();
+        // ENTRY COUNT, taken before ANY other member of this coordinator is touched.
+        //
+        // m_park_calls_in_flight only starts counting once a writer has been ADMITTED, so a writer
+        // that has entered this function but is still between the checks below and the gate — on
+        // its way to the mutex, blocked on it, or asleep on the CV — is invisible to it. A
+        // destructor draining only that count sees zero, returns, and frees the mutex the writer
+        // is about to lock.
+        //
+        // Counting from the very top closes that: every caller already INSIDE this function is
+        // accounted for, whatever it happens to be blocked on. (A call that starts after
+        // destruction has begun is not, and cannot be — that is the caller's lifetime problem,
+        // solved by holding the component alive, not by anything this class can do.)
+        //
+        // Drained ONLY by close_admission_permanently_for(). An ordinary stop must never wait on
+        // this: it holds the gate shut while draining, and a caller blocked on that gate can only
+        // leave once the gate reopens, so a stop that waited here would deadlock itself.
+        const entry_guard entered{*this};
         // ADMISSION GATE. Draining in-flight writers is not enough on its own: the count
         // reaching zero says nothing about the NEXT writer, which can enter immediately after
         // and race a teardown that has already decided it is alone (worker_resources_down()
@@ -238,7 +280,35 @@ public:
                               m_admission_owner.load(std::memory_order_acquire) != self;
         if (external) {
             std::unique_lock admit_lk{m_admit_mtx};
-            m_admit_cv.wait(admit_lk, [this] { return !m_admission_closed.load(std::memory_order_acquire); });
+            // COUNTED WHILE WAITING, separately from m_park_calls_in_flight. A writer parked on
+            // this CV has not incremented the in-flight count yet, so a teardown draining only
+            // that count sees zero and proceeds — and the waiter then wakes up inside an
+            // already-destroyed mutex and condition variable. That waiter is covered by the entry
+            // ticket taken at the top of this function, which is why there is no separate
+            // CV-waiter count: a writer asleep here has entered and not yet exited, so a teardown
+            // draining tickets is already waiting for it.
+            //
+            // Deliberately NOT folded into m_park_calls_in_flight: an ordinary stop drains that
+            // count while HOLDING the gate closed, and a waiter blocked on the gate can only
+            // leave once the gate reopens. Counting it there would deadlock every stop.
+            //
+            // BOUNDED, like the park attempt it sits in front of. The gate is held across
+            // component::stop_locked(), whose worker join is deliberately unbounded, so an
+            // untimed wait here turns every property write into an unbounded one: a component
+            // whose process() has wedged would pin an httplib worker per PATCH until the whole
+            // control plane — including the bounded POST /app/stop that exists to survive
+            // exactly this — is dead. A caller would rather be told than hang.
+            const bool admitted = m_admit_cv.wait_for(admit_lk, m_timeout, [this] {
+                return !m_admission_closed.load(std::memory_order_acquire) || m_admission_permanent;
+            });
+            const bool destroying = m_admission_permanent;
+            if (!admitted || destroying) {
+                // admit_lk unlocks as this unwinds, and ~entry_guard then stamps the exit ticket
+                // and notifies — so a teardown cannot return, and cannot free this mutex, until
+                // after that unlock has happened.
+                throw std::runtime_error(destroying ? "property write rejected: component is being destroyed"
+                                                    : "property write rejected: component teardown in progress");
+            }
             m_park_calls_in_flight.fetch_add(1, std::memory_order_acq_rel); // counted under the gate
         } else {
             m_park_calls_in_flight.fetch_add(1, std::memory_order_acq_rel);
@@ -392,9 +462,58 @@ public:
     auto close_admission() -> void {
         const auto self = std::this_thread::get_id();
         std::scoped_lock lk{m_admit_mtx};
-        ++m_admission_depth; // depth-counted: a nested close must not re-open on the inner exit
+        // Depth counts NESTED closes by the SAME thread. Both call sites hold the component's
+        // lifecycle mutex, so two threads can never interleave closes here — which is what makes
+        // a single owner slot sufficient. If that ever changes, the owner must become a set: with
+        // one slot, an inner close by a different thread would overwrite the outer closer's
+        // identity and strip it of the bypass it needs to finish its own teardown.
+        assert(m_admission_depth == 0 || m_admission_owner.load(std::memory_order_acquire) == self);
+        ++m_admission_depth;
         m_admission_owner.store(self, std::memory_order_release);
         m_admission_closed.store(true, std::memory_order_release);
+    }
+
+    /// Close admission for good. For DESTRUCTION only; IDEMPOTENT, so it is safe to call before
+    /// each attempt of a reporting drain loop.
+    ///
+    /// The RAII gate re-opens at the end of stop(), which is correct for a stop the component
+    /// survives but not for the last one: a writer that evaluated its "external" test before the
+    /// gate closed can wake up after stop() has returned, walk through the re-opened gate, and run
+    /// against members that ~component is already destroying. Nothing re-opens after this.
+    ///
+    /// Deliberately does NOT drain — the caller must, and must do so WITHOUT a deadline. See
+    /// component::~component().
+    /// IDEMPOTENT, so it is safe to call once per iteration of a reporting loop.
+    ///
+    /// @return true once NO caller is left inside with_worker_parked(); false if @p timeout
+    ///         elapsed first (the closure itself has still taken effect).
+    [[nodiscard]] auto close_admission_permanently_for(std::chrono::nanoseconds timeout) -> bool {
+        std::unique_lock lk{m_admit_mtx};
+        if (!m_admission_permanent) { // idempotent: never double-count the depth
+            m_admission_permanent = true;
+            m_permanent_pending.store(true, std::memory_order_release);
+            ++m_admission_depth;
+            m_admission_owner.store(std::this_thread::get_id(), std::memory_order_release);
+            m_admission_closed.store(true, std::memory_order_release);
+        }
+        // Wake every queued writer NOW rather than leaving it to time out. Their predicate is
+        // satisfied by m_admission_permanent, so each returns immediately and throws instead of
+        // sitting on the CV for the rest of the park timeout.
+        m_admit_cv.notify_all();
+
+        // TICKETS, not a live count. Waiting for "callers inside == 0" cannot converge while
+        // writers keep arriving: each new one enters, is rejected, and leaves, so the count
+        // oscillates and a busy control plane livelocks the destructor forever. What has to be
+        // drained is precisely the callers that were ALREADY inside when the door shut.
+        //
+        // Both counters are monotonic, so snapshotting entries here and waiting for exits to catch
+        // up drains exactly that set. Callers arriving afterwards push m_entered_total past the
+        // target and are deliberately NOT waited for — a call that starts after destruction has
+        // begun is the caller's lifetime problem (hold the component alive), and no amount of
+        // counting inside the object being destroyed can fix it.
+        const auto target = m_entered_total.load(std::memory_order_seq_cst);
+        return m_admit_cv.wait_for(lk, timeout,
+                                   [this, target] { return m_exited_total.load(std::memory_order_seq_cst) >= target; });
     }
 
     /// Re-open admission and release anyone queued behind it.
@@ -456,6 +575,15 @@ public:
     /// True if a worker thread exists that will reach a loop point (i.e. NOT
     /// NO_WORKER / EXITING). Used to decide whether a deferred config reaction will
     /// be drained by the worker at loop-top, or must be run inline by the writer.
+    /// True when called ON the component's live worker thread. Same test the writer path uses to
+    /// classify a self-write: the id alone is not enough, because a recycled thread id could match
+    /// a worker that has already exited.
+    [[nodiscard]] auto on_worker_thread() const -> bool {
+        const auto st = m_park.load(std::memory_order_acquire);
+        return m_worker_id.load(std::memory_order_acquire) == std::this_thread::get_id() && st != state::NO_WORKER &&
+               st != state::EXITING;
+    }
+
     [[nodiscard]] auto has_worker() const -> bool {
         const auto s = m_park.load(std::memory_order_acquire);
         return s != state::NO_WORKER && s != state::EXITING;
@@ -506,6 +634,13 @@ private:
     int m_admission_depth{0};                         ///< nesting count; guarded by m_admit_mtx
     std::mutex m_admit_mtx;                           ///< guards the admission flag + its CV
     std::condition_variable m_admit_cv;               ///< released by open_admission()
+    bool m_admission_permanent{false};                ///< set by close_admission_permanently()
+    std::atomic<bool> m_permanent_pending{false};     ///< a teardown is waiting on the counters below
+    /// Monotonic entry/exit tickets for with_worker_parked(), stamped from the very top of the
+    /// function — so they also cover a caller that has not reached the gate mutex yet, which
+    /// neither the in-flight count nor a CV-waiter count can see.
+    std::atomic<std::uint64_t> m_entered_total{0};
+    std::atomic<std::uint64_t> m_exited_total{0};
 
     struct in_flight_guard {
         /// Tag: the caller has ALREADY incremented the in-flight count (it had to, to make the

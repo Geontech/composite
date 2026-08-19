@@ -150,10 +150,13 @@ public:
         // would put an unbounded phase outside the caller's budget.
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         auto components = snapshot();
-        // Pass 1: latch the exit request everywhere, without waiting.
+        // Pass 1: latch the exit request everywhere, without waiting. BOUNDED by the same
+        // deadline — request_stop() would take each component's lifecycle lock untimed, so one
+        // component already being torn down (an unbounded join, holding that lock) would hang
+        // this pass and the budget below would never be consulted at all.
         for (auto& component : components) {
             try {
-                component->request_stop();
+                component->try_request_stop(deadline);
             } catch (...) { // NOLINT(bugprone-empty-catch) — collected as "did not stop" in pass 2
             }
         }
@@ -244,7 +247,11 @@ public:
             for (const auto& c : comps) {
                 if (!has_incoming(c->id())) {
                     ++sources;
-                    c->stop();
+                    // CONTAINED, like every other per-component loop in this class. stop() is not
+                    // noexcept (park timeout, staged-reaction failure), and a throw here would
+                    // abandon EOS for every remaining source and skip the wait/stop tail below —
+                    // from an API documented as best-effort and degrading gracefully.
+                    c->stop_contained();
                     c->send_eos();
                 }
             }

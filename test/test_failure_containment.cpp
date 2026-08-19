@@ -29,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace composite;
@@ -798,10 +799,18 @@ int main() {
         const auto waited = std::chrono::steady_clock::now() - t0;
 
         check(ids.size() == k_n, "wake budget: both wedged components reported");
-        // Deadline taken BEFORE signalling: total ~= signalling_cost (budget already spent).
-        // Deadline taken AFTER  signalling: total ~= signalling_cost + k_budget.
-        check(waited < signalling_cost + k_budget / 2,
-              "wake budget: the wake-hook pass is charged AGAINST the budget, not added on top");
+        // The wake hook fires in BOTH passes now. It used to be skipped in pass 2 whenever the
+        // stop was already latched, which saved one hook per component but meant a worker that
+        // entered a custom, non-token-aware wait AFTER the first nudge never got a second one and
+        // could not be stopped at all — see request_worker_exit_locked(). So a wedged component
+        // costs ~2x the hook: that is the price of the nudge always landing.
+        //
+        // The property under test is unchanged: the deadline is taken BEFORE signalling, so the
+        // signalling passes are charged against the budget rather than added on top.
+        //   deadline before signalling: total ~= 2 * signalling_cost (budget spent by then)
+        //   deadline after  signalling: total ~= 2 * signalling_cost + k_budget
+        check(waited < (2 * signalling_cost) + (k_budget / 2),
+              "wake budget: the wake-hook passes are charged AGAINST the budget, not added on top");
 
         for (auto& c : comps) {
             c->m_release.store(true, std::memory_order_release);
@@ -929,6 +938,165 @@ int main() {
         check(c.m_teardown_write_ok.load(std::memory_order_acquire),
               "hook write: the on_worker_stop() property write actually completed");
     }
+
+    // ---- (20) a worker that DISABLES ITSELF must not join itself ----
+    // `enabled` is advertised as a runtime property and worker-originated set_properties() is a
+    // supported path, so a component turning itself off from process() is ordinary usage. The
+    // reconcile used to run the full stop inline, which waited on the worker-done flag that only
+    // this same thread could set — a permanent hang holding m_lifecycle_mtx, which then wedged
+    // every later stop()/start() on the component too. A regression here HANGS.
+    {
+        class self_disable_comp : public component {
+        public:
+            explicit self_disable_comp(std::string_view id) : component(id) {}
+            auto process() -> retval override {
+                if (!std::exchange(m_done, false)) {
+                    return retval::NOOP;
+                }
+                set_properties(json{{"enabled", false}}, config_type::RUNTIME);
+                m_returned.store(true, std::memory_order_release);
+                return retval::NOOP;
+            }
+            std::atomic<bool> m_returned{false};
+            bool m_done{true};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        self_disable_comp c{"selfdisable"};
+        c.start();
+        check(wait_until([&] { return c.m_returned.load(std::memory_order_acquire); }, std::chrono::seconds(5)),
+              "self-disable: the worker's own set_properties({enabled:false}) returned");
+        check(wait_until([&] { return !c.is_running(); }, std::chrono::seconds(5)),
+              "self-disable: the worker actually stopped");
+        // The lifecycle lock must still be usable — the old hang held it forever.
+        check(c.try_stop(std::chrono::seconds(5)), "self-disable: a later stop still completes");
+    }
+
+    // ---- (21) a wedged teardown must not make the control plane unbounded ----
+    // Two separate defects made POST /app/stop hang exactly when it is needed. The admission gate
+    // waited with no timeout, so a property write during a teardown blocked forever; and
+    // try_stop()'s signalling pass took each lifecycle lock UNTIMED, so a component already inside
+    // an unbounded join stalled the whole bounded pass before the budget was ever consulted.
+    {
+        class wedged_comp : public component {
+        public:
+            explicit wedged_comp(std::string_view id) : component(id) { add_property("knob", m_knob); }
+            auto process() -> retval override {
+                m_entered.store(true, std::memory_order_release);
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return retval::NOOP;
+            }
+            std::atomic<bool> m_entered{false};
+            std::atomic<bool> m_release{false};
+            double m_knob{1.0};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        auto wedged = std::make_shared<wedged_comp>("wedged");
+        application app{"wedged_app"};
+        check(app.add_component(wedged), "wedged: component added");
+        app.start();
+        check(wait_until([&] { return wedged->m_entered.load(std::memory_order_acquire); }, std::chrono::seconds(5)),
+              "wedged: worker is inside the wedged process()");
+
+        // A thread parked forever in the unbounded join, holding m_lifecycle_mtx and the gate.
+        std::thread stopper{[&] { wedged->stop(); }};
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // let it reach the join
+
+        // (a) a property write must be REJECTED, not hang, while the gate is closed.
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            bool threw = false;
+            try {
+                wedged->set_properties(json{{"knob", 2.0}}, config_type::RUNTIME);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            const auto waited = std::chrono::steady_clock::now() - t0;
+            check(threw, "gate bound: a property write during teardown is rejected, not accepted");
+            check(waited < std::chrono::seconds(30), "gate bound: the rejection is BOUNDED, not an unbounded wait");
+        }
+
+        // (b) the bounded stop must honour its budget even though pass 1 cannot take the lock.
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto ids = app.try_stop(std::chrono::milliseconds(500));
+            const auto waited = std::chrono::steady_clock::now() - t0;
+            check(ids.size() == 1, "signalling bound: the wedged component is reported as not stopped");
+            check(waited < std::chrono::seconds(5),
+                  "signalling bound: try_stop() returned within its budget despite an untakeable lifecycle lock");
+        }
+
+        wedged->m_release.store(true, std::memory_order_release);
+        stopper.join();
+    }
+
+    // ---- (22) destruction must not abandon a writer PARKED AT THE ADMISSION GATE ----
+    // A writer blocked on the gate has not incremented the in-flight count yet, so a teardown that
+    // drains only that count sees zero and proceeds — and the waiter later wakes inside an
+    // already-destroyed mutex and condition variable. Reachable with NO worker, where stop()
+    // returns without draining writers at all.
+    //
+    // Two independent signals, so this is not ASan-only:
+    //   - TIMING. Permanent closure must WAKE the queued writer, not leave it to time out. With
+    //     the wake it returns in milliseconds; without it, it sits the full park timeout (5s).
+    //   - MEMORY. Destruction must not return until the writer is out of the coordinator, which
+    //     under ASan is a heap-use-after-free if it regresses.
+    {
+        struct gated_comp : component {
+            explicit gated_comp(std::string_view id) : component(id) { add_property("knob", m_knob); }
+            auto process() -> retval override { return retval::FINISH; }
+            double m_knob{1.0};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        std::atomic<bool> writer_entered{false};
+        std::atomic<bool> writer_returned{false};
+        std::atomic<bool> writer_rejected{false};
+
+        auto* c = new gated_comp{"gatewait"}; // NOLINT(cppcoreguidelines-owning-memory)
+        c->park_for_test().close_admission(); // hold it shut; only destruction reopens/retires it
+
+        std::thread writer{[&] {
+            writer_entered.store(true, std::memory_order_release);
+            try {
+                c->set_properties(json{{"knob", 2.0}}, config_type::RUNTIME);
+            } catch (const std::exception&) {
+                writer_rejected.store(true, std::memory_order_release); // rejected, as it must be
+            }
+            writer_returned.store(true, std::memory_order_release);
+        }};
+
+        check(wait_until([&] { return writer_entered.load(std::memory_order_acquire); }, std::chrono::seconds(5)),
+              "gate wait: writer thread started");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // let it park on the CV
+
+        const auto t0 = std::chrono::steady_clock::now();
+        delete c; // NOLINT(cppcoreguidelines-owning-memory) — must wake AND wait for the writer
+        const auto teardown = std::chrono::steady_clock::now() - t0;
+        writer.join();
+        const auto total = std::chrono::steady_clock::now() - t0;
+
+        check(writer_rejected.load(), "gate wait: the parked writer was rejected, not admitted");
+        check(writer_returned.load(), "gate wait: the parked writer returned");
+        // The park timeout is 5s. Without the wake-on-permanent-close the writer would still be
+        // sitting on the CV here, so the join would take ~5s.
+        check(total < std::chrono::seconds(3),
+              "gate wait: permanent closure WOKE the parked writer instead of leaving it to time out");
+        std::printf("gate wait: teardown %lldms, writer out after %lldms (park timeout is 5000ms)\n",
+                    (long long)std::chrono::duration_cast<std::chrono::milliseconds>(teardown).count(),
+                    (long long)std::chrono::duration_cast<std::chrono::milliseconds>(total).count());
+    }
+
+    // NOTE on the narrower window above: a caller that has ENTERED with_worker_parked() but has
+    // not yet reached the gate mutex is covered by the entry ticket stamped at the top of that
+    // function (see park.hpp). It is deliberately NOT stress-tested here. Any test that races a
+    // fresh set_properties() against destruction is testing something the contract explicitly does
+    // NOT promise — a call STARTED after destruction begins touches a freed object no matter what
+    // the coordinator counts — so such a test faults by construction and would be measuring the
+    // caller's lifetime bug, not ours. Case (22) covers the part that IS ours, deterministically.
 
     if (g_fails != 0) {
         std::fprintf(stderr, "%d containment check(s) FAILED\n", g_fails);

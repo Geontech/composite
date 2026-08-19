@@ -455,7 +455,11 @@ TEST_CASE_METHOD(rest_fixture, "every advertised route is actually registered", 
             ++probed;
         }
     }
-    REQUIRE(probed > 15); // guard against the loop silently probing nothing
+    // EXACT, not a floor. `> 15` let six routes silently disappear from the catalogue with only
+    // the sorted-list case (a separate assertion, on a separate document) noticing — so the probe
+    // itself, whose whole job is to prove each catalogued route is really registered, could quietly
+    // stop covering a third of them.
+    REQUIRE(probed == 22);
 }
 
 // Route-diff: every GET route the spec advertises must actually be REGISTERED on the server.

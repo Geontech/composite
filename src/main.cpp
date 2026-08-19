@@ -494,7 +494,17 @@ auto main(int argc, char** argv) -> int {
                 }
                 if (comp.contains("properties")) {
                     spdlog::trace("adding component-level properties to changeset for {}", comp_ptr->id());
-                    props_json.merge_patch(comp["properties"]);
+                    // Key-wise assignment, NOT merge_patch. merge_patch is RFC 7386, where a null
+                    // member DELETES the key from the target instead of being carried through.
+                    // That silently swallowed two things: a null-valued typo ({"gian": null})
+                    // vanished before the strict unknown-key check could ever see it, so the
+                    // config loaded clean with no diagnostic at all; and {"opt": null} — the
+                    // RFC-7396 spelling for "reset to default" that DELETE /properties/:name
+                    // sends — was dropped rather than applied, leaving the config file and the
+                    // REST layer disagreeing about the same syntax.
+                    for (const auto& [key, value] : comp["properties"].items()) {
+                        props_json[key] = value;
+                    }
                 }
 
                 // Apply the merged (app-level + component-level) properties as one batch.

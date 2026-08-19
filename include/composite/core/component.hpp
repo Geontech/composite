@@ -65,6 +65,8 @@ inline auto to_string(finish_reason r) -> std::string_view {
 }
 
 class component : public lifecycle {
+    /// application::try_stop() drives the internal bounded signalling pass (see below).
+    friend class application;
     static constexpr uint32_t DEFAULT_DELAY{1000000};
     // sched_yield() on every NORMAL is a per-packet syscall (~hundreds of ns even when
     // nothing else is runnable). Yield once per this many consecutive NORMALs instead — a
@@ -114,14 +116,62 @@ public:
 
     virtual ~component() override {
         stop_contained(); // a throwing stop (park timeout / staged reaction) must not unwind here
-        // Deregister all of this component's metrics (lifecycle + ports + user) by
-        // its identity label, so a reload doesn't leak series toward the registry
-        // cap and OTel drops the instruments. The registry outlives components.
-        metrics::registry::instance().remove_by_label("component_id", m_id);
-        if (m_logger) {
-            m_logger->flush();
+        // Now shut the door for good. stop()'s admission gate re-opens at the end of stop(), which
+        // is right for a component that survives it — but this is the last one, and a writer that
+        // evaluated its "external" test before the gate ever closed can wake after stop() returns
+        // and run against members being destroyed below. Heap components are usually saved by the
+        // REST layer's shared_ptr; the stack-allocated + auto_stop pattern this class documents
+        // and endorses is not.
+        // UNBOUNDED, with periodic diagnostics — deliberately not a timeout. Destruction has no
+        // fallback: giving up after N seconds and destroying members anyway hands a still-running
+        // on_apply / property_change_handler a use-after-free, which is strictly worse than the
+        // hang it was trying to avoid. The reachable case is a component with NO worker, where
+        // stop() returns without draining writers at all. Same contract as the worker join above:
+        // a user callback that never returns is a bug we report loudly, not one we outrun.
+        //
+        // This subsumes drain_park_reporting(): every in-flight writer is also a caller inside
+        // with_worker_parked(), and this additionally covers the ones the in-flight count cannot
+        // see (queued on the gate, or not yet at its mutex).
+        for (int elapsed = 0; !m_park.close_admission_permanently_for(k_stop_report_interval);
+             elapsed += static_cast<int>(k_stop_report_interval.count())) {
+            try {
+                logger()->warn("{}: a property write has been in flight {}s into destruction — a config "
+                               "on_apply or property_change_handler is not returning. Destroying now would "
+                               "free members it is still touching, so this waits.",
+                               m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
+            } catch (...) { // NOLINT(bugprone-empty-catch) — the log sink is what just failed
+            }
+        }
+        // The two calls below are no more throw-free than the stop above, and this destructor is
+        // implicitly noexcept, so an escape here is std::terminate rather than a bad teardown:
+        // remove_by_label allocates and then runs third-party deregistration observers, and
+        // logger->flush() throws spdlog_ex on any sink I/O failure (a full disk is ordinary, not
+        // exotic). Containing stop() alone stopped one line short.
+        try {
+            // Deregister all of this component's metrics (lifecycle + ports + user) by
+            // its identity label, so a reload doesn't leak series toward the registry
+            // cap and OTel drops the instruments. The registry outlives components.
+            metrics::registry::instance().remove_by_label("component_id", m_id);
+        } catch (const std::exception& ex) {
+            log_contained_failure("metric deregistration failed during destruction", ex.what());
+        } catch (...) {
+            log_contained_failure("metric deregistration failed during destruction", "unknown exception");
+        }
+        try {
+            if (m_logger) {
+                m_logger->flush();
+            }
+        } catch (...) { // NOLINT(bugprone-empty-catch) — the log sink is what just failed
         }
     }
+
+#ifdef COMPOSITE_TESTING
+    /// TEST ONLY. Lets a test hold the admission gate shut so a writer parks on it
+    /// deterministically — the interleaving destruction has to survive, and one that cannot
+    /// otherwise be produced from outside. Header-only and compiled out of normal builds, so it
+    /// is not part of the public surface (same treatment as metrics::registry::clear()).
+    auto park_for_test() -> park_coordinator& { return m_park; }
+#endif
 
     auto id() const noexcept -> const std::string& { return m_id; }
 
@@ -251,12 +301,19 @@ public:
             // Drain BEFORE the teardown so this wait is inside the budget too. Bailing here is
             // just as safe and retryable as bailing above: the worker has exited but nothing is
             // torn down, so a later try_stop()/stop() joins instantly and finishes the job.
-            if (!m_park.drain_in_flight_for(left())) {
+            // Same reentrancy guard finish_stop_locked() applies: a thread already inside its own
+            // with_worker_parked() (the documented lifecycle-touching on_apply pattern) holds an
+            // in-flight guard that only its own return can release, so draining to zero here would
+            // burn the whole budget against itself and report false forever.
+            if (!m_park.owned_by_current_thread() && !m_park.drain_in_flight_for(left())) {
                 return false;
             }
             finish_stop_locked(); // its own drain is now a no-op
         }
-        // Outside m_lifecycle_mtx so a lifecycle-touching on_apply cannot self-deadlock.
+        // Outside m_lifecycle_mtx so a lifecycle-touching on_apply cannot self-deadlock — and
+        // therefore OUTSIDE the deadline as well. This drains staged config<T>::on_apply
+        // reactions, which are user code with no bound, so it is a third thing the budget does
+        // not cover alongside on_park_requested() and on_worker_stop().
         run_reactions_contained();
         return true;
     }
@@ -784,7 +841,12 @@ public:
                 // reconcile STARTED a worker, it drains at its own loop-top. CONTAINED: the
                 // value batch is already committed and the lifecycle change already took
                 // effect, so a drain failure must not retroactively fail the write.
-                if (!m_park.has_worker()) {
+                // Also drain when the WORKER made this write: a self-disable latches the exit,
+                // so the worker breaks out of its loop and the loop-top drain that would
+                // otherwise pick the reaction up never runs again. On the worker thread
+                // run_reactions_contained() takes the worker self-write bypass and runs inline,
+                // so this is safe here rather than a second park attempt.
+                if (!m_park.has_worker() || m_park.on_worker_thread()) {
                     run_reactions_contained();
                 }
             }
@@ -1124,6 +1186,34 @@ protected:
     }
 
 private:
+    /**
+     * @brief INTERNAL. Bounded request_stop() for the signalling pass of application::try_stop().
+     *
+     * request_stop() takes m_lifecycle_mtx untimed, which is fine on its own but defeats a caller
+     * working to a deadline: a thread already inside stop_locked() holds that lock across an
+     * unbounded worker join, so the signalling pass hangs and the budget is never consulted.
+     *
+     * NOT public API and deliberately not part of the v0.5 stop surface. The absolute-deadline
+     * signature exists so several components can share ONE budget; it is an implementation detail
+     * of application::try_stop() and would be the wrong shape to freeze for callers, who have
+     * request_stop() and try_stop(timeout).
+     *
+     * @return true if the request was latched; false if the lifecycle lock stayed unavailable.
+     */
+    auto try_request_stop(std::chrono::steady_clock::time_point deadline) -> bool {
+        std::unique_lock<std::mutex> life{m_lifecycle_mtx, std::defer_lock};
+        while (!life.try_lock()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (m_thread.has_value()) {
+            request_worker_exit_locked();
+        }
+        return true;
+    }
+
     std::string m_id;
     std::shared_ptr<composite::logger> m_logger;
     park_coordinator m_park; ///< park handshake: lock-free process(), parked property writes
@@ -1168,6 +1258,12 @@ private:
     std::mutex m_lifecycle_mtx; ///< serializes start/stop/enabled reconcile
     std::vector<connection> m_connections;
     mutable std::mutex m_connections_mtx; ///< guards m_connections (connect/disconnect vs REST readers)
+    /// Guards m_saved_input_depths ONLY. The worker calls pause_input_ports() from its own
+    /// error-giveup path while a lifecycle thread may be in reconcile_enabled_locked(), and the
+    /// worker cannot take m_lifecycle_mtx to synchronise — a stop() holds that lock across the
+    /// join, so the worker reaching for it would deadlock. A dedicated leaf mutex has no such
+    /// ordering problem.
+    mutable std::mutex m_saved_depths_mtx;
     std::map<std::string, std::size_t> m_saved_input_depths;
 
     // Lifecycle metrics (registered in constructor)
@@ -1225,6 +1321,7 @@ private:
     }
 
     auto pause_input_ports() -> void {
+        const std::scoped_lock depths{m_saved_depths_mtx}; // worker vs. lifecycle thread
         m_saved_input_depths.clear();
         for (const auto& [name, port] : m_port_set.ports()) {
             if (auto* input_port = dynamic_cast<input_port_base*>(port)) {
@@ -1244,6 +1341,7 @@ private:
      * depth exists for a port, it remains at its current depth.
      */
     auto resume_input_ports() -> void {
+        const std::scoped_lock depths{m_saved_depths_mtx}; // worker vs. lifecycle thread
         for (const auto& [name, saved_depth] : m_saved_input_depths) {
             if (auto* input_port = dynamic_cast<input_port_base*>(m_port_set.get_port<input_port_base>(name))) {
                 input_port->depth(saved_depth);
@@ -1277,7 +1375,21 @@ private:
         } else if (!want && has_handle) {
             logger()->debug("Disabling component '{}'", m_id);
             pause_input_ports();
-            stop_locked();
+            if (m_park.on_worker_thread()) {
+                // The worker is disabling ITSELF (set_properties({"enabled": false}) from
+                // process() or an on_change reaction — a supported, schema-advertised write).
+                // stop_locked() would join this very thread: it would wait for m_worker_done,
+                // which only this thread can set, and hold m_lifecycle_mtx while doing it, so
+                // every later stop()/start() on the component would wedge behind it too.
+                // Latch the request instead and let the worker unwind through its own completion
+                // tail, which already reaps worker resources and flips the state gauge. The
+                // jthread handle survives until someone joins it; reconcile_enabled_locked()
+                // keys its START decision off liveness rather than the handle precisely so a
+                // later re-enable still restarts correctly.
+                request_worker_exit_locked();
+            } else {
+                stop_locked();
+            }
         }
     }
 
@@ -1417,9 +1529,15 @@ private:
     auto drain_park_reporting() -> void {
         for (int elapsed = 0; !m_park.drain_in_flight_for(k_stop_report_interval);
              elapsed += static_cast<int>(k_stop_report_interval.count())) {
-            logger()->warn("{}: a property write has been in flight {}s into stop() — a config "
-                           "on_apply or property_change_handler is not returning.",
-                           m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
+            // CONTAINED: this loop is also reached from ~component(), which is noexcept, and a
+            // failing log sink must not turn a diagnostic into std::terminate — nor abandon the
+            // drain, which is the part that actually keeps teardown safe.
+            try {
+                logger()->warn("{}: a property write has been in flight {}s into stop() — a config "
+                               "on_apply or property_change_handler is not returning.",
+                               m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
+            } catch (...) { // NOLINT(bugprone-empty-catch) — the log sink is what just failed
+            }
         }
     }
 
@@ -1442,14 +1560,14 @@ private:
     auto request_worker_exit_locked() -> void {
         auto source = m_thread->get_stop_source();
         if (source.stop_possible()) {
-            if (source.stop_requested()) {
-                // Already latched AND nudged by an earlier call (e.g. request_stop() followed by
-                // try_stop()). The nudge only has to land once — the request is a latch, and the
-                // worker's idle wait is stop-token-aware — while on_park_requested() is USER code
-                // that may be slow. Paying for it twice would charge a signal-then-collect
-                // shutdown double the hook cost.
-                return;
-            }
+            // NOTE: deliberately NOT short-circuiting when the stop is already latched. Only the
+            // FRAMEWORK's idle wait is stop-token-aware; on_park_requested() exists to interrupt a
+            // custom blocking wait (a socket recv, a device ioctl) that is not. In the documented
+            // signal-then-collect shutdown, request_stop() can fire the hook before the worker has
+            // entered that wait — a no-op — and skipping the hook on the following try_stop() then
+            // leaves the worker blocked forever, with every retry taking the same early return.
+            // Re-nudging an already-stopping worker costs one extra hook call; not re-nudging it
+            // makes the component permanently unstoppable.
             source.request_stop();
         }
         m_park.cancel_waiters(); // release a writer blocked waiting to park
@@ -1538,8 +1656,15 @@ private:
 
     auto thread_func(std::stop_token token) -> void {
         using enum retval;
-        m_park.worker_started();
+        // Guard FIRST. worker_started() publishes m_worker_id and the RUNNING state, and its
+        // wait can throw (std::system_error from the CV). A throw between that publish and the
+        // guard's construction would leave the coordinator RUNNING with m_worker_id naming a
+        // thread that no longer exists — permanently, since only ~exit_guard clears it, and an
+        // id the OS later recycles would hand an unrelated thread the worker's bypasses.
+        // Constructing the guard first costs nothing: publishing EXITING for a worker that never
+        // reached RUNNING is the correct terminal state either way.
         park_coordinator::exit_guard park_exit{m_park};
+        m_park.worker_started();
         std::uint32_t normal_streak = 0; // batched yield: consecutive NORMALs since the last sched_yield
         finish_reason exit_reason = finish_reason::none; // set iff the loop self-terminates (FINISH/throw)
 

@@ -351,9 +351,13 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
     // Add a common handler for preflight requests (OPTIONS method)
     server->Options(".*", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");                                  // allow all origins
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS"); // allowed HTTP methods
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");       // allowed headers
+        res.set_header("Access-Control-Allow-Origin", "*"); // allow all origins
+        // PUT is listed even though every PUT route answers 405. The preflight is not where the
+        // policy is enforced — the 405 handler is — and omitting PUT here means a cross-origin
+        // browser client (the audience this CORS block exists for) is blocked by the preflight and
+        // sees an opaque CORS failure instead of the "use PATCH" message written for it.
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization"); // allowed headers
         res.set_header("Access-Control-Max-Age", "86400"); // cache preflight response for 1 day
         res.status = 204;                                  // no content
     });
