@@ -720,7 +720,11 @@ auto manager::remove_otel_instrument(const metrics::metric_metadata& meta) -> vo
 
     std::size_t dropped = 0;
     for (auto& group : m_impl->instruments) {
-        if (group->base_name != meta.name) {
+        // Match on TYPE as well as name. A metric refused by group_for() as a type collision
+        // still has metadata with the same name and labels as the accepted one, so removing the
+        // refused metric would otherwise strip the surviving metric's series — leaving a live
+        // metric silently unexported.
+        if (group->base_name != meta.name || group->type != meta.type) {
             continue;
         }
         const std::lock_guard series_lock{group->mtx};

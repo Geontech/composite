@@ -111,6 +111,29 @@ int main() {
                     after_instruments, mid_series, after_series);
     }
 
+    // ---- (6) removing a REFUSED collision must not strip the accepted metric's series ----
+    // Same name AND same labels this time. The gauge is refused by grouping, but its metadata is
+    // indistinguishable from the counter's by (name, labels) — so a removal keyed on those alone
+    // would drop the counter's series while the counter is still alive and exporting.
+    {
+        const auto shared = labels_for("same_identity");
+        reg.get_or_create_counter("collide.identical", "counter", "1", shared);
+        const auto [_, with_counter] = mgr.exported_series_counts();
+
+        reg.get_or_create_gauge("collide.identical", "gauge", "1", shared); // refused by grouping
+        reg.remove_gauge("collide.identical", shared);                      // must be a no-op for the counter
+
+        const auto [__, after_removal] = mgr.exported_series_counts();
+        check(after_removal == with_counter,
+              "collision removal: removing the REFUSED gauge left the counter's series intact");
+        std::printf("collision removal: series %zu -> %zu (must be unchanged)\n", with_counter, after_removal);
+
+        // and the counter's own removal still works
+        reg.remove_counter("collide.identical", shared);
+        const auto [___, after_counter] = mgr.exported_series_counts();
+        check(after_counter == with_counter - 1, "collision removal: the counter's own removal still drops its series");
+    }
+
     telemetry::manager::instance().shutdown();
 
     if (g_fails != 0) {
