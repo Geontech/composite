@@ -33,12 +33,41 @@ public:
             return retval::NOOP;
         }
         if (!out.can_send()) {
+            // Time each backpressure stall. This is the measurement that actually discriminates:
+            // a reverse-doorbell wake is sub-millisecond, while a MISSED edge falls back to the
+            // 4s NOOP backoff. A wall-clock bound on the whole run cannot tell those apart —
+            // 60s is generous enough that a doorbell firing on only SOME full->not-full edges
+            // still finishes inside it — but the longest single stall separates them by three
+            // orders of magnitude regardless of how loaded the machine is.
+            if (!m_await_started) {
+                m_await_since = std::chrono::steady_clock::now();
+                m_await_started = true;
+            }
             return retval::AWAIT_OUTPUT;
         } // backpressured -> reverse-doorbell idle
+        // Measured HERE, on the send that follows a wait — not on the next backpressured call.
+        // A missed edge stalls until the NOOP backoff fires, by which point the consumer has
+        // drained and can_send() is true again, so the stall is only ever visible from this side.
+        if (m_await_started) {
+            m_await_started = false;
+            const auto waited =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_await_since)
+                    .count();
+            auto prev = max_stall_ms.load(std::memory_order_relaxed);
+            while (waited > prev && !max_stall_ms.compare_exchange_weak(prev, waited, std::memory_order_relaxed)) {
+            }
+        }
         out.send_data(make_immutable<float>({1.0F}), timestamp{});
         produced.fetch_add(1, std::memory_order_relaxed);
         return retval::NORMAL;
     }
+    std::atomic<long> max_stall_ms{0};
+
+private:
+    std::chrono::steady_clock::time_point m_await_since{};
+    bool m_await_started{false};
+
+public:
     component::auto_stop m_auto_stop{*this};
 };
 
@@ -121,9 +150,14 @@ int main() {
 
     check(got_all, "consumer drained all N (reverse doorbell kept the backpressured source flowing)");
     check(src->produced.load() == N, "source produced exactly N (lossless can_send pacing)");
-    check(dt_ms < k_budget_ms, "completed far below the 4s-per-fill no-reverse-doorbell floor");
-    std::printf("reverse doorbell: drained %ld/%ld in %lld ms (produced=%ld)\n", sink->consumed.load(), N,
-                (long long)dt_ms, src->produced.load());
+    // The sensitive assertion: not one backpressure stall ran to the NOOP backoff. Half the
+    // budget of a single backoff period is a wide margin over a doorbell wake (sub-millisecond
+    // even loaded) and a wide margin under the fallback (4s), so this fails on a doorbell that
+    // misses SOME edges — which the 60s whole-run bound cannot see.
+    check(src->max_stall_ms.load() < 2000,
+          "no backpressure stall reached the NOOP backoff — every full->not-full edge rang the doorbell");
+    std::printf("reverse doorbell: drained %ld/%ld in %lld ms (produced=%ld, longest stall=%ld ms)\n",
+                sink->consumed.load(), N, (long long)dt_ms, src->produced.load(), src->max_stall_ms.load());
 
     src->stop();
     sink->stop();

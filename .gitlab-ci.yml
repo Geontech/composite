@@ -106,6 +106,12 @@ build:options-matrix:
     matrix:
       - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
       - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON"
+      # The OTel bridge SANITIZED. The sanitize:* jobs below build the default option set, which
+      # excludes OpenTelemetry, so without this entry the most sanitizer-hungry code in the tree —
+      # raw void* round-trips, a `this` pointer handed to a C callback the SDK invokes from its own
+      # export thread, and cross-thread mutation of a group's series list — ran under no sanitizer
+      # at all, in any job.
+      - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON -DCOMPOSITE_SANITIZER=address,undefined"
   script:
     # Tests ON so the option-specific suites are built AND RUN. The OTLP grouping test in
     # particular only exists under -DCOMPOSITE_USE_OPENTELEMETRY=ON, and the failure it guards
