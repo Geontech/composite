@@ -485,15 +485,21 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         // This callback is invoked for existing metrics and any future metrics
         auto& registry = metrics::registry::instance();
 
+        // DEREGISTRATION FIRST, then registration. add_observer(notify_existing) enumerates and
+        // notifies under the registry's observer mutex, so a removal racing that enumeration is
+        // held until the callbacks have run — its metric stays alive meanwhile, so we register a
+        // valid pointer. But that removal's deregistration notice fires the moment the mutex is
+        // released, and if the deregistration observer were installed only afterwards, the notice
+        // would find no observer and the series for a now-destroyed metric would be stranded.
+        // Subscribing in this order means the retraction always has somewhere to land.
+        m_impl->deregistration_observer_id = registry.add_deregistration_observer(
+            [this](const metrics::metric_metadata& meta) { remove_otel_instrument(meta); });
+
         m_impl->registration_observer_id =
             registry.add_observer([this](const metrics::metric_metadata& meta,
                                          void* metric_ptr) { create_otel_instrument(meta, metric_ptr); },
                                   true // notify for existing metrics
             );
-
-        // Register deregistration observer to clean up OTel instruments when metrics are removed
-        m_impl->deregistration_observer_id = registry.add_deregistration_observer(
-            [this](const metrics::metric_metadata& meta) { remove_otel_instrument(meta); });
 
         spdlog::info("telemetry: OTLP export initialized (interval: {}ms)", m_impl->config.export_interval.count());
         return true;

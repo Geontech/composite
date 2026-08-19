@@ -82,7 +82,11 @@ foreach(t
     # overlap_ring: lock-free overlapped framing ring lifted from the comps framer_pool (M6)
     test_overlap_ring
     # EAL-free DPDK port_registry bookkeeping (compiles + TSan-tests without libdpdk)
-    test_dpdk_registry)
+    test_dpdk_registry
+    # Deterministic coverage for observer/enumeration synchronization: reentrant metric removal
+    # during initial enumeration, and an observer retiring itself. Neither schedule is reached by
+    # ordinary runs — a regression is a UAF or a hang, so this is worth pinning explicitly.
+    test_registry_observer_sync)
   composite_standalone_test(${t})
 endforeach()
 

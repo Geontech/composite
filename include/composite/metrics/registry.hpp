@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <format>
 #include <functional>
@@ -324,6 +325,27 @@ inline auto normalize_labels(labels_t& labels) -> void {
     std::sort(labels.begin(), labels.end(), [](const label_pair& a, const label_pair& b) { return a.first < b.first; });
 }
 
+namespace detail {
+
+/// An observer plus the state remove_observer() needs to retire it safely. Held by shared_ptr so
+/// a notifier's copy keeps the slot alive even as the map entry is erased. At namespace scope
+/// because the notify signatures below name it in PARAMETER types, which are not a
+/// complete-class context.
+template <typename Callback>
+struct observer_slot {
+    explicit observer_slot(Callback cb) : callback(std::move(cb)) {}
+    Callback callback;
+    std::atomic<bool> closed{false}; ///< set by removal; checked after registering in-flight
+    std::atomic<int> in_flight{0};   ///< callbacks currently executing
+};
+
+} // namespace detail
+
+using registration_observer_map =
+    std::unordered_map<std::size_t, std::shared_ptr<detail::observer_slot<registration_callback>>>;
+using deregistration_observer_map =
+    std::unordered_map<std::size_t, std::shared_ptr<detail::observer_slot<deregistration_callback>>>;
+
 /**
  * @brief Central registry for all application metrics
  *
@@ -424,7 +446,7 @@ public:
 
         counter<uint64_t>* result_ptr = nullptr;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -460,7 +482,7 @@ public:
         counter<uint64_t>* result_ptr = nullptr;
         bool created = false;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -502,7 +524,7 @@ public:
 
         updown_counter<int64_t>* result_ptr = nullptr;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -535,7 +557,7 @@ public:
         updown_counter<int64_t>* result_ptr = nullptr;
         bool created = false;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -577,7 +599,7 @@ public:
 
         gauge<double>* result_ptr = nullptr;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -609,7 +631,7 @@ public:
         gauge<double>* result_ptr = nullptr;
         bool created = false;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -651,7 +673,7 @@ public:
 
         histogram* result_ptr = nullptr;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -684,7 +706,7 @@ public:
         histogram* result_ptr = nullptr;
         bool created = false;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -727,7 +749,7 @@ public:
 
         histogram* result_ptr = nullptr;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -760,7 +782,7 @@ public:
         histogram* result_ptr = nullptr;
         bool created = false;
         metric_metadata meta_copy;
-        std::unordered_map<std::size_t, registration_callback> observers_copy;
+        decltype(m_observers) observers_copy;
         error_callback error_handler_copy;
 
         {
@@ -815,9 +837,12 @@ public:
                 }
             }
         }
-        // Notify outside lock to prevent slow observers from blocking
+        // Notify outside lock to prevent slow observers from blocking. Wait out any enumeration
+        // FIRST: one already publishing this metric must finish registering it (it is still alive
+        // — keep_alive above holds it) before the retraction below, or the series it adds would
+        // be stranded pointing at a metric this function is about to destroy.
         if (removed_meta) {
-            notify_deregistration_unlocked(*removed_meta);
+            finish_removal(std::move(keep_alive_until_observers_return), *removed_meta);
             return true;
         }
         return false;
@@ -848,7 +873,7 @@ public:
             }
         }
         if (removed_meta) {
-            notify_deregistration_unlocked(*removed_meta);
+            finish_removal(std::move(keep_alive_until_observers_return), *removed_meta);
             return true;
         }
         return false;
@@ -878,7 +903,7 @@ public:
             }
         }
         if (removed_meta) {
-            notify_deregistration_unlocked(*removed_meta);
+            finish_removal(std::move(keep_alive_until_observers_return), *removed_meta);
             return true;
         }
         return false;
@@ -908,7 +933,7 @@ public:
             }
         }
         if (removed_meta) {
-            notify_deregistration_unlocked(*removed_meta);
+            finish_removal(std::move(keep_alive_until_observers_return), *removed_meta);
             return true;
         }
         return false;
@@ -991,7 +1016,29 @@ public:
             }
         }
 
-        // Notify outside lock
+        // Same rule as the single-removal paths: defer when reentrant, otherwise drain first.
+        if (!removed_metrics.empty()) {
+            if (enumeration_depth() > 0) {
+                const std::lock_guard lk{m_deferred_mtx};
+                for (auto& owner : keep_alive_m_counters) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (auto& owner : keep_alive_m_updown_counters) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (auto& owner : keep_alive_m_gauges) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (auto& owner : keep_alive_m_histograms) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (const auto& meta : removed_metrics) {
+                    m_deferred_removals.push_back(meta);
+                }
+                return removed_metrics.size();
+            }
+            wait_for_enumerations();
+        }
         for (const auto& meta : removed_metrics) {
             notify_deregistration_unlocked(meta);
         }
@@ -1083,7 +1130,29 @@ public:
             }
         }
 
-        // Notify outside lock
+        // Same rule as the single-removal paths: defer when reentrant, otherwise drain first.
+        if (!removed_metrics.empty()) {
+            if (enumeration_depth() > 0) {
+                const std::lock_guard lk{m_deferred_mtx};
+                for (auto& owner : keep_alive_m_counters) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (auto& owner : keep_alive_m_updown_counters) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (auto& owner : keep_alive_m_gauges) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (auto& owner : keep_alive_m_histograms) {
+                    m_deferred_owners.emplace_back(std::move(owner));
+                }
+                for (const auto& meta : removed_metrics) {
+                    m_deferred_removals.push_back(meta);
+                }
+                return removed_metrics.size();
+            }
+            wait_for_enumerations();
+        }
         for (const auto& meta : removed_metrics) {
             notify_deregistration_unlocked(meta);
         }
@@ -1111,11 +1180,22 @@ public:
         std::vector<std::pair<metric_metadata, void*>> existing_metrics;
         error_callback error_handler_copy;
 
+        // Held across the snapshot AND the notification below, so a concurrent removal cannot
+        // destroy a metric in between. A removal that gets in first is simply absent from the
+        // snapshot; one that arrives after blocks on this until the callbacks have run, and its
+        // own keep-alive holds the metric valid throughout.
+        std::shared_ptr<detail::observer_slot<registration_callback>> slot;
         {
             auto lock = std::unique_lock{m_mutex};
 
             id = m_next_observer_id++;
-            m_observers[id] = callback; // Store callback (not moved, we need it below)
+            slot = std::make_shared<detail::observer_slot<registration_callback>>(callback);
+            m_observers[id] = slot;
+            // Counted under m_mutex, so it is atomic with the snapshot below: a removal either
+            // sees this enumeration and waits it out, or erases first and is simply absent here.
+            if (notify_existing) {
+                m_enumerations_in_flight.fetch_add(1, std::memory_order_seq_cst);
+            }
             error_handler_copy = m_error_handler;
 
             if (notify_existing) {
@@ -1138,10 +1218,38 @@ public:
             }
         }
 
-        // Notify for existing metrics outside lock to prevent slow observers from blocking
+        // Notify for existing metrics outside lock to prevent slow observers from blocking.
+        // RAII so the enumeration count is released even if a callback throws.
+        struct enumeration_guard {
+            registry* self;
+            bool active;
+            explicit enumeration_guard(registry* s, bool a) : self(s), active(a) {
+                if (active) {
+                    ++enumeration_depth();
+                }
+            }
+            enumeration_guard(const enumeration_guard&) = delete;
+            auto operator=(const enumeration_guard&) -> enumeration_guard& = delete;
+            enumeration_guard(enumeration_guard&&) = delete;
+            auto operator=(enumeration_guard&&) -> enumeration_guard& = delete;
+            ~enumeration_guard() {
+                if (!active) {
+                    return;
+                }
+                const bool outermost = --enumeration_depth() == 0;
+                if (self->m_enumerations_in_flight.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                    const std::lock_guard lk{self->m_drain_mtx};
+                    self->m_drain_cv.notify_all();
+                }
+                if (outermost) {
+                    self->flush_deferred_removals(); // retract, then destroy, now it is safe
+                }
+            }
+        } guard{this, notify_existing};
+
         for (const auto& [meta, ptr] : existing_metrics) {
             try {
-                callback(meta, ptr);
+                invoke_observer(slot, [&](const registration_callback& cb) { cb(meta, ptr); });
             } catch (...) {
                 if (error_handler_copy) {
                     try {
@@ -1162,8 +1270,23 @@ public:
      * @param observer_id ID returned from add_observer
      */
     auto remove_observer(std::size_t observer_id) -> void {
-        auto lock = std::unique_lock{m_mutex};
-        m_observers.erase(observer_id);
+        // m_observer_mtx first: a notification may be running RIGHT NOW with a copy of the
+        // callback map taken before this call. Erasing from the map alone would not stop it, so
+        // this waits the in-flight callback out. Once this returns, the observer is neither
+        // running nor reachable — which is what lets a subscriber (the telemetry manager) tear
+        // down the state its callback touches.
+        std::shared_ptr<detail::observer_slot<registration_callback>> slot;
+        {
+            auto lock = std::unique_lock{m_mutex};
+            if (auto it = m_observers.find(observer_id); it != m_observers.end()) {
+                slot = it->second;
+                m_observers.erase(it);
+            }
+        }
+        // Erasing the map entry is not enough: a notifier copies the map before calling, so a
+        // copied slot may be about to run. Close it and wait for any call already in progress —
+        // once this returns, the callback is neither running nor startable.
+        retire_observer(slot);
     }
 
     /**
@@ -1178,7 +1301,8 @@ public:
     auto add_deregistration_observer(deregistration_callback callback) -> std::size_t {
         auto lock = std::unique_lock{m_mutex};
         auto id = m_next_deregistration_observer_id++;
-        m_deregistration_observers[id] = std::move(callback);
+        m_deregistration_observers[id] =
+            std::make_shared<detail::observer_slot<deregistration_callback>>(std::move(callback));
         return id;
     }
 
@@ -1188,8 +1312,15 @@ public:
      * @param observer_id ID returned from add_deregistration_observer
      */
     auto remove_deregistration_observer(std::size_t observer_id) -> void {
-        auto lock = std::unique_lock{m_mutex};
-        m_deregistration_observers.erase(observer_id);
+        std::shared_ptr<detail::observer_slot<deregistration_callback>> slot;
+        {
+            auto lock = std::unique_lock{m_mutex};
+            if (auto it = m_deregistration_observers.find(observer_id); it != m_deregistration_observers.end()) {
+                slot = it->second;
+                m_deregistration_observers.erase(it);
+            }
+        }
+        retire_observer(slot); // see remove_observer
     }
 
     // ========================================================================
@@ -1369,11 +1500,11 @@ private:
      * @param error_handler_copy Copy of error handler (taken while lock was held)
      */
     auto notify_registration_unlocked(const metric_metadata& meta, void* ptr,
-                                      const std::unordered_map<std::size_t, registration_callback>& observers_copy,
+                                      const registration_observer_map& observers_copy,
                                       const error_callback& error_handler_copy) -> void {
-        for (const auto& [id, callback] : observers_copy) {
+        for (const auto& [id, slot] : observers_copy) {
             try {
-                callback(meta, ptr);
+                invoke_observer(slot, [&](const registration_callback& callback) { callback(meta, ptr); });
             } catch (...) {
                 // Observer callbacks should not throw, but don't let one
                 // bad observer break registration. Report error if handler set.
@@ -1405,9 +1536,9 @@ private:
         }
 
         // Call observers without lock
-        for (const auto& [id, callback] : observers_copy) {
+        for (const auto& [id, slot] : observers_copy) {
             try {
-                callback(meta);
+                invoke_observer(slot, [&](const deregistration_callback& callback) { callback(meta); });
             } catch (...) {
                 if (error_handler_copy) {
                     try {
@@ -1569,6 +1700,88 @@ private:
     error_callback m_error_handler;
 
     // Separate storage for each type (avoids variant overhead in hot path)
+    /// Drain coordination for observer callbacks and metric enumeration.
+    ///
+    /// NO LOCK IS HELD WHILE A USER CALLBACK RUNS. An earlier attempt serialized everything on one
+    /// mutex held across the callbacks, which deadlocked any observer that created a metric,
+    /// removed one, or touched observer registration — a silent restriction on existing public
+    /// API. Two independent counters replace it:
+    ///
+    ///  - each observer_slot tracks its own in-flight callbacks, so remove_observer() can close
+    ///    admission and wait for its callback to finish. Copying the observer map under m_mutex
+    ///    is not enough on its own: the copy predates the call, so an erase could otherwise
+    ///    return while a copied callback was about to run against torn-down state.
+    ///  - m_enumerations_in_flight covers add_observer(notify_existing), which publishes raw
+    ///    metric pointers after releasing m_mutex. A removal waits this out BEFORE announcing the
+    ///    deregistration, so an enumeration that is mid-flight registers the metric (still alive
+    ///    via the remover's keep-alive) and the retraction lands afterwards rather than being
+    ///    lost.
+    mutable std::mutex m_drain_mtx;
+    mutable std::condition_variable m_drain_cv;
+    std::atomic<int> m_enumerations_in_flight{0};
+
+    /// How many enumerations THIS thread is inside. A depth, not a flag: enumerations can nest
+    /// if an observer callback subscribes another observer with notify_existing.
+    static auto enumeration_depth() -> int& {
+        static thread_local int depth = 0;
+        return depth;
+    }
+
+    /// Slots this thread is currently invoking, innermost last. Lets an observer retire ITSELF
+    /// without waiting for an in-flight count that only it can decrement.
+    static auto invoking_slots() -> std::vector<const void*>& {
+        static thread_local std::vector<const void*> slots;
+        return slots;
+    }
+
+    /// Block until no enumeration is publishing metric pointers. Cold path (removal only).
+    /// Callers must handle the reentrant case themselves — see finish_removal().
+    auto wait_for_enumerations() const -> void {
+        std::unique_lock lk{m_drain_mtx};
+        m_drain_cv.wait(lk, [this] { return m_enumerations_in_flight.load(std::memory_order_acquire) == 0; });
+    }
+
+    /// Complete a removal: retract the series, then destroy the metric.
+    ///
+    /// Reentrant case (this thread is inside an enumeration): DEFER both. The enumeration holds
+    /// raw pointers to a snapshot it has not finished walking, so destroying this metric now
+    /// would leave a later entry dangling — and retracting now would let the enumeration register
+    /// the metric AFTERWARDS, stranding a series. Both are queued and run when the outermost
+    /// enumeration finishes, which puts the retraction after the registration and the destruction
+    /// after both.
+    template <typename Metric>
+    auto finish_removal(std::unique_ptr<Metric> owner, const metric_metadata& meta) -> void {
+        if (enumeration_depth() > 0) {
+            const std::lock_guard lk{m_deferred_mtx};
+            m_deferred_owners.emplace_back(std::move(owner)); // shared_ptr<void> adopts the deleter
+            m_deferred_removals.push_back(meta);
+            return;
+        }
+        wait_for_enumerations();
+        notify_deregistration_unlocked(meta);
+        // `owner` dies here, after every observer has retracted it.
+    }
+
+    /// Run the removals deferred by reentrant callbacks. Called when the outermost enumeration
+    /// on this thread completes.
+    auto flush_deferred_removals() -> void {
+        std::vector<std::shared_ptr<void>> owners;
+        std::vector<metric_metadata> removals;
+        {
+            const std::lock_guard lk{m_deferred_mtx};
+            owners.swap(m_deferred_owners);
+            removals.swap(m_deferred_removals);
+        }
+        for (const auto& meta : removals) {
+            notify_deregistration_unlocked(meta);
+        }
+        // owners destroyed here, after the retractions above.
+    }
+
+    mutable std::mutex m_deferred_mtx;
+    std::vector<std::shared_ptr<void>> m_deferred_owners; ///< kept alive until enumeration ends
+    std::vector<metric_metadata> m_deferred_removals;     ///< retractions owed once it does
+
     std::vector<std::unique_ptr<counter<uint64_t>>> m_counters;
     std::vector<metric_metadata> m_counter_metadata;
 
@@ -1582,11 +1795,68 @@ private:
     std::vector<metric_metadata> m_histogram_metadata;
 
     // Observer management
-    std::unordered_map<std::size_t, registration_callback> m_observers;
+    /// Run @p slot's callback unless it has been closed, keeping remove_observer() informed.
+    /// The seq_cst pairing matters: the increment and the `closed` load must not BOTH miss the
+    /// remover's store and its in-flight read, or a callback could start after removal returned.
+    template <typename Slot, typename Invoke>
+    auto invoke_observer(const Slot& slot, Invoke&& invoke) const -> void {
+        // The decrement MUST be RAII: observer callbacks are allowed to throw (the registry
+        // catches and routes to the error handler), and a straight-line decrement after the call
+        // is skipped on that path — leaving in_flight stuck above zero and remove_observer()
+        // waiting forever. That is a hang, not a leak.
+        struct flight_guard {
+            const registry* self;
+            const Slot& slot;
+            flight_guard(const registry* registry_ptr, const Slot& observer_slot)
+                : self(registry_ptr), slot(observer_slot) {}
+            flight_guard(const flight_guard&) = delete;
+            auto operator=(const flight_guard&) -> flight_guard& = delete;
+            flight_guard(flight_guard&&) = delete;
+            auto operator=(flight_guard&&) -> flight_guard& = delete;
+            ~flight_guard() {
+                if (slot->in_flight.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                    const std::lock_guard lk{self->m_drain_mtx};
+                    self->m_drain_cv.notify_all();
+                }
+            }
+        };
+
+        slot->in_flight.fetch_add(1, std::memory_order_seq_cst);
+        const flight_guard guard{this, slot};
+        if (!slot->closed.load(std::memory_order_seq_cst)) {
+            invoking_slots().push_back(slot.get());
+            struct pop_guard {
+                ~pop_guard() { invoking_slots().pop_back(); }
+            } popper;
+            invoke(slot->callback);
+        }
+    }
+
+    /// Close @p slot and wait for any callback already running to finish.
+    template <typename Slot>
+    auto retire_observer(const Slot& slot) const -> void {
+        if (!slot) {
+            return;
+        }
+        slot->closed.store(true, std::memory_order_seq_cst);
+        // An observer removing ITSELF from inside its own callback must not wait: the only
+        // in-flight count is this very call, and only its return can decrement it. `closed` is
+        // already set, so no further invocation can start — which is the guarantee callers
+        // actually need. (Two observers each removing the other, concurrently, would still
+        // deadlock; that is documented as unsupported rather than defended against.)
+        const auto& active = invoking_slots();
+        if (std::find(active.begin(), active.end(), static_cast<const void*>(slot.get())) != active.end()) {
+            return;
+        }
+        std::unique_lock lk{m_drain_mtx};
+        m_drain_cv.wait(lk, [&slot] { return slot->in_flight.load(std::memory_order_seq_cst) == 0; });
+    }
+
+    registration_observer_map m_observers;
     std::size_t m_next_observer_id{};
 
     // Deregistration observer management
-    std::unordered_map<std::size_t, deregistration_callback> m_deregistration_observers;
+    deregistration_observer_map m_deregistration_observers;
     std::size_t m_next_deregistration_observer_id{};
 };
 
