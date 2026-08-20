@@ -87,6 +87,17 @@ variables:
     - cmake --version | head -1
     - g++ --version | head -1
 
+# Everything except publish:dockerhub is a *verification* job, and a tag pipeline verifies a commit
+# develop already verified. Re-running them on the tag would rebuild and re-test identical source to
+# reach the same answer, then publish images built by that second run rather than the ones develop
+# blessed — which is the thing promote-by-digest exists to avoid. So a tag pipeline is publish-only.
+# Jobs opt in by extending this alongside their image anchor, e.g. `extends: [.rocky, .not-on-tag]`.
+.not-on-tag:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+
 # ---------------------------------------------------------------------------
 # Publish the Dockerfile's toolchain stage to THIS PROJECT's registry so every build/test job can
 # use it. Pushed with $CI_JOB_TOKEN, which is scoped to this project's registry — no long-lived
@@ -98,7 +109,7 @@ variables:
 # ---------------------------------------------------------------------------
 ci:toolchain:
   stage: toolchain
-  extends: .docker
+  extends: [.docker, .not-on-tag]
   script:
     - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     # GUARD FIRST: the tag must encode the current Dockerfile. Without this, skipping the rebuild
@@ -152,6 +163,7 @@ ci:toolchain:
 # ---------------------------------------------------------------------------
 lint:tidy-format:
   stage: lint
+  extends: .not-on-tag
   image: gcc:14
   before_script:
     - apt-get update -qq && apt-get install -y -qq cmake git clang-tidy clang-format nlohmann-json3-dev
@@ -172,15 +184,14 @@ lint:tidy-format:
 # ---------------------------------------------------------------------------
 build:test:
   stage: build
-  extends: .rocky
-  # RC2-STOPGAP — REMOVE THIS. Non-gating only so a red test cannot block publishing the first
-  # OpenTelemetry/DPDK-enabled images to Docker Hub. It makes the ENTIRE 57-test suite advisory,
-  # which is a large hole: while this line is here, a genuine regression in any test reaches the
-  # registry.
+  extends: [.rocky, .not-on-tag]
+  # RC2-STOPGAP — remove this. Non-gating only so a red test cannot block publishing the first
+  # OpenTelemetry/DPDK-enabled images to Docker Hub. It makes the whole suite advisory, which is a
+  # large hole: while this line is here, a genuine regression in any test reaches the registry.
   #
   # It was added after test_reverse_doorbell failed on Rocky/GCC 14 having passed locally. That
-  # specific failure is FIXED (two flaky assertions of our own, see the test's history) and the
-  # suite is green locally at 57/57 — this is belt-and-braces for the immediate release only.
+  # specific failure is fixed (two flaky assertions of our own, see the test's history) and the
+  # suite is green locally — this is belt-and-braces for the immediate release only.
   #
   # Take it out once one pipeline has gone green on its own.
   allow_failure: true
@@ -201,7 +212,7 @@ build:test:
 # another. Now there is only one.
 build:options-matrix:
   stage: build
-  extends: .rocky
+  extends: [.rocky, .not-on-tag]
   parallel:
     matrix:
       - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
@@ -241,7 +252,7 @@ build:options-matrix:
 # mandatory — the manager can't silently rot.
 build:dpdk:
   stage: build
-  extends: .rocky
+  extends: [.rocky, .not-on-tag]
   before_script:
     # dpdk-devel is the ONE package any job still installs: it is a fast dnf install from
     # appstream, and keeping it out of the shared toolchain image avoids paying ~40MB of drivers
@@ -261,7 +272,7 @@ build:dpdk:
 # build:options-matrix on the shipped toolchain.
 build:portability-debian:
   stage: build
-  extends: .gcc
+  extends: [.gcc, .not-on-tag]
   # RC2-STOPGAP: non-gating so a red test cannot block publishing the first OpenTelemetry/DPDK
   # images. Remove every line tagged RC2-STOPGAP once a pipeline has gone green unaided:
   #   grep -n RC2-STOPGAP .gitlab-ci.yml
@@ -278,7 +289,7 @@ build:portability-debian:
 # Libs: line).
 build:consumer:
   stage: build
-  extends: .rocky
+  extends: [.rocky, .not-on-tag]
   script:
     - cmake -B build -DCMAKE_INSTALL_PREFIX=$CI_PROJECT_DIR/_install -DCOMPOSITE_INSTALL=ON -DCOMPOSITE_BUILD_TESTS=OFF
     - cmake --build build -j"$(nproc)" --target install
@@ -334,7 +345,7 @@ build:consumer:
 # consumer and graceful signal handling without adding test assets to runtime.
 build:container:
   stage: build
-  extends: .docker
+  extends: [.docker, .not-on-tag]
   script:
     - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     # LABEL CONTRACT: image labels carry the numeric PROJECT version, which is also what
@@ -557,11 +568,11 @@ build:container:
     # The rebuild is nearly free: every layer is already in the builder cache from the passes above.
     - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - export STAGED="$CI_REGISTRY_IMAGE/staging"
-    # PIPELINE-SCOPED, and used for every subsequent reference. `staging:<sha>` alone is a MUTABLE
-    # tag — a branch pipeline, a retry, or a tag pipeline on the same commit rewrites it — so
-    # verifying it and later promoting it need not be the same bytes. Adding the pipeline id makes
-    # each pipeline's artifacts its own, and publish:dockerhub runs in this same pipeline (it has no
-    # `rules` excluding it), so it can name exactly what was built and verified here.
+    # Pipeline-scoped, and used for every reference within this job. A bare `staging:<sha>` is
+    # mutable — a concurrent pipeline or a retry on the same commit rewrites it — so building under
+    # one name and verifying under it need not be the same bytes. The pipeline id makes this job's
+    # artifacts its own for the duration of its own gates; the commit-scoped alias published at the
+    # end is what the tag pipeline later promotes.
     - export STAGE_REF="$CI_COMMIT_SHA-p$CI_PIPELINE_ID"
     - |
       set -eu
@@ -623,6 +634,29 @@ build:container:
         attested "$img" SBOM       || { echo "no SBOM attestation on $img"; exit 1; }
         echo "attested: $img"
       done
+    # Last step, and only now that every gate above has passed: point a commit-scoped alias at these
+    # exact manifests. This is the handle the tag pipeline promotes from.
+    #
+    # It needs its own name because a tag pipeline cannot compute $STAGE_REF: the commit is the same
+    # but $CI_PIPELINE_ID is that pipeline's own, so the pipeline-scoped tag it would look for
+    # belongs to no build. Publishing under the commit alone gives the tag pipeline something it can
+    # name from $CI_COMMIT_SHA, which is all it has.
+    #
+    # `imagetools create` copies the manifest list by reference — no rebuild, no layer re-upload, and
+    # the digest is unchanged, so the attestations verified above are the ones the alias resolves to.
+    #
+    # The alias is mutable (a later pipeline on the same commit moves it) and that is fine: publish
+    # resolves it to a digest once, up front, and works from the digest thereafter. What matters is
+    # that it can only ever point at a build that cleared this job's smoke, feature and attestation
+    # gates, because this is the last thing the job does.
+    - |
+      set -eu
+      for suffix in "" "-devel" "-dpdk" "-dpdk-devel"; do
+        docker buildx imagetools create \
+          --tag "$STAGED:$CI_COMMIT_SHA$suffix" \
+          "$STAGED:$STAGE_REF$suffix"
+        echo "aliased $STAGED:$STAGE_REF$suffix -> $STAGED:$CI_COMMIT_SHA$suffix"
+      done
   after_script:
     # ONE after_script, cleanup only. Nothing here is a test: GitLab does not fail a job when
     # after_script fails, so anything that must gate belongs in `script`.
@@ -637,7 +671,7 @@ build:container:
 # access is provisioned (the build itself is green).
 build:comps:
   stage: build
-  extends: .rocky
+  extends: [.rocky, .not-on-tag]
   allow_failure: true   # pending comps-repo CI access; the build + tests are green locally
   variables:
     COMPS_REPO_URL: "$CI_SERVER_URL/$CI_PROJECT_NAMESPACE/composite-comps.git"
@@ -663,7 +697,7 @@ build:comps:
 # ---------------------------------------------------------------------------
 sanitize:thread:
   stage: sanitize
-  extends: .rocky
+  extends: [.rocky, .not-on-tag]
   # RC2-STOPGAP: non-gating so a red test cannot block publishing the first OpenTelemetry/DPDK
   # images. Remove every line tagged RC2-STOPGAP once a pipeline has gone green unaided:
   #   grep -n RC2-STOPGAP .gitlab-ci.yml
@@ -678,7 +712,7 @@ sanitize:thread:
 
 sanitize:address:
   stage: sanitize
-  extends: .rocky
+  extends: [.rocky, .not-on-tag]
   # RC2-STOPGAP: non-gating so a red test cannot block publishing the first OpenTelemetry/DPDK
   # images. Remove every line tagged RC2-STOPGAP once a pipeline has gone green unaided:
   #   grep -n RC2-STOPGAP .gitlab-ci.yml
@@ -696,7 +730,7 @@ sanitize:address:
 # architecture at all — the ordering fixes in park.hpp are the kind of thing only arm64 can show.
 sanitize:thread-arm64:
   stage: sanitize
-  extends: .gcc
+  extends: [.gcc, .not-on-tag]
   tags: [arm64]
   allow_failure: true
   script:
@@ -759,11 +793,14 @@ publish:dockerhub:
     # silent rebuild: publishing an untested artifact is what this change exists to prevent.
     - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - export STAGED="$CI_REGISTRY_IMAGE/staging"
-    # Same pipeline-scoped ref build:container staged. This job has no `rules` excluding it from the
-    # tag pipeline, so it runs alongside that build and promotes precisely the artifacts that
-    # pipeline verified — not whatever a later branch pipeline may have written over a commit-only
-    # tag while this manual job sat waiting.
-    - export STAGE_REF="$CI_COMMIT_SHA-p$CI_PIPELINE_ID"
+    # The commit-scoped alias build:container publishes as its final step, once its smoke, feature
+    # and attestation gates have passed. $CI_COMMIT_SHA is the only handle this job shares with the
+    # pipeline that did the building — a tag pipeline has its own $CI_PIPELINE_ID, so it cannot name
+    # that pipeline's ref.
+    #
+    # This is what makes a tag a promotion rather than a rebuild: the develop pipeline for this
+    # commit built, tested and blessed these manifests, and the tag ships those bytes.
+    - export STAGE_REF="$CI_COMMIT_SHA"
     # RESOLVE TO DIGESTS FIRST, then do everything against the digest.
     #
     # `staging:<sha>` is a MUTABLE tag: a branch pipeline, a tag pipeline, or a retry on the same
@@ -774,16 +811,29 @@ publish:dockerhub:
     - |
       set -eu
       : > /tmp/staged_digests
+      # The digest is the sha256 of the manifest's own bytes, so hashing `--raw` computes it by
+      # definition, for an index or a single manifest alike.
+      #
+      # Not `--format '{{.Manifest.Digest}}'`, which was here first and never worked: buildx
+      # special-cases a template starting with `.Manifest` and prints its full human-readable dump
+      # instead, exiting 0. `test -n` sees a non-empty string and passes, so the "digest" carried
+      # forward was a 14-line block beginning "Name: ...". An invalid field name is no better —
+      # buildx prints `ERROR: template:` and still exits 0.
       for suffix in "" "-devel" "-dpdk" "-dpdk-devel"; do
         src="$STAGED:$STAGE_REF$suffix"
-        if ! digest="$(docker buildx imagetools inspect "$src" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+        # Two steps, not a pipeline: a pipeline's status is `sha256sum`'s, which succeeds whatever
+        # inspect did. Capturing first is what makes a missing image an error.
+        if ! raw="$(docker buildx imagetools inspect "$src" --raw 2>/dev/null)"; then
           echo "MISSING staged image: $src"
-          echo "The develop pipeline for $CI_COMMIT_SHA did not stage images. Re-run"
-          echo "build:container on that commit, then re-run this job. Refusing to rebuild and"
-          echo "publish an artifact that was never tested."
+          echo "No pipeline for $CI_COMMIT_SHA has staged images. Run a branch pipeline on that"
+          echo "commit so build:container blesses them, then re-run this job. Refusing to rebuild"
+          echo "and publish an artifact that was never tested."
           exit 1
         fi
-        test -n "$digest"
+        digest="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+        # A digest is a fixed shape; anything else means the resolution above changed behaviour.
+        echo "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+          || { echo "unparseable digest for $src: [$digest]"; exit 1; }
         printf '%s|%s\n' "$suffix" "$STAGED@$digest" >> /tmp/staged_digests
         echo "resolved $src -> $digest"
       done

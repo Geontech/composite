@@ -121,7 +121,11 @@ The Rocky base image sets its own `name`, `version`, `license`, `vendor`, `summa
 
 ## GitLab CI
 
-`build:container` never receives Docker Hub credentials. It builds and tests the runtime, SDK, external-component consumer, non-root contract, SIGTERM path, OCI labels, third-party license notices, and the compiled-in feature surface — then **stages** the four verified images to the project's own GitLab registry (`$CI_REGISTRY_IMAGE/staging:<commit-sha>*`) with the job token, built with provenance and SBOM attestations. Staging happens only after every check above passes.
+**A tag pipeline runs `publish:dockerhub` and nothing else.** Every other job verifies a commit, and a tag names a commit the branch pipeline already verified; re-running them would rebuild identical source to reach the same answer, then publish the second build rather than the one that was blessed. Jobs opt out of tag pipelines by extending `.not-on-tag`, so adding a verification job means adding it there too — otherwise tagging silently starts rebuilding again.
+
+`build:container` never receives Docker Hub credentials. It builds and tests the runtime, SDK, external-component consumer, non-root contract, SIGTERM path, OCI labels, third-party license notices, and the compiled-in feature surface — then **stages** the four verified images to the project's own GitLab registry with the job token, built with provenance and SBOM attestations. Staging happens only after every check above passes.
+
+Staged images carry two refs. Each is pushed to a pipeline-scoped `staging:<commit-sha>-p<pipeline-id>*`, which is what that job's own gates run against — a bare commit tag is mutable, so a concurrent pipeline or a retry could otherwise leave it verifying bytes it did not build. As its final step, once those gates pass, the job aliases each manifest to `staging:<commit-sha>*`. The alias is the handle the tag pipeline promotes from, and it needs to exist because a tag pipeline has its own `$CI_PIPELINE_ID` and so cannot name the building pipeline's ref. Aliasing is `imagetools create`, a manifest copy by reference: no rebuild, no layer upload, and the digest is unchanged, so the attestations just verified are the ones the alias resolves to.
 
 `publish:dockerhub` appears only for tags matching:
 
@@ -130,7 +134,7 @@ v?MAJOR.MINOR.PATCH
 v?MAJOR.MINOR.PATCH-rc.N
 ```
 
-It is initially manual and uses the protected `dockerhub-production` environment. The job **does not build**: it resolves the staged images to immutable digests, verifies those exact manifests (version, non-root, feature surface, labels, attestations), copies them to source-SHA tags on Docker Hub, and then promotes the same manifests to release aliases.
+It is initially manual and uses the protected `dockerhub-production` environment. The job **does not build**: it resolves `staging:<commit-sha>*` to immutable digests, verifies those exact manifests (version, non-root, feature surface, labels, attestations), copies them to source-SHA tags on Docker Hub, and then promotes the same manifests to release aliases. If the alias is absent the job fails and says so, rather than falling back to a build — publishing an untested artifact is the thing this design exists to prevent.
 
 Building once and promoting means the published bytes are the ones the develop pipeline tested. Rebuilding at tag time published an artifact that had never been exercised — and with opentelemetry-cpp built from source it also meant four source builds in a fresh dind with no layer cache. Image **labels carry the numeric project version**; release identity, including any `-rc.N`, is the tag. That falls out of promoting rather than rebuilding: labels are baked on develop, before the release tag exists.
 
