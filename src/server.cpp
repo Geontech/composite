@@ -174,6 +174,11 @@ auto metric_snapshot_to_json(const metrics::metric_snapshot& snap) -> nlohmann::
                 hist_obj["sum"] = val.sum;
                 hist_obj["boundaries"] = val.boundaries;
                 hist_obj["bucket_counts"] = val.bucket_counts;
+                // Surfaced so bad instrumentation is visible to an operator. Deliberately NOT a
+                // fourth OTLP instrument: it measures a code defect, not the workload, and a
+                // histogram's OTLP registration is all-three-roles-or-none — adding a fourth role
+                // to that atomic set for a value that should always be zero is a poor trade.
+                hist_obj["rejected"] = val.rejected;
                 json_obj["value"] = hist_obj;
             }
         },
@@ -299,18 +304,20 @@ auto set_component_properties(composite::application::component_ptr comp, const 
     return res;
 }
 
-#ifdef COMPOSITE_USE_OPENSSL
-auto make_server(application& app, const std::string& cert, const std::string& key, const std::string& ca)
-    -> std::unique_ptr<httplib::Server> {
-    auto server = std::make_unique<httplib::SSLServer>(cert.c_str(), key.c_str(), ca.c_str());
-#else
-auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
-    auto server = std::make_unique<httplib::Server>();
-#endif
+namespace {
+/// Everything both server flavours share, applied to an ALREADY-CONSTRUCTED server.
+///
+/// Previously the two flavours were spliced together by an #ifdef across the signature and the
+/// first line, which meant an OpenSSL-enabled build contained ONLY the TLS overload — there was no
+/// plain-HTTP server to select at runtime at all. Compiling OpenSSL in therefore made TLS
+/// MANDATORY, which is not what a build-time capability flag should mean: it broke the documented
+/// plain-HTTP invocation and every existing deployment that had no certificates. One shared body,
+/// two thin entry points, and the choice moves to runtime where it belongs.
+auto configure_server(application& app, std::unique_ptr<httplib::Server> server) -> std::unique_ptr<httplib::Server> {
 
     // ------------------------------------------------------------------------
     // Control-plane hardening: central exception barrier, request-size cap, and
-    // SSE stream admission control. Shared by both server variants (post-#endif).
+    // SSE stream admission control. Shared by both server variants.
     // ------------------------------------------------------------------------
     // Any handler that throws lands here and returns a clean JSON error with an
     // appropriate status instead of dropping the connection. Per-route handlers
@@ -996,5 +1003,29 @@ auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
 
     return server;
 }
+} // namespace
+
+/// Plain HTTP. Available in EVERY build, including OpenSSL-enabled ones — compiling TLS support in
+/// must not make TLS compulsory.
+auto make_server(application& app) -> std::unique_ptr<httplib::Server> {
+    return configure_server(app, std::make_unique<httplib::Server>());
+}
+
+#ifdef COMPOSITE_USE_OPENSSL
+/// TLS. Selected at runtime when the caller supplies a certificate and key.
+///
+/// @param ca Optional trust store for verifying CLIENT certificates. Empty means "do not require
+///           client certificates" — and it must be passed as nullptr to mean that. cpp-httplib
+///           treats ANY non-null client_ca_cert_file_path as a request for mandatory client
+///           verification (it sets SSL_VERIFY_FAIL_IF_NO_PEER_CERT), and `std::string{}.c_str()`
+///           is a valid non-null pointer to "". So handing it an empty string produced a server
+///           that listened, loaded no trust roots, and then rejected every client — TLS that
+///           cannot actually be used. nullptr gives ordinary server-authenticated TLS.
+auto make_server(application& app, const std::string& cert, const std::string& key, const std::string& ca)
+    -> std::unique_ptr<httplib::Server> {
+    return configure_server(
+        app, std::make_unique<httplib::SSLServer>(cert.c_str(), key.c_str(), ca.empty() ? nullptr : ca.c_str()));
+}
+#endif
 
 } // namespace composite

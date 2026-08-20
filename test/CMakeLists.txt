@@ -123,6 +123,13 @@ target_include_directories(test_http_integration PRIVATE
 # Match the production server's pool size so the SSE-stream-cap test (8 held
 # streams + a rejected 9th) has spare workers to serve the 9th request.
 target_compile_definitions(test_http_integration PRIVATE CPPHTTPLIB_THREAD_POOL_COUNT=16)
+# The TLS cases need the same macro server.cpp is compiled with, plus OpenSSL for generating the
+# self-signed material they hand-shake against. Without this the TLS half of the REST surface —
+# which the published images now ship — has no test coverage at all.
+if(COMPOSITE_USE_OPENSSL)
+  target_compile_definitions(test_http_integration PRIVATE COMPOSITE_USE_OPENSSL=1)
+  target_link_libraries(test_http_integration PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 target_link_libraries(test_http_integration PRIVATE
   composite::composite composite_warnings nlohmann_json::nlohmann_json spdlog::spdlog_header_only
   httplib::httplib Catch2::Catch2WithMain ${CMAKE_DL_LIBS})

@@ -37,8 +37,11 @@ it with `find_package(composite)` (or `pkg-config composite`) and links the impo
 
 ### Build Options
 
-- `COMPOSITE_USE_OPENSSL` (default OFF) — compile a TLS REST server (requires OpenSSL 3). When ON,
-  `composite-cli` requires client cert/key arguments at launch (see below).
+- `COMPOSITE_USE_OPENSSL` (default OFF; **ON in the published container images**) — compile TLS
+  support into the REST server (requires OpenSSL 3). TLS then becomes available, not mandatory:
+  without `--server-certificate`/`--server-key` the server listens on plain HTTP exactly as an
+  OpenSSL-free build does. (Before 0.5 this flag made TLS *and* client authentication compulsory,
+  which meant enabling a capability silently changed the wire protocol.)
 - `COMPOSITE_USE_OPENTELEMETRY` (default OFF) — enable OpenTelemetry OTLP metrics export (requires
   opentelemetry-cpp).
 - `COMPOSITE_USE_DPDK` (default OFF) — build DPDK-backed source support.
@@ -75,9 +78,15 @@ Optional arguments:
 
 Additional arguments appear depending on build options:
 
-- With `-DCOMPOSITE_USE_OPENSSL=ON` (TLS), client authentication is **required**:
-  `-c, --client-certificate <file>` (required), `-k, --client-key <file>` (required),
-  `-a, --certificate-authority <file>` (optional).
+- With `-DCOMPOSITE_USE_OPENSSL=ON`, TLS is **optional and runtime-selected**:
+  `-c, --server-certificate <file>` and `-k, --server-key <file>` — this server's own certificate
+  and private key. Supply **both** for TLS, **neither** for plain HTTP; supplying exactly one is a
+  configuration error rather than a silent downgrade to unencrypted.
+  `-a, --client-ca <file>` (optional) — a CA used to verify **client** certificates, i.e. this is
+  what enables mutual TLS. Omit it for ordinary server-authenticated TLS.
+  **Renamed in 0.5, no aliases:** the former `--client-certificate`, `--client-key` and
+  `--certificate-authority` named the server's own credentials as if they were a client's, and are
+  removed rather than kept working. The short forms `-c`/`-k`/`-a` are unchanged.
 - With `-DCOMPOSITE_USE_DPDK=ON`: `--list-dpdk-ports` enumerates DPDK-capable ports and exits.
 
 > The default (non-TLS) build serves **plain, unauthenticated HTTP** with a wide-open CORS policy.
@@ -695,10 +704,16 @@ curl -s -X POST http://localhost:5000/app/connections \
        "input":  {"component": "snk", "port": "data_in"}}'
 ```
 
-A TLS build (`-DCOMPOSITE_USE_OPENSSL=ON`) requires client cert/key at launch and `https://`:
+A TLS build (`-DCOMPOSITE_USE_OPENSSL=ON`) serves plain HTTP unless you give it a server
+certificate and key, in which case it serves `https://`:
 
 ```bash
-composite-cli app.json -c client.crt -k client.key -a ca.crt
+# Server-authenticated TLS: clients verify the server, no client certificate needed.
+composite-cli app.json -c server.crt -k server.key
+curl --cacert ca.crt https://localhost:5000/app/healthz
+
+# Mutual TLS: --client-ca makes a client certificate mandatory.
+composite-cli app.json -c server.crt -k server.key -a client-ca.crt
 curl --cert client.crt --key client.key --cacert ca.crt https://localhost:5000/app/healthz
 ```
 

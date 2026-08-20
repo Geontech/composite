@@ -29,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <unistd.h> // _exit on the fail-fast path below
 #include <utility>
 #include <vector>
 
@@ -1088,6 +1089,86 @@ int main() {
         std::printf("gate wait: teardown %lldms, writer out after %lldms (park timeout is 5000ms)\n",
                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(teardown).count(),
                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(total).count());
+    }
+
+    // ---- (23) a post-close writer's exit must NOT satisfy an older writer's drain ----
+    // The drain used to compare aggregate entry/exit TOTALS, which cannot express "these
+    // particular callers finished" — exits are fungible. Cut at entered=N/exited=N-1 with writer A
+    // still inside; writer B arrives afterwards, is rejected, and its exit pushes the total to N,
+    // so the destructor concludes "drained" and frees the coordinator underneath A.
+    //
+    // Deterministic: A is pinned inside its property write by a blocking on_change, B is released
+    // only after the teardown has begun, and the teardown must still be waiting when B is done.
+    {
+        struct pinned_comp : component {
+            explicit pinned_comp(std::string_view id) : component(id) {
+                add_property("knob", m_knob, config_type::RUNTIME).on_change([this](const json&) {
+                    m_inside.store(true, std::memory_order_release);
+                    while (!m_release.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                });
+            }
+            auto process() -> retval override { return retval::FINISH; }
+            double m_knob{1.0};
+            std::atomic<bool> m_inside{false};
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        auto* c = new pinned_comp{"cohort"}; // NOLINT(cppcoreguidelines-owning-memory)
+        std::atomic<bool> teardown_returned{false};
+        std::atomic<bool> b_done{false};
+
+        // Writer A: enters, and stays inside until released.
+        std::thread a{[&] {
+            try {
+                c->set_properties(json{{"knob", 2.0}}, config_type::RUNTIME);
+            } catch (const std::exception&) { // not expected, but must not abort the test
+            }
+        }};
+        check(wait_until([&] { return c->m_inside.load(std::memory_order_acquire); }, std::chrono::seconds(5)),
+              "cohort: writer A is inside its property write");
+
+        // Teardown begins while A is inside. It must NOT return.
+        std::thread destroyer{[&] {
+            delete c; // NOLINT(cppcoreguidelines-owning-memory)
+            teardown_returned.store(true, std::memory_order_release);
+        }};
+        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // let it reach the cohort wait
+
+        // Writer B: arrives AFTER the close, is rejected, and returns. Under the old totals-based
+        // drain this exit is what wrongly satisfied A's ticket.
+        std::thread b{[&] {
+            try {
+                c->set_properties(json{{"knob", 3.0}}, config_type::RUNTIME);
+            } catch (const std::exception&) { // rejected: teardown in progress
+            }
+            b_done.store(true, std::memory_order_release);
+        }};
+        check(wait_until([&] { return b_done.load(std::memory_order_acquire); }, std::chrono::seconds(10)),
+              "cohort: post-close writer B completed");
+
+        // THE ASSERTION: B's exit must not have counted for A.
+        //
+        // FAIL FAST rather than continuing. If the teardown has already returned, the component
+        // has been destroyed while writer A is still inside a property write on it — every
+        // subsequent step (releasing A, joining it, unwinding) then operates on freed memory, and
+        // the process hangs or aborts before it can report anything. Reporting the violation and
+        // exiting is the only way this produces a usable diagnosis instead of a mystery.
+        if (teardown_returned.load(std::memory_order_acquire)) {
+            std::fprintf(stderr, "FAIL: cohort: teardown returned while writer A was still inside — a "
+                                 "post-close writer's exit satisfied an older writer's drain\n");
+            std::fflush(stderr);
+            _exit(1);
+        }
+        check(true, "cohort: teardown still waiting for writer A after a post-close writer exited");
+
+        c->m_release.store(true, std::memory_order_release);
+        a.join();
+        b.join();
+        destroyer.join();
+        check(teardown_returned.load(std::memory_order_acquire), "cohort: teardown completed once A returned");
     }
 
     // NOTE on the narrower window above: a caller that has ENTERED with_worker_parked() but has

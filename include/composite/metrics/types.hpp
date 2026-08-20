@@ -23,6 +23,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -355,14 +356,33 @@ private:
 // ============================================================================
 
 /**
- * @brief Consistent snapshot of histogram data
+ * @brief Snapshot of histogram data
  *
- * All fields are guaranteed to be from the same point in time.
+ * NOT a single point-in-time view while writers are active, and it never was — the earlier claim
+ * that "all fields are guaranteed to be from the same point in time" (and the reference to a
+ * seqlock in snapshot()) described an implementation that no longer exists. The seqlock was
+ * removed because it was only correct for ONE recorder; independent per-field atomics are correct
+ * for any number. The actual contract:
+ *
+ *  - CONCURRENT with record(): each field is individually never torn, but the fields are read one
+ *    at a time and may disagree with each other. In particular the bucket counts need not sum to
+ *    count, and sum need not correspond to either. Do not assert cross-field invariants on a
+ *    snapshot taken while anything is recording.
+ *  - QUIESCENT (no recorder running): exact and mutually consistent.
+ *
+ * This is what an aggregating exporter needs, and the honest description of what the code does.
+ * Adding synchronization to make it stronger would put a lock on the hot record() path to fix a
+ * discrepancy that resolves itself on the next export interval.
  */
 struct histogram_data {
     std::vector<uint64_t> bucket_counts;
     uint64_t count;
     double sum;
+    /// Observations record() refused for being negative, NaN or infinite. Carried in the snapshot
+    /// (and out through REST) rather than left on the accessor alone: a non-zero value means
+    /// instrumentation somewhere is feeding a histogram values it cannot represent, and advice to
+    /// alert on it is not actionable if the number never leaves the process.
+    uint64_t rejected;
 };
 
 /**
@@ -370,35 +390,61 @@ struct histogram_data {
  *
  * Use for latency distributions, size distributions, etc.
  *
- * For maximum performance, use power-of-2 bucket boundaries which enable
- * O(1) bucket lookup via bit manipulation.
+ * Bucket lookup is O(log n) in the number of boundaries (std::lower_bound). It used to advertise an
+ * O(1) power-of-2 fast path; that path was removed because it disagreed with the binary-search path
+ * about which bucket a value belongs to (e.g. 1.5), and correctness won. power_of_2_boundaries()
+ * remains a convenient way to GENERATE boundaries — it just no longer changes the lookup.
  *
  * Thread safety:
  * - record() is always thread-safe
  * - Individual accessors (count(), sum(), bucket_counts()) are thread-safe
  *   but may return inconsistent data if called during concurrent writes
- * - Use snapshot() for a consistent point-in-time view
+ * - Use snapshot() to read every field in one call. It is NOT atomic across fields while writers
+ *   are active — see histogram_data for the exact contract — but it avoids interleaving caller
+ *   logic between the individual accessors
  */
 class histogram {
 public:
     /**
      * @brief Construct histogram with explicit bucket boundaries
      *
-     * @param boundaries Upper bounds for each bucket (exclusive).
-     *        Values >= last boundary go in overflow bucket.
+     * @param boundaries INCLUSIVE upper bounds, one per bucket, plus an implicit overflow bucket.
+     *        Values greater than the last boundary land in the overflow bucket.
      *        Example: {10, 50, 100, 500, 1000} creates 6 buckets:
-     *        [0,10), [10,50), [50,100), [100,500), [500,1000), [1000,+inf)
+     *        (-,10], (10,50], (50,100], (100,500], (500,1000], (1000,+inf)
+     *
+     *        The bounds are INCLUSIVE, matching the `le` ("less than or equal") convention that
+     *        Prometheus and the OTLP bridge use — an observation exactly equal to a boundary lands
+     *        in that boundary's bucket. This documentation used to describe exclusive bounds
+     *        ([0,10) and so on), which contradicted the implementation: bucketing is a
+     *        std::lower_bound, which finds the first boundary NOT LESS THAN the value, so 10.0 has
+     *        always gone into the bucket labelled 10. The implementation was right and the
+     *        documentation wrong, so the documentation is what changed.
+     *
+     * @throws std::invalid_argument if @p boundaries is not finite, non-negative and strictly
+     *         increasing.
+     *
+     *         Validated rather than tolerated, as part of the v0.5 freeze, and for the same reason
+     *         record() rejects negative and non-finite observations: a negative boundary can never
+     *         be matched by a valid observation, a NaN boundary makes lower_bound's ordering
+     *         requirement unmet (so bucketing becomes undefined, not merely odd), and a duplicate
+     *         or out-of-order boundary produces two exported series whose `le` labels imply an
+     *         ordering the bucket counts do not honour — a silently unreadable histogram
+     *         downstream. Throwing at construction is a loud, immediate failure in setup code;
+     *         every alternative is quiet corruption at export time.
      */
     explicit histogram(std::vector<double> boundaries)
-        : m_boundaries(std::move(boundaries)), m_buckets(m_boundaries.size() + 1) // +1 for overflow bucket
+        : m_boundaries(validated_boundaries(std::move(boundaries))),
+          m_buckets(m_boundaries.size() + 1) // +1 for overflow bucket
     {}
 
     /**
-     * @brief Generate power-of-2 boundaries for O(1) lookup
+     * @brief Generate power-of-2 bucket boundaries
      *
      * Creates boundaries: 1, 2, 4, 8, ..., 2^(n-2)
-     * Use with the histogram constructor for buckets:
-     * [0,1), [1,2), [2,4), [4,8), ..., [2^(n-2), +inf)
+     * Use with the histogram constructor for buckets, with INCLUSIVE upper bounds (`le`), matching
+     * the constructor: an observation exactly equal to a boundary lands in that boundary's bucket.
+     * (-,1], (1,2], (2,4], (4,8], ..., (2^(n-2), +inf)
      *
      * @param num_buckets Number of buckets (max 64)
      * @return Vector of boundaries
@@ -417,14 +463,6 @@ public:
         }
         return bounds;
     }
-
-    /**
-     * @brief Enable power-of-2 optimized bucket lookup
-     *
-     * Call this after constructing with power_of_2_boundaries() to enable
-     * O(1) bucket lookup via bit manipulation.
-     */
-    void enable_power_of_2_lookup() noexcept { m_power_of_2 = true; }
 
     /**
      * @brief Record a value in the histogram
@@ -493,7 +531,8 @@ public:
      * @return Vector of counts per bucket
      *
      * @note This may be inconsistent with count()/sum() during concurrent writes.
-     *       Use snapshot() for a consistent view.
+     *       Use snapshot() to read every field in one call — though note that snapshot() is not
+     *       atomic ACROSS fields either while writers are active; see histogram_data.
      */
     [[nodiscard]]
     auto bucket_counts() const -> std::vector<uint64_t> {
@@ -506,12 +545,13 @@ public:
     }
 
     /**
-     * @brief Get a consistent snapshot of all histogram data
+     * @brief Read all histogram fields in one call
      *
-     * Uses a seqlock to ensure all returned values are from the same
-     * point in time. May retry internally if writes are detected.
+     * Preferable to the individual accessors — it reads every field once, so a caller cannot
+     * accidentally interleave its own logic between them — but it is NOT atomic across fields
+     * while writers are active. See histogram_data for the exact contract.
      *
-     * @return Consistent histogram data
+     * @return Histogram data: per-field consistent always, mutually consistent when quiescent
      */
     [[nodiscard]]
     auto snapshot() const -> histogram_data {
@@ -522,6 +562,7 @@ public:
         }
         data.count = m_count.value.load(std::memory_order_relaxed);
         data.sum = std::bit_cast<double>(m_sum.value.load(std::memory_order_relaxed));
+        data.rejected = m_rejected.value.load(std::memory_order_relaxed);
         return data;
     }
 
@@ -563,15 +604,34 @@ public:
         }
         m_count.value.store(0, std::memory_order_relaxed);
         m_sum.value.store(0, std::memory_order_relaxed);
+        m_rejected.value.store(0, std::memory_order_relaxed); // "initial state" means ALL of it
     }
 
 private:
+    /// Enforce the boundary contract at construction. Static so it can run in the member
+    /// initializer list, before m_boundaries is built from its result.
+    static auto validated_boundaries(std::vector<double> boundaries) -> std::vector<double> {
+        double previous = -std::numeric_limits<double>::infinity();
+        for (const auto bound : boundaries) {
+            if (!std::isfinite(bound)) {
+                throw std::invalid_argument("histogram boundaries must be finite (no NaN or infinity)");
+            }
+            if (bound < 0.0) {
+                throw std::invalid_argument("histogram boundaries must be non-negative");
+            }
+            if (bound <= previous) {
+                throw std::invalid_argument("histogram boundaries must be strictly increasing");
+            }
+            previous = bound;
+        }
+        return boundaries;
+    }
+
     std::vector<double> m_boundaries;
     std::vector<aligned_atomic<uint64_t>> m_buckets;
     aligned_atomic<uint64_t> m_count{};
     aligned_atomic<uint64_t> m_sum{};      // Stored as bits of double
     aligned_atomic<uint64_t> m_rejected{}; // negative / NaN / infinite observations refused
-    bool m_power_of_2{false};
 };
 
 } // namespace composite::metrics

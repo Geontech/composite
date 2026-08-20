@@ -110,39 +110,33 @@ public:
         explicit auto_stop(component& owner) noexcept : m_owner(&owner) {}
         auto_stop(const auto_stop&) = delete;
         auto_stop& operator=(const auto_stop&) = delete;
-        ~auto_stop() { m_owner->stop_contained(); } // idempotent, and must not throw from a dtor
+        /// Stop the worker AND shut the admission gate for good, while every derived member is
+        /// still alive.
+        ///
+        /// Closing the gate here rather than in ~component is the whole point. ~component runs
+        /// AFTER the derived members are destroyed, so a permanent close there is too late: an
+        /// ordinary stop() re-opens admission on its way out (and, with no worker, returns without
+        /// draining writers at all), which left a property callback free to touch derived members
+        /// whose lifetimes had already ended while the base destructor sat waiting for it. This
+        /// object destructs FIRST, so the door is shut and the writers are drained before anything
+        /// they might touch goes away. ~component keeps the same call as an idempotent fallback for
+        /// components that do not use auto_stop.
+        ~auto_stop() { m_owner->shutdown_writers_contained(); } // must not throw from a dtor
     private:
         component* m_owner;
     };
 
     virtual ~component() override {
-        stop_contained(); // a throwing stop (park timeout / staged reaction) must not unwind here
-        // Now shut the door for good. stop()'s admission gate re-opens at the end of stop(), which
-        // is right for a component that survives it — but this is the last one, and a writer that
-        // evaluated its "external" test before the gate ever closed can wake after stop() returns
-        // and run against members being destroyed below. Heap components are usually saved by the
-        // REST layer's shared_ptr; the stack-allocated + auto_stop pattern this class documents
-        // and endorses is not.
-        // UNBOUNDED, with periodic diagnostics — deliberately not a timeout. Destruction has no
-        // fallback: giving up after N seconds and destroying members anyway hands a still-running
-        // on_apply / property_change_handler a use-after-free, which is strictly worse than the
-        // hang it was trying to avoid. The reachable case is a component with NO worker, where
-        // stop() returns without draining writers at all. Same contract as the worker join above:
-        // a user callback that never returns is a bug we report loudly, not one we outrun.
+        // Fallback for components WITHOUT auto_stop. Idempotent: when auto_stop is present it has
+        // already done this, with the derived members still alive — which is the only ordering
+        // that is actually safe. See auto_stop::~auto_stop().
+        shutdown_writers_contained();
+        // Metric deregistration and the log flush stay HERE, not in
+        // shutdown_writers_contained(): that helper also runs from auto_stop, while the derived
+        // members are still alive, and remove_by_label DESTROYS this component's metrics — a
+        // derived destructor body that touches one of its own counters afterwards would then be
+        // reading freed memory. They belong to destruction, not to writer shutdown.
         //
-        // This subsumes drain_park_reporting(): every in-flight writer is also a caller inside
-        // with_worker_parked(), and this additionally covers the ones the in-flight count cannot
-        // see (queued on the gate, or not yet at its mutex).
-        for (int elapsed = 0; !m_park.close_admission_permanently_for(k_stop_report_interval);
-             elapsed += static_cast<int>(k_stop_report_interval.count())) {
-            try {
-                logger()->warn("{}: a property write has been in flight {}s into destruction — a config "
-                               "on_apply or property_change_handler is not returning. Destroying now would "
-                               "free members it is still touching, so this waits.",
-                               m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
-            } catch (...) { // NOLINT(bugprone-empty-catch) — the log sink is what just failed
-            }
-        }
         // The two calls below are no more throw-free than the stop above, and this destructor is
         // implicitly noexcept, so an escape here is std::terminate rather than a bad teardown:
         // remove_by_label allocates and then runs third-party deregistration observers, and
@@ -1187,6 +1181,42 @@ protected:
     }
 
 private:
+    /// PRIVATE: destructor machinery, not an operation for consumers. It permanently closes
+    /// admission, so a component it has run on can never accept another property write — calling
+    /// it from outside would quietly render the component inert, and it is not something to
+    /// support for the rest of 0.5.x. auto_stop is a nested class and so can still reach it.
+    /// Stop the worker, then close admission permanently and drain every writer already inside.
+    /// noexcept: reached from two destructors.
+    auto shutdown_writers_contained() noexcept -> void {
+        stop_contained(); // a throwing stop (park timeout / staged reaction) must not unwind here
+        // Now shut the door for good. stop()'s admission gate re-opens at the end of stop(), which
+        // is right for a component that survives it — but this is the last one, and a writer that
+        // evaluated its "external" test before the gate ever closed can wake after stop() returns
+        // and run against members being destroyed below. Heap components are usually saved by the
+        // REST layer's shared_ptr; the stack-allocated + auto_stop pattern this class documents
+        // and endorses is not.
+        // UNBOUNDED, with periodic diagnostics — deliberately not a timeout. Destruction has no
+        // fallback: giving up after N seconds and destroying members anyway hands a still-running
+        // on_apply / property_change_handler a use-after-free, which is strictly worse than the
+        // hang it was trying to avoid. The reachable case is a component with NO worker, where
+        // stop() returns without draining writers at all. Same contract as the worker join above:
+        // a user callback that never returns is a bug we report loudly, not one we outrun.
+        //
+        // This subsumes drain_park_reporting(): every in-flight writer is also a caller inside
+        // with_worker_parked(), and this additionally covers the ones the in-flight count cannot
+        // see (queued on the gate, or not yet at its mutex).
+        for (int elapsed = 0; !m_park.close_admission_permanently_for(k_stop_report_interval);
+             elapsed += static_cast<int>(k_stop_report_interval.count())) {
+            try {
+                logger()->warn("{}: a property write has been in flight {}s into destruction — a config "
+                               "on_apply or property_change_handler is not returning. Destroying now would "
+                               "free members it is still touching, so this waits.",
+                               m_id, elapsed + static_cast<int>(k_stop_report_interval.count()));
+            } catch (...) { // NOLINT(bugprone-empty-catch) — the log sink is what just failed
+            }
+        }
+    }
+
     /**
      * @brief INTERNAL. Bounded request_stop() for the signalling pass of application::try_stop().
      *
@@ -1700,6 +1730,24 @@ private:
     /// formats log messages, which can throw while already unwinding — so neither may be the
     /// outermost frame.
     auto thread_entry(std::stop_token token) noexcept -> void {
+        // A TRIPWIRE ON THE DECLARATIONS, not a proof of containment. `noexcept` does not stop a
+        // body from calling something that throws — it turns an escape into a terminate — so what
+        // these assertions actually buy is that nobody can quietly drop the specifier and let
+        // finalization start unwinding again. The containment itself rests on run_stage_contained()
+        // routing every stage through the noexcept log_contained_failure().
+        //
+        // The behaviour is NOT covered by a test. The discriminating input is a failure of the
+        // logging INSIDE an exception handler, and injecting one needs either a data member (which
+        // would change this class's layout between the library's TUs and the tests') or a
+        // COMPOSITE_TESTING branch in an inline member (an ODR violation). Deterministic fault
+        // injection for the logger is the right long-term fix; this is a test-evidence gap.
+        static_assert(noexcept(finish_worker(finish_reason::none)),
+                      "finish_worker must not be able to abandon its remaining stages");
+        static_assert(noexcept(log_contained_failure("", "")),
+                      "the handler used by every finalization stage must not throw");
+        static_assert(noexcept(record_worker_fault("")), "recording an escaped fault must not throw");
+        static_assert(noexcept(emergency_note("", "")), "the last-ditch note must not throw");
+
         const completion_guard done{*this}; // outermost: signals even if everything below throws
         auto exit_reason = finish_reason::none;
         try {
@@ -1906,54 +1954,61 @@ private:
     /// the loop is not the outermost frame: everything here runs USER code (on_finished, send_eos,
     /// on_worker_stop), each piece contained individually, with thread_entry()'s catch as the net
     /// and completion_guard publishing m_worker_done regardless of what happens in here.
-    auto finish_worker(finish_reason exit_reason) -> void {
+    /// Run one finalization stage so that NOTHING escapes — including a failure of the logging in
+    /// the handler. That last part is the point: the handlers here used to call the ordinary
+    /// (formatting, therefore allocating) logger, so the very bad_alloc this containment exists for
+    /// would throw out of the catch block and abandon the REST of finalization. thread_entry()'s
+    /// catch then stopped the process from dying, but send_eos() and the resource reap never ran,
+    /// while completion was still published — so a wait_until_finished() waiter could observe a
+    /// "quiesced" component whose pipeline pool was still running. Every stage is independent.
+    template <typename Fn>
+    auto run_stage_contained(const char* stage, Fn&& fn) noexcept -> void {
+        try {
+            fn();
+        } catch (const std::exception& ex) {
+            log_contained_failure(stage, ex.what()); // itself noexcept
+        } catch (...) {
+            log_contained_failure(stage, "unknown exception");
+        }
+    }
+
+    auto finish_worker(finish_reason exit_reason) noexcept -> void {
         // If the loop self-terminated (FINISH / exception, not an external stop), record the reason
         // and fire on_finished() ON THIS worker thread before it exits.
         if (exit_reason != finish_reason::none) {
             m_finish_reason.store(exit_reason, std::memory_order_release);
-            try {
-                on_finished(exit_reason);
-            } catch (const std::exception& e) {
-                logger()->error("component '{}' on_finished() threw: {}", m_id, e.what());
-            } catch (...) {
-                logger()->error("component '{}' on_finished() threw an unknown exception", m_id);
-            }
+            run_stage_contained("on_finished() at completion", [this, exit_reason] { on_finished(exit_reason); });
         }
         // EOS propagation: orderly completion closes our outputs (AFTER on_finished, so a component
         // that flushes final data there gets it out before the close), so downstream consumers reach
         // at_end() and can finish in turn — the chain completes end to end. An ERROR exit does NOT
         // send EOS (it was not orderly; downstream should not treat it as a clean end-of-stream).
         if (exit_reason == finish_reason::completed) {
-            try {
-                send_eos();
-            } catch (const std::exception& e) {
-                logger()->error("component '{}' send_eos() at completion threw: {}", m_id, e.what());
-            } catch (...) {
-            }
+            run_stage_contained("send_eos() at completion", [this] { send_eos(); });
         }
         // Reap subclass worker resources on SELF-termination (FINISH / error). stop_locked() is NOT
         // in the call path of a self-finish, so without this a pipeline_component's pool would linger
         // (idle, but alive, holding N threads) until a later stop() / re-enable / destruction — a
         // real window now that pipeline_component self-completes on inputs_at_end(). Exchange-guarded
         // (see worker_resources_down) so a concurrent or subsequent stop_locked() cannot double-reap.
-        // Ordered BEFORE the finished signal so a wait_until_finished() waiter observes a fully
-        // quiesced component (pool joined). Safe from this (the main worker) thread: on_worker_stop()
-        // joins the POOL threads, never this one.
+        //
+        // MANDATORY: reached whatever the stages above did, and ordered BEFORE thread_entry()'s
+        // completion_guard publishes m_worker_done — so a wait_until_finished() waiter observes a
+        // genuinely quiesced component (pool joined), which is the guarantee this ordering exists
+        // to provide. Safe from this (the main worker) thread: on_worker_stop() joins the POOL
+        // threads, never this one.
         if (exit_reason != finish_reason::none) {
-            try {
-                worker_resources_down();
-            } catch (const std::exception& e) {
-                logger()->error("component '{}' on_worker_stop() at completion threw: {}", m_id, e.what());
-            } catch (...) {
-            }
+            run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
             // Flip the exported state gauge to "stopped" — a self-finished worker is no longer running,
             // and stop_locked() (the only OTHER writer) is NOT in this call path, so without this the
             // composite.component.state metric would report 1.0/"running" forever after a batch/source
             // graph completes, contradicting is_running(). Ordered after the reap so the gauge flips to
             // 0 only once the component is fully quiesced, mirroring stop_locked().
-            if (m_state) {
-                m_state->set(0.0);
-            }
+            run_stage_contained("state gauge update at completion", [this] {
+                if (m_state) {
+                    m_state->set(0.0);
+                }
+            });
         }
     }
 

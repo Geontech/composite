@@ -267,7 +267,8 @@ TEST_CASE("Histogram power-of-2 boundaries", "[metrics][histogram]") {
 // UpDownCounter — a decreasing counter is read downstream as a reset and fabricates a huge rate.
 // A single NaN is worse than wrong: NaN + x is NaN forever, so it would poison the sum permanently.
 TEST_CASE("Histogram rejects negative and non-finite observations", "[metrics][histogram]") {
-    histogram h{{1.0, 10.0, 100.0}};
+    const std::vector<double> bounds{1.0, 10.0, 100.0};
+    histogram h{bounds};
 
     h.record(5.0);
     const auto baseline = h.snapshot();
@@ -321,6 +322,18 @@ TEST_CASE("Histogram rejects negative and non-finite observations", "[metrics][h
         REQUIRE(h.rejected_observations() == 1);
     }
 
+    SECTION("rejections are visible in the snapshot and cleared by reset()") {
+        h.record(-1.0);
+        h.record(std::numeric_limits<double>::quiet_NaN());
+        REQUIRE(h.snapshot().rejected == 2); // carried in the snapshot, not just the accessor
+        REQUIRE(h.rejected_observations() == 2);
+        h.reset();
+        REQUIRE(h.rejected_observations() == 0); // "initial state" means ALL of it
+        REQUIRE(h.snapshot().rejected == 0);
+        REQUIRE(h.snapshot().count == 0);
+        REQUIRE(h.snapshot().sum == 0.0);
+    }
+
     SECTION("sum is monotonic across a mixed stream") {
         double previous = h.snapshot().sum;
         const std::vector<double> stream{
@@ -335,6 +348,48 @@ TEST_CASE("Histogram rejects negative and non-finite observations", "[metrics][h
         REQUIRE(h.rejected_observations() == 3);
         REQUIRE(h.snapshot().count == 5); // 5.0 + the four valid stream values
     }
+}
+
+// v0.5 freeze: boundaries must be finite, non-negative and strictly increasing. A NaN boundary is
+// the sharp case — std::lower_bound requires a partitioned range, so bucketing becomes undefined
+// rather than merely odd — while duplicates and out-of-order bounds produce exported `le` labels
+// implying an ordering the bucket counts do not honour.
+TEST_CASE("Histogram validates bucket boundaries", "[metrics][histogram]") {
+    // Boundaries passed as named vectors: a braced list inside REQUIRE_* splits on its commas and
+    // the macro sees three arguments.
+    const std::vector<double> ok{1.0, 5.0, 10.0};
+    const std::vector<double> zero_ok{0.0, 1.0};
+    const std::vector<double> empty_ok{};
+    REQUIRE_NOTHROW(histogram{ok});
+    REQUIRE_NOTHROW(histogram{zero_ok});  // zero is a legitimate boundary
+    REQUIRE_NOTHROW(histogram{empty_ok}); // no boundaries: one overflow bucket
+
+    const std::vector<double> negative{-1.0, 1.0};
+    const std::vector<double> nan_bound{1.0, std::numeric_limits<double>::quiet_NaN()};
+    const std::vector<double> inf_bound{1.0, std::numeric_limits<double>::infinity()};
+    const std::vector<double> duplicate{5.0, 5.0};
+    const std::vector<double> unsorted{10.0, 5.0};
+    REQUIRE_THROWS_AS(histogram{negative}, std::invalid_argument);
+    REQUIRE_THROWS_AS(histogram{nan_bound}, std::invalid_argument);
+    REQUIRE_THROWS_AS(histogram{inf_bound}, std::invalid_argument);
+    REQUIRE_THROWS_AS(histogram{duplicate}, std::invalid_argument);
+    REQUIRE_THROWS_AS(histogram{unsorted}, std::invalid_argument);
+}
+
+// The bounds are INCLUSIVE (`le`), matching Prometheus and the OTLP bridge. The constructor comment
+// used to claim exclusive bounds ([0,10)), which contradicted the lower_bound implementation; this
+// pins the actual, intended behaviour so the two cannot drift apart again.
+TEST_CASE("Histogram bucket bounds are inclusive", "[metrics][histogram]") {
+    const std::vector<double> bounds{10.0, 20.0};
+    histogram h{bounds};
+    h.record(10.0); // exactly ON the first boundary -> first bucket, not the second
+    h.record(20.0); // exactly ON the second boundary -> second bucket
+    h.record(20.5); // past the last boundary -> overflow
+    const auto snap = h.snapshot();
+    REQUIRE(snap.bucket_counts[0] == 1);
+    REQUIRE(snap.bucket_counts[1] == 1);
+    REQUIRE(snap.bucket_counts[2] == 1);
+    REQUIRE(snap.count == 3);
 }
 
 TEST_CASE("Histogram snapshot provides consistent data", "[metrics][histogram]") {

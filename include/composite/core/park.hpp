@@ -79,24 +79,49 @@ public:
         m_run_cv.notify_all();
     }
 
-    /// RAII: counts one caller currently inside with_worker_parked(), from before its first look
-    /// at any gate state until it returns (normally or by throwing).
+    /// RAII: counts this caller into the PRE-CLOSE COHORT — the callers that were already inside
+    /// with_worker_parked() when permanent closure happened, which are exactly the ones a
+    /// destructor must wait for.
+    ///
+    /// A cohort counter, NOT entry/exit totals. Totals were wrong, and subtly so: exits are
+    /// FUNGIBLE, so a caller arriving after the cut could supply the exit that satisfied it.
+    /// Concretely — cut at entered=100/exited=99 with writer A still running; writer B arrives
+    /// afterwards, is rejected, and pushes exited to 100; the destructor concludes "drained" and
+    /// frees the coordinator underneath A. Sequential consistency does not help, because the
+    /// defect is identity, not ordering: a total cannot express "these particular callers
+    /// finished". So each caller now removes ITSELF from the set being waited on.
     struct entry_guard {
         park_coordinator& c;
+        bool counted{false};
+
         explicit entry_guard(park_coordinator& coord) : c(coord) {
-            c.m_entered_total.fetch_add(1, std::memory_order_seq_cst);
+            // Already closed: this caller is a post-close arrival. It will be rejected at the gate,
+            // and it is deliberately NOT part of the cohort — waiting for arrivals that keep
+            // coming is what livelocks a destructor on a busy control plane.
+            if (c.m_closing.load(std::memory_order_seq_cst)) {
+                return;
+            }
+            c.m_pre_close_inside.fetch_add(1, std::memory_order_seq_cst);
+            // Re-check: closure may have happened between the two. This is a Dekker pairing and
+            // needs seq_cst on BOTH sides — the caller increments then reads the flag, the closer
+            // stores the flag then reads the count. In the single total order S at least one of
+            // them observes the other, so no caller can slip through uncounted while the closer
+            // simultaneously concludes the cohort is empty.
+            if (c.m_closing.load(std::memory_order_seq_cst)) {
+                c.m_pre_close_inside.fetch_sub(1, std::memory_order_release);
+                return; // withdraw: also a post-close arrival
+            }
+            counted = true;
         }
         entry_guard(const entry_guard&) = delete;
         auto operator=(const entry_guard&) -> entry_guard& = delete;
         entry_guard(entry_guard&&) = delete;
         auto operator=(entry_guard&&) -> entry_guard& = delete;
         ~entry_guard() {
-            c.m_exited_total.fetch_add(1, std::memory_order_seq_cst);
-            // Only pay a mutex acquisition when a teardown is actually waiting. On the ordinary
-            // property-write path this is a single relaxed-ish load and nothing else.
-            if (c.m_permanent_pending.load(std::memory_order_acquire)) {
-                const std::lock_guard lk{c.m_admit_mtx};
-                c.m_admit_cv.notify_all();
+            if (counted) {
+                // RELEASE, so a destructor that observes the cohort empty also observes everything
+                // every member of it did.
+                c.m_pre_close_inside.fetch_sub(1, std::memory_order_release);
             }
         }
     };
@@ -491,7 +516,9 @@ public:
         std::unique_lock lk{m_admit_mtx};
         if (!m_admission_permanent) { // idempotent: never double-count the depth
             m_admission_permanent = true;
-            m_permanent_pending.store(true, std::memory_order_release);
+            // SEQ_CST, pairing with the entry guard's re-check. Published BEFORE the cohort wait
+            // below, so a caller that is not yet counted must observe it and withdraw.
+            m_closing.store(true, std::memory_order_seq_cst);
             ++m_admission_depth;
             m_admission_owner.store(std::this_thread::get_id(), std::memory_order_release);
             m_admission_closed.store(true, std::memory_order_release);
@@ -501,19 +528,38 @@ public:
         // sitting on the CV for the rest of the park timeout.
         m_admit_cv.notify_all();
 
-        // TICKETS, not a live count. Waiting for "callers inside == 0" cannot converge while
-        // writers keep arriving: each new one enters, is rejected, and leaves, so the count
-        // oscillates and a busy control plane livelocks the destructor forever. What has to be
-        // drained is precisely the callers that were ALREADY inside when the door shut.
+        // Wait for the PRE-CLOSE COHORT to empty. m_closing was published above, so from here on
+        // every arriving caller withdraws itself from this counter — which is what makes the wait
+        // converge even while a busy control plane keeps issuing property writes. Callers that
+        // arrived BEFORE the close stay counted until they actually return, so this cannot be
+        // satisfied by somebody else's exit.
         //
-        // Both counters are monotonic, so snapshotting entries here and waiting for exits to catch
-        // up drains exactly that set. Callers arriving afterwards push m_entered_total past the
-        // target and are deliberately NOT waited for — a call that starts after destruction has
-        // begun is the caller's lifetime problem (hold the component alive), and no amount of
-        // counting inside the object being destroyed can fix it.
-        const auto target = m_entered_total.load(std::memory_order_seq_cst);
-        return m_admit_cv.wait_for(lk, timeout,
-                                   [this, target] { return m_exited_total.load(std::memory_order_seq_cst) >= target; });
+        // A call that STARTS after destruction has begun is still the caller's lifetime problem
+        // (hold the component alive); nothing inside an object being destroyed can fix that.
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        // SEQ_CST, not acquire. This load is one half of the Dekker pairing with the entry guard,
+        // and a Dekker argument only holds if BOTH sides participate in the single total order S.
+        // With an acquire load this execution stayed legal on a weak memory model: the writer sees
+        // m_closing false, does its seq_cst increment, the closer does its seq_cst store to
+        // m_closing, the closer's acquire load still reads the stale zero and returns, and the
+        // writer's second m_closing load — ordered before the store — also reads false. Both sides
+        // conclude the other is absent, and the coordinator is freed under a live writer.
+        // x86 would almost never show it; this is what the arm64 job exists for.
+        while (m_pre_close_inside.load(std::memory_order_seq_cst) != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            // min(1ms, remaining): a generic duration API should not overshoot a budget smaller
+            // than its own poll interval. Destruction uses multi-second intervals, so this only
+            // matters to a caller passing a sub-millisecond timeout — but that caller is entitled
+            // to have it honoured.
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            const auto slice = remaining < std::chrono::nanoseconds{std::chrono::milliseconds{1}}
+                                   ? remaining
+                                   : std::chrono::nanoseconds{std::chrono::milliseconds{1}};
+            m_admit_cv.wait_for(lk, slice);
+        }
+        return true;
     }
 
     /// Re-open admission and release anyone queued behind it.
@@ -635,12 +681,13 @@ private:
     std::mutex m_admit_mtx;                           ///< guards the admission flag + its CV
     std::condition_variable m_admit_cv;               ///< released by open_admission()
     bool m_admission_permanent{false};                ///< set by close_admission_permanently()
-    std::atomic<bool> m_permanent_pending{false};     ///< a teardown is waiting on the counters below
-    /// Monotonic entry/exit tickets for with_worker_parked(), stamped from the very top of the
-    /// function — so they also cover a caller that has not reached the gate mutex yet, which
-    /// neither the in-flight count nor a CV-waiter count can see.
-    std::atomic<std::uint64_t> m_entered_total{0};
-    std::atomic<std::uint64_t> m_exited_total{0};
+    /// Permanent closure is in effect. Read at the top of with_worker_parked() so an arriving
+    /// caller can exclude itself from the cohort below.
+    std::atomic<bool> m_closing{false};
+    /// Callers inside with_worker_parked() that entered BEFORE permanent closure. Counted from the
+    /// very top of the function, so it also covers a caller that has not reached the gate mutex
+    /// yet — invisible to both the in-flight count and any CV-waiter count.
+    std::atomic<int> m_pre_close_inside{0};
 
     struct in_flight_guard {
         /// Tag: the caller has ALREADY incremented the in-flight count (it had to, to make the

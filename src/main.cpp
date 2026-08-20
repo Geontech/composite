@@ -32,17 +32,17 @@
 #include <set>
 #include <spdlog/spdlog.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
 namespace composite {
 
+auto make_server(application&) -> std::unique_ptr<httplib::Server>;
 #ifdef COMPOSITE_USE_OPENSSL
 auto make_server(application&, const std::string&, const std::string&, const std::string&)
     -> std::unique_ptr<httplib::Server>;
-#else
-auto make_server(application&) -> std::unique_ptr<httplib::Server>;
 #endif
 
 } // namespace composite
@@ -51,16 +51,63 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // Argument Parsing
     // ========================================
+    // --features BEFORE the parser runs. `config-file` is a required positional, so a normal
+    // parse of `composite-cli --features` fails for want of an argument the caller has no reason
+    // to supply — the same reason --version gets special handling.
+    //
+    // This exists so a container can PROVE what it shipped. `--version` says nothing about
+    // optional features, so an image advertising OTLP or DPDK support could have them compiled
+    // out and still pass every smoke test — which is exactly what happened to the 0.5.0-rc.1
+    // images. One feature per line, stable names, so a test can assert exact membership.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view{argv[i]} == "--features") {
+#ifdef COMPOSITE_USE_OPENTELEMETRY
+            std::cout << "opentelemetry\n";
+#endif
+#ifdef COMPOSITE_USE_DPDK
+            std::cout << "dpdk\n";
+#endif
+#ifdef COMPOSITE_USE_OPENSSL
+            std::cout << "openssl\n";
+#endif
+            std::cout.flush();
+            return EXIT_SUCCESS;
+        }
+    }
+
     auto program = argparse::ArgumentParser{"composite-cli", COMPOSITE_VERSION};
+    program.add_argument("--features")
+        .help("list optional features compiled into this binary, one per line, and exit")
+        .flag();
     program.add_argument("config-file").help("application configuration file");
     program.add_argument("-s", "--server").help("REST server address").default_value(std::string{"localhost"});
     program.add_argument("-p", "--port").help("REST server port").scan<'i', int>().default_value(5000);
 #ifdef COMPOSITE_USE_OPENSSL
-    program.add_argument("-a", "--certificate-authority")
-        .help("Path to a cert file for the certificate authority")
+    // The CA that verifies CLIENT certificates — i.e. this switch is what turns on mutual TLS.
+    // Omitting it gives ordinary server-authenticated TLS.
+    program.add_argument("-a", "--client-ca")
+        .help("Path to a CA file used to verify CLIENT certificates (enables mutual TLS)")
         .default_value(std::string{});
-    program.add_argument("-c", "--client-certificate").help("Path to a client certificate file for TLS").required();
-    program.add_argument("-k", "--client-key").help("Path to a client key file for TLS").required();
+    // NAMED FOR WHAT THEY ARE. These are the SERVER's own certificate and private key — the
+    // identity this process presents to clients — not a client identity. The old
+    // --client-certificate / --client-key spelling described them backwards, which is a genuinely
+    // dangerous kind of wrong for a TLS flag: the previous README example fed the same file in as
+    // both server identity and client trust root.
+    //
+    // The old long names are REMOVED, not aliased. This is a 0.x line, and an alias that keeps a
+    // misleading name alive is how the misunderstanding it encodes outlives the fix. The short
+    // forms -c/-k/-a are unchanged, so the common invocation is unaffected.
+    //
+    // OPTIONAL, AS A PAIR. These were `.required()`, which meant a TLS-capable build could not
+    // serve plain HTTP at all: compiling the capability in silently made it compulsory, breaking
+    // the documented invocation and any deployment without certificates. Supply both for TLS,
+    // neither for HTTP; supplying one is a configuration error, diagnosed below.
+    program.add_argument("-c", "--server-certificate")
+        .help("Path to this server's TLS certificate (with --server-key; omit both for plain HTTP)")
+        .default_value(std::string{});
+    program.add_argument("-k", "--server-key")
+        .help("Path to this server's TLS private key (with --server-certificate; omit both for plain HTTP)")
+        .default_value(std::string{});
 #endif
     program.add_argument("-l", "--log-level")
         .help("log level [trace, debug, info, warning, error, critical, off]")
@@ -204,19 +251,32 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // TLS Certificate Validation
     // ========================================
-    auto ca_path = program.get<std::string>("--certificate-authority");
-    auto cert_path = program.get<std::string>("--client-certificate");
-    auto key_path = program.get<std::string>("--client-key");
-    if (!std::filesystem::exists(cert_path)) {
-        spdlog::error("client certificate file not found at {}", cert_path);
+    auto ca_path = program.get<std::string>("--client-ca");
+    auto cert_path = program.get<std::string>("--server-certificate");
+    auto key_path = program.get<std::string>("--server-key");
+    // A certificate without a key (or vice versa) is a mistake, not a request for plain HTTP —
+    // silently downgrading to unencrypted would be the worst possible reading of it.
+    if (cert_path.empty() != key_path.empty()) {
+        spdlog::error("--server-certificate and --server-key must be supplied together (or neither, "
+                      "for plain HTTP)");
         return EXIT_FAILURE;
     }
-    if (!std::filesystem::exists(key_path)) {
-        spdlog::error("client key file not found at {}", key_path);
-        return EXIT_FAILURE;
-    }
-    if (!ca_path.empty() && !std::filesystem::exists(ca_path)) {
-        spdlog::error("certificate authority file not found at {}", ca_path);
+    const bool use_tls = !cert_path.empty();
+    if (use_tls) {
+        if (!std::filesystem::exists(cert_path)) {
+            spdlog::error("server certificate file not found at {}", cert_path);
+            return EXIT_FAILURE;
+        }
+        if (!std::filesystem::exists(key_path)) {
+            spdlog::error("server key file not found at {}", key_path);
+            return EXIT_FAILURE;
+        }
+        if (!ca_path.empty() && !std::filesystem::exists(ca_path)) {
+            spdlog::error("client CA file not found at {}", ca_path);
+            return EXIT_FAILURE;
+        }
+    } else if (!ca_path.empty()) {
+        spdlog::error("--client-ca requires --server-certificate and --server-key");
         return EXIT_FAILURE;
     }
 #endif
@@ -599,7 +659,8 @@ auto main(int argc, char** argv) -> int {
     auto server_addr = program.get<std::string>("--server");
     auto server_port = program.get<int>("--port");
 #ifdef COMPOSITE_USE_OPENSSL
-    auto server = composite::make_server(app, cert_path, key_path, ca_path);
+    auto server = use_tls ? composite::make_server(app, cert_path, key_path, ca_path) : composite::make_server(app);
+    spdlog::info("REST server transport: {}", use_tls ? "HTTPS (TLS)" : "HTTP");
 #else
     auto server = composite::make_server(app);
 #endif

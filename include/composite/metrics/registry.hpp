@@ -51,6 +51,7 @@ struct histogram_snapshot {
     std::vector<uint64_t> bucket_counts;
     uint64_t count;
     double sum;
+    uint64_t rejected; ///< observations refused as negative/NaN/infinite; see histogram::record()
 };
 
 /**
@@ -681,7 +682,7 @@ public:
      * @param name Metric name
      * @param description Human-readable description
      * @param unit Unit of measurement
-     * @param boundaries Bucket boundaries (or use histogram::power_of_2())
+     * @param boundaries Bucket boundaries (or use histogram::power_of_2_boundaries())
      * @param labels Dimensional labels
      * @return Reference to the created histogram
      * @throws duplicate_metric_error if a histogram with same name+labels exists
@@ -756,7 +757,11 @@ public:
     }
 
     /**
-     * @brief Create a histogram with power-of-2 boundaries for O(1) lookup
+     * @brief Create a histogram with power-of-2 bucket boundaries
+     *
+     * A convenient boundary SHAPE for latency/size distributions. Lookup is O(log n) like every
+     * other histogram — the opt-in O(1) fast path this once advertised was removed for disagreeing
+     * with the binary search about which bucket a value belongs to.
      *
      * @param name Metric name
      * @param description Human-readable description
@@ -1344,14 +1349,18 @@ public:
                 {meta.name, meta.description, meta.unit, meta.type, meta.labels, m_gauges[i]->value(), now});
         }
 
-        // Histograms - use atomic snapshot for consistency
+        // Histograms - one snapshot() call per histogram rather than the individual accessors
         for (std::size_t i = 0; i < m_histograms.size(); ++i) {
             const auto& meta = m_histogram_metadata[i];
             const auto& h = *m_histograms[i];
-            auto data = h.snapshot(); // Atomic snapshot of bucket_counts, count, sum
+            // Reads bucket_counts, count, sum and rejected in one call. NOT atomic across those
+            // fields while writers are active — see histogram_data for the contract — but it keeps
+            // this loop from interleaving its own work between them.
+            auto data = h.snapshot();
             snapshots.push_back(
                 {meta.name, meta.description, meta.unit, meta.type, meta.labels,
-                 histogram_snapshot{h.boundaries(), std::move(data.bucket_counts), data.count, data.sum}, now});
+                 histogram_snapshot{h.boundaries(), std::move(data.bucket_counts), data.count, data.sum, data.rejected},
+                 now});
         }
 
         return snapshots;
@@ -1655,8 +1664,10 @@ private:
                                     std::size_t num_buckets, labels_t labels) -> histogram& {
         check_metric_limit();
         auto boundaries = histogram::power_of_2_boundaries(num_buckets);
+        // Power-of-two boundaries are a convenient SHAPE for a latency histogram; they do not
+        // select a different lookup. The opt-in fast path that once did was removed for disagreeing
+        // with the binary search on bucket edges, and its switch is gone as of 0.5.
         m_histograms.push_back(std::make_unique<histogram>(std::move(boundaries)));
-        m_histograms.back()->enable_power_of_2_lookup();
         metric_metadata meta{std::move(name), std::move(description), std::move(unit), metric_type::histogram,
                              std::move(labels)};
         auto* ptr = m_histograms.back().get();

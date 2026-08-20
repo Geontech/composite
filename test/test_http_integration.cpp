@@ -9,14 +9,23 @@
 
 #include "composite/core/application.hpp"
 #include "composite/core/component.hpp"
+#include "composite/metrics/registry.hpp"
 #include "helpers.hpp" // make_server consumes the production helpers
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#ifdef COMPOSITE_USE_OPENSSL
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#endif
 #include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -31,7 +40,11 @@ using json = composite::properties::json;
 // make_server is defined in server.cpp (compiled into this test target).
 namespace composite {
 auto make_server(application&) -> std::unique_ptr<httplib::Server>;
-}
+#ifdef COMPOSITE_USE_OPENSSL
+auto make_server(application&, const std::string&, const std::string&, const std::string&)
+    -> std::unique_ptr<httplib::Server>;
+#endif
+} // namespace composite
 
 namespace {
 enum class Win { hann, hamming };
@@ -274,6 +287,43 @@ TEST_CASE_METHOD(rest_fixture, "DELETE resets a property to default", "[http]") 
 // component's properties, incl. the `enabled` virtual. This is the published wire contract:
 // a generic validator or form generator must be able to consume it without composite-specific
 // knowledge, so the structural keywords are standard and composite metadata is x-prefixed.
+// `rejected` is public REST output as of v0.5, so its serialization is pinned here rather than only
+// at the native-snapshot layer: it travels histogram::snapshot() -> histogram_snapshot ->
+// metric_snapshot_to_json, and a break anywhere along that path is invisible to the metrics tests.
+TEST_CASE_METHOD(rest_fixture, "GET metrics exposes histogram rejected observations", "[http]") {
+    auto& reg = composite::metrics::registry::instance();
+    const std::vector<double> bounds{1.0, 10.0};
+    auto& hist =
+        reg.get_or_create_histogram("http.hist", "test histogram", "ms", bounds, {{"component_id", "resttest"}});
+    hist.record(5.0);                                      // valid
+    hist.record(-1.0);                                     // rejected: negative
+    hist.record(std::numeric_limits<double>::quiet_NaN()); // rejected: NaN
+
+    auto cli = client();
+    auto r = cli.Get("/app/metrics");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    const auto body = json::parse(r->body);
+    REQUIRE(body.contains("metrics"));
+
+    bool found = false;
+    for (const auto& m : body.at("metrics")) {
+        if (m.value("name", std::string{}) != "http.hist") {
+            continue;
+        }
+        found = true;
+        const auto& value = m.at("value");
+        REQUIRE(value.contains("rejected"));
+        CHECK(value.at("rejected").get<std::uint64_t>() == 2);
+        CHECK(value.at("count").get<std::uint64_t>() == 1); // only the valid observation counted
+        CHECK(value.at("sum").get<double>() == 5.0);        // and the NaN did not poison the sum
+        REQUIRE(value.contains("bucket_counts"));
+        REQUIRE(value.contains("boundaries"));
+    }
+    REQUIRE(found);
+    reg.remove_histogram("http.hist", {{"component_id", "resttest"}});
+}
+
 TEST_CASE_METHOD(rest_fixture, "GET component schema is a JSON Schema 2020-12 document", "[http]") {
     auto cli = client();
     auto r = cli.Get("/app/components/c1/schema");
@@ -717,3 +767,129 @@ TEST_CASE_METHOD(rest_fixture, "SSE metric stream cap -> 503, then frees", "[htt
     }
     REQUIRE(admitted_again);
 }
+
+#ifdef COMPOSITE_USE_OPENSSL
+// ---------------------------------------------------------------------------
+// TLS modes. Both are pinned because the difference between them is a SINGLE
+// nullptr: cpp-httplib treats any non-null client-CA path as a demand for client
+// certificates, and `std::string{}.c_str()` is non-null. Passing an empty CA
+// string therefore produced a server that completed startup, loaded no trust
+// roots, and then rejected every client — TLS that listens but cannot be used.
+// Only a real handshake distinguishes that from a working server, so these tests
+// do real handshakes against self-signed material generated in-process.
+// ---------------------------------------------------------------------------
+namespace tlsfix {
+
+struct key_pair {
+    std::string cert_path;
+    std::string key_path;
+};
+
+/// Self-signed certificate for "localhost", written to two temp files.
+inline auto make_self_signed(const std::string& stem) -> key_pair {
+    auto* pkey = EVP_RSA_gen(2048);
+    REQUIRE(pkey != nullptr);
+    auto* x509 = X509_new();
+    REQUIRE(x509 != nullptr);
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 60L * 60L);
+    X509_set_pubkey(x509, pkey);
+    auto* name = X509_get_subject_name(x509);
+    const auto* cn = reinterpret_cast<const unsigned char*>("localhost");
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, cn, -1, -1, 0);
+    X509_set_issuer_name(x509, name); // self-signed
+    REQUIRE(X509_sign(x509, pkey, EVP_sha256()) > 0);
+
+    const auto dir = std::filesystem::temp_directory_path();
+    key_pair out{(dir / (stem + ".crt")).string(), (dir / (stem + ".key")).string()};
+    auto* cert_fp = std::fopen(out.cert_path.c_str(), "wb");
+    REQUIRE(cert_fp != nullptr);
+    PEM_write_X509(cert_fp, x509);
+    std::fclose(cert_fp);
+    auto* key_fp = std::fopen(out.key_path.c_str(), "wb");
+    REQUIRE(key_fp != nullptr);
+    PEM_write_PrivateKey(key_fp, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+    std::fclose(key_fp);
+
+    X509_free(x509);
+    EVP_PKEY_free(pkey);
+    return out;
+}
+
+/// Run a TLS server on an ephemeral port for the duration of @p body.
+template <typename Body>
+void with_tls_server(const std::string& cert, const std::string& key, const std::string& ca, Body&& body) {
+    composite::application app{"tls_app"};
+    auto server = composite::make_server(app, cert, key, ca);
+    const auto port = server->bind_to_any_port("localhost");
+    REQUIRE(port > 0);
+    std::thread thread{[&] { server->listen_after_bind(); }};
+    // RAII stop-and-join. A failed REQUIRE inside `body` throws, and unwinding past a joinable
+    // std::thread is std::terminate — so a genuine assertion failure would have surfaced as an
+    // abort with no diagnosis instead of a readable test failure. Also covers the REQUIRE below.
+    struct joiner {
+        httplib::Server& srv;
+        std::thread& t;
+        ~joiner() {
+            srv.stop();
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } guard{*server, thread};
+    for (int i = 0; i < 400 && !server->is_running(); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE(server->is_running());
+    body(port);
+}
+
+} // namespace tlsfix
+
+TEST_CASE("TLS: server-only mode needs no client certificate", "[http][tls]") {
+    const auto srv = tlsfix::make_self_signed("composite_tls_server");
+    // Empty CA == "do not require client certificates".
+    tlsfix::with_tls_server(srv.cert_path, srv.key_path, "", [](int port) {
+        httplib::SSLClient cli{"localhost", port};
+        cli.enable_server_certificate_verification(false); // self-signed
+        cli.set_connection_timeout(5, 0);
+        auto r = cli.Get("/app/healthz");
+        // THE ASSERTION: a plain client, with no certificate of its own, must be served. With the
+        // empty CA forwarded as a non-null pointer this fails at the handshake.
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+    });
+    std::filesystem::remove(srv.cert_path);
+    std::filesystem::remove(srv.key_path);
+}
+
+TEST_CASE("TLS: supplying a client CA makes client certificates mandatory", "[http][tls]") {
+    const auto srv = tlsfix::make_self_signed("composite_tls_server2");
+    const auto cli_id = tlsfix::make_self_signed("composite_tls_client");
+    // The client's own self-signed cert doubles as the CA that authenticates it.
+    tlsfix::with_tls_server(srv.cert_path, srv.key_path, cli_id.cert_path, [&](int port) {
+        {
+            httplib::SSLClient anon{"localhost", port};
+            anon.enable_server_certificate_verification(false);
+            anon.set_connection_timeout(5, 0);
+            auto r = anon.Get("/app/healthz");
+            // No client certificate: must NOT be served. This is what distinguishes mutual TLS
+            // from server-only mode, and therefore what makes the nullptr distinction observable.
+            const bool rejected = !r || r->status != 200;
+            REQUIRE(rejected);
+        }
+        {
+            httplib::SSLClient authed{"localhost", port, cli_id.cert_path, cli_id.key_path};
+            authed.enable_server_certificate_verification(false);
+            authed.set_connection_timeout(5, 0);
+            auto r = authed.Get("/app/healthz");
+            REQUIRE(r);
+            REQUIRE(r->status == 200);
+        }
+    });
+    for (const auto& p : {srv.cert_path, srv.key_path, cli_id.cert_path, cli_id.key_path}) {
+        std::filesystem::remove(p);
+    }
+}
+#endif // COMPOSITE_USE_OPENSSL

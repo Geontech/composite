@@ -9,8 +9,10 @@ int main() {
     // Equivalence: a pow2-flagged hist and a plain hist with the same boundaries
     // must put every value in the SAME bucket (the old fast path failed for 1.5).
     histogram a{bounds};
+    // Both histograms take the ONE bucketing rule — the property this case exists to pin. There
+    // used to be an opt-in power-of-2 fast path here; it disagreed with the binary search about
+    // which bucket 1.5 belongs to, so it was removed and its switch deleted in 0.5.
     histogram b{bounds};
-    b.enable_power_of_2_lookup();
     for (double v : {0.5, 1.0, 1.5, 2.0, 3.0, 7.9, 8.0, 100.0, 1000.0}) {
         a.record(v);
         b.record(v);
