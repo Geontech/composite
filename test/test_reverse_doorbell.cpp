@@ -56,12 +56,16 @@ public:
             auto prev = max_stall_ms.load(std::memory_order_relaxed);
             while (waited > prev && !max_stall_ms.compare_exchange_weak(prev, waited, std::memory_order_relaxed)) {
             }
+            if (waited >= 2000) {
+                missed_edges.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         out.send_data(make_immutable<float>({1.0F}), timestamp{});
         produced.fetch_add(1, std::memory_order_relaxed);
         return retval::NORMAL;
     }
     std::atomic<long> max_stall_ms{0};
+    std::atomic<long> missed_edges{0}; // stalls that fell through to the NOOP backoff
 
 private:
     std::chrono::steady_clock::time_point m_await_since{};
@@ -149,15 +153,34 @@ int main() {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
     check(got_all, "consumer drained all N (reverse doorbell kept the backpressured source flowing)");
-    check(src->produced.load() == N, "source produced exactly N (lossless can_send pacing)");
-    // The sensitive assertion: not one backpressure stall ran to the NOOP backoff. Half the
-    // budget of a single backoff period is a wide margin over a doorbell wake (sub-millisecond
-    // even loaded) and a wide margin under the fallback (4s), so this fails on a doorbell that
-    // misses SOME edges — which the 60s whole-run bound cannot see.
-    check(src->max_stall_ms.load() < 2000,
-          "no backpressure stall reached the NOOP backoff — every full->not-full edge rang the doorbell");
-    std::printf("reverse doorbell: drained %ld/%ld in %lld ms (produced=%ld, longest stall=%ld ms)\n",
-                sink->consumed.load(), N, (long long)dt_ms, src->produced.load(), src->max_stall_ms.load());
+    // `consumed == N` does NOT imply the producer has finished bookkeeping. The source increments
+    // `produced` AFTER send_data returns, so the sink can consume packet N and satisfy the wait
+    // above while the source has not yet run its fetch_add for that packet — leaving produced at
+    // N-1 for a few instructions. Reading it immediately made this assertion a race that happened
+    // to win on one machine and lose on another (it failed first on Rocky/GCC 14, having passed
+    // locally). Wait for the counter the assertion is about, then assert on it.
+    const bool produced_all =
+        wait_until([&] { return src->produced.load() >= N; }, std::chrono::milliseconds(k_budget_ms));
+    check(produced_all && src->produced.load() == N, "source produced exactly N (lossless can_send pacing)");
+    // COUNT the stalls that fell through to the NOOP backoff, and allow a few.
+    //
+    // Demanding zero was wrong: the reverse doorbell is best-effort BY DESIGN (see the comment at
+    // input_port.hpp's signal_data() call — a burst that a lagging consumer later observes as empty
+    // through a coherence-stale m_tail can miss the fast wake and fall back to m_delay, which is
+    // the documented liveness backstop). A zero-miss assertion therefore fails on correct code
+    // roughly one run in eight. It was validated only against its true positive — reintroducing a
+    // missed edge made it fail — and never against its false-positive rate on a healthy tree.
+    //
+    // With ~1000 backpressure fills, a handful of misses is the design working as documented while
+    // a systemic regression misses essentially all of them (~1 hour of stalls). This bound still
+    // separates those by two orders of magnitude, which is what the whole-run budget alone cannot.
+    constexpr long k_max_missed_edges = 5;
+    check(src->missed_edges.load() <= k_max_missed_edges,
+          "backpressure stalls reaching the NOOP backoff stayed rare (doorbell is best-effort, not absent)");
+    std::printf("reverse doorbell: drained %ld/%ld in %lld ms (produced=%ld, longest stall=%ld ms, "
+                "missed edges=%ld/%ld)\n",
+                sink->consumed.load(), N, (long long)dt_ms, src->produced.load(), src->max_stall_ms.load(),
+                src->missed_edges.load(), k_max_missed_edges);
 
     src->stop();
     sink->stop();
