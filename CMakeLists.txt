@@ -94,7 +94,20 @@ endif()
 # OpenTelemetry support
 option(COMPOSITE_USE_OPENTELEMETRY "Compile with OpenTelemetry support" OFF)
 if(COMPOSITE_USE_OPENTELEMETRY)
+    # A version argument on find_package() would be a PIN here, not a floor: opentelemetry-cpp's
+    # package config declares same-minor compatibility, so `find_package(opentelemetry-cpp 1.19)`
+    # actively REJECTS 1.22. Compare the version ourselves to get the floor we actually want.
     find_package(opentelemetry-cpp REQUIRED)
+    # 1.19 is the oldest release this compiles against — see the nostd::shared_ptr note in
+    # telemetry_manager.cpp. CI and the published images both use the single revision pinned in
+    # docker/Dockerfile.rocky9, so there is no longer a tested-vs-shipped split; this floor exists
+    # for anyone building against a distro package, and fails at configure rather than at a call
+    # site that happens to touch a newer API.
+    if(opentelemetry-cpp_VERSION VERSION_LESS 1.19)
+        message(FATAL_ERROR
+                "opentelemetry-cpp ${opentelemetry-cpp_VERSION} is too old; 1.19 or newer required "
+                "(CI and the published images use the revision pinned in docker/Dockerfile.rocky9)")
+    endif()
     message(STATUS "Found OpenTelemetry: ${opentelemetry-cpp_VERSION}")
 endif()
 

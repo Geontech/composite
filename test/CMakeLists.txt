@@ -13,6 +13,19 @@ FetchContent_MakeAvailable(Catch2)
 # Test-only API access (e.g., metrics::registry::clear)
 add_compile_definitions(COMPOSITE_TESTING)
 
+# KEEP assert() LIVE IN EVERY BUILD TYPE. 12 of these test files carry 123 assert() calls, and
+# CMake's Release/RelWithDebInfo flags define NDEBUG -- so in any job that does not explicitly ask
+# for Debug, all of them compiled to nothing and the tests ran without checking anything.
+# build:options-matrix and both sanitizer jobs configure without CMAKE_BUILD_TYPE, which defaults
+# to RelWithDebInfo: those runs were catching crashes and sanitizer reports (their main purpose)
+# while validating no behaviour at all.
+#
+# -UNDEBUG is applied after CMAKE_CXX_FLAGS_<CONFIG>, so it wins. It also makes the
+# unused-but-set-variable warnings honest: a `bool threw` that only feeds an assert() genuinely IS
+# unused once the assert is gone, which is how this surfaced -- as -Werror failures the first time
+# the tree was built in the environment it ships in.
+add_compile_options(-UNDEBUG)
+
 ##############################
 # Standalone tests (own main(), no Catch2)
 ##############################

@@ -483,7 +483,6 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         auto provider = sdk_metrics::MeterProviderFactory::Create(std::make_unique<sdk_metrics::ViewRegistry>(), res);
 
         auto* sdk_provider = static_cast<sdk_metrics::MeterProvider*>(provider.get());
-        sdk_provider->AddMetricReader(std::move(reader));
 
         // Set as global provider (convert unique_ptr to nostd::shared_ptr)
         opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> shared_provider(provider.release());
@@ -493,6 +492,18 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         // Get meter for our instrumentation
         m_impl->meter = otel_metrics::Provider::GetMeterProvider()->GetMeter(
             "composite", m_impl->config.service_version.empty() ? "0.0.0" : m_impl->config.service_version);
+
+        // READER LAST. AddMetricReader starts the periodic export thread, and that thread walks the
+        // provider's meters — so attaching it before GetMeter() means the collector is running
+        // against a provider whose meter is still being constructed. TSan reported exactly that
+        // race (Meter::Meter on this thread vs ObservableRegistry::Observe on the export thread)
+        // once the export interval was short enough for a collect to land during start-up.
+        //
+        // Same shape as the shutdown ordering: do not start the thing that reads until the thing it
+        // reads exists, and do not retire the thing that protects a pointer until nothing can
+        // dereference it. `sdk_provider` stays valid — shared_provider owns it and is held in
+        // m_impl->provider.
+        sdk_provider->AddMetricReader(std::move(reader));
 
         // Register as an observer on the native metrics registry
         // This callback is invoked for existing metrics and any future metrics
@@ -548,6 +559,29 @@ auto manager::initialize(const telemetry::config& cfg) -> bool {
         {
             const auto inst_lock = std::lock_guard{m_impl->instrument_mutex};
             m_impl->instruments.clear();
+        }
+        // UNDO THE PUBLICATION, not just our own handles. SetMeterProvider() has already installed
+        // this provider globally by the time the reader is attached and the observers registered, so
+        // dropping only m_impl's pointers left the GLOBAL provider owning a half-initialized SDK —
+        // and, if AddMetricReader() succeeded before something later threw, owning a live periodic
+        // export thread that keeps collecting for the rest of the process. is_initialized() would
+        // report false while that thread ran on, and shutdown() early-returns on exactly that flag,
+        // so nothing would ever have torn it down.
+        //
+        // Order matters: swap the global back to a noop FIRST so nothing new resolves to the
+        // failed provider, then shut the SDK provider down (which joins its reader threads), then
+        // release our reference.
+        try {
+            opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider> noop_provider(
+                new otel_metrics::NoopMeterProvider());
+            otel_metrics::Provider::SetMeterProvider(noop_provider);
+            if (m_impl->provider) {
+                static_cast<sdk_metrics::MeterProvider*>(m_impl->provider.get())->Shutdown();
+            }
+        } catch (const std::exception& inner) {
+            spdlog::error("telemetry: failed to unwind a partially initialized provider: {}", inner.what());
+        } catch (...) {
+            spdlog::error("telemetry: failed to unwind a partially initialized provider");
         }
         m_impl->meter = opentelemetry::nostd::shared_ptr<otel_metrics::Meter>{};
         m_impl->provider = opentelemetry::nostd::shared_ptr<otel_metrics::MeterProvider>{};
