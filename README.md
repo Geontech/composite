@@ -431,8 +431,12 @@ out.connection_count();  out.connected_ports();   // introspection
 `input_port<BufferType>` receives packets into a **bounded lock-free SPSC ring**.
 
 - **Default depth is 1024** (rounded up to a power of two); configurable per port and at runtime via
-  `depth(std::size_t)`. The ring only grows while empty; raising the depth at runtime adjusts a soft
-  limit, it never reallocates a live ring.
+  `depth(std::size_t)`. Raising the depth at runtime adjusts a **soft limit** only — it never
+  reallocates a live ring, and the effective bound stays `min(depth(), ring size)`. The ring grows
+  physically only while the input is **unclaimed** (no producer connected) *and* empty, which makes
+  growth a setup-time operation; v0.5 does not support live physical resizing. Emptiness alone is
+  not sufficient and is not the gate: a connected producer can sit between its capacity check and
+  its slot write with the ring momentarily empty, so `head == tail` does not exclude a producer.
 - **Drop-on-full at the producer:** when the ring is full, `send_data` drops the packet (it does
   **not** block and the queue is **not** unbounded), increments `packets_dropped`, and fires the
   overflow callback. Use `can_send()`/`AWAIT_OUTPUT` upstream for lossless flow.
