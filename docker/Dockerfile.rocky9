@@ -13,19 +13,31 @@
 # linux/amd64 explicitly.
 ARG ROCKY_BASE=rockylinux/rockylinux:9-minimal@sha256:e1d0a9f5ed99d52e7faf03afe7ee32e48b231c4dd9586808b3d1aedf894dff04
 
+# Which toolchain the builder and devel stages sit on: `toolchain` (default) or `toolchain-dpdk`.
+# One Dockerfile, two image families — the alternative was duplicating every stage for the DPDK
+# variant, which is how a variant silently drifts from the one people actually test.
+ARG BUILD_TOOLCHAIN=toolchain
+
 FROM ${ROCKY_BASE} AS toolchain
 
 # GCC Toolset 13 satisfies Composite's supported compiler floor while retaining
 # Rocky 9 as the runtime ABI baseline. nlohmann_json is a public Composite SDK
 # dependency but is not packaged by Rocky 9, so install its exact upstream
 # commit as a normal CMake package.
+# protobuf/libcurl are opentelemetry-cpp's OTLP-HTTP dependencies; openssl-devel is cpp-httplib's
+# TLS backend. All four come from repos this image already enables (appstream/crb/baseos) — no new
+# repository, and no EPEL.
 RUN microdnf install -y --enablerepo=crb \
         ca-certificates \
         cmake \
         gcc-toolset-13-gcc-c++ \
         git-core \
+        libcurl-devel \
         ninja-build \
+        openssl-devel \
         pkgconf-pkg-config \
+        protobuf-compiler \
+        protobuf-devel \
     && microdnf clean all
 
 ENV PATH="/opt/rh/gcc-toolset-13/root/usr/bin:${PATH}" \
@@ -45,16 +57,72 @@ RUN git clone --filter=blob:none https://github.com/nlohmann/json.git /tmp/nlohm
         /usr/local/share/licenses/nlohmann_json/LICENSE.MIT \
     && rm -rf /tmp/nlohmann-json /tmp/nlohmann-json-build
 
-FROM toolchain AS builder
+# OpenTelemetry, built from source because Rocky 9 does not package opentelemetry-cpp at all. This
+# is why the shipped 0.5.0-rc.1 images had OTLP compiled out: the CI jobs that exercise OTel run on
+# Debian (which does package it) and never fed those artifacts into the image.
+#
+# OTLP/HTTP ONLY. Composite links exactly one exporter target
+# (opentelemetry-cpp::otlp_http_metric_exporter), so WITH_OTLP_GRPC stays OFF and the dependency set
+# collapses to protobuf + libcurl — no gRPC, no abseil. That is the difference between a tractable
+# in-image build and dragging half a service mesh into a signal-processing container.
+#
+# STATIC (BUILD_SHARED_LIBS=OFF) with PIC, so the exporter links INTO libcomposite.so and the
+# runtime image needs no opentelemetry shared objects of its own. Without this, otel builds shared
+# and the runtime image — which copies only Composite's install tree — dies on a missing
+# libopentelemetry_proto.so. The feature check below caught exactly that.
+# Pinned by COMMIT, like every other external input here — a tag is a mutable ref.
+ARG OPENTELEMETRY_CPP_REVISION=9ee0c27886f4cc6afc1afbec07a7e8d99b33a9ce
+RUN git clone --filter=blob:none https://github.com/open-telemetry/opentelemetry-cpp.git /tmp/otel \
+    && git -C /tmp/otel checkout --detach "${OPENTELEMETRY_CPP_REVISION}" \
+    && cmake -S /tmp/otel -B /tmp/otel-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_TESTING=OFF \
+        -DWITH_EXAMPLES=OFF \
+        -DWITH_BENCHMARK=OFF \
+        -DWITH_FUNC_TESTS=OFF \
+        -DWITH_OTLP_HTTP=ON \
+        -DWITH_OTLP_GRPC=OFF \
+        -DOPENTELEMETRY_INSTALL=ON \
+    && cmake --build /tmp/otel-build --parallel \
+    && cmake --install /tmp/otel-build \
+    && install -D -m 0644 /tmp/otel/LICENSE \
+        /usr/local/share/licenses/opentelemetry-cpp/LICENSE \
+    && rm -rf /tmp/otel /tmp/otel-build
+
+# DPDK toolchain. A SEPARATE variant rather than a default, because DPDK is not a library you can
+# simply ship: it needs hugepages, specific host devices, and elevated capabilities to be useful, so
+# putting it in the standard image would impose deployment requirements on every user who does not
+# need it. See docker/README.md for what a DPDK image actually requires from its host.
+FROM toolchain AS toolchain-dpdk
+RUN microdnf install -y --enablerepo=crb dpdk-devel \
+    && microdnf clean all
+
+FROM ${BUILD_TOOLCHAIN} AS builder
 
 WORKDIR /src
 COPY . .
+
+# OpenTelemetry and OpenSSL are ON for EVERY image. Both were silently OFF before — the Dockerfile
+# passed neither flag and both options default OFF — so the published containers had no OTLP
+# exporter and no TLS despite the framework supporting both. DPDK is opt-in per the variant.
+#
+# Asserted, not assumed: the smoke stages below check `composite-cli --features` against the flags
+# used here, so an image cannot advertise a capability it was not built with.
+ARG COMPOSITE_WITH_DPDK=OFF
+ARG COMPOSITE_WITH_OPENTELEMETRY=ON
+ARG COMPOSITE_WITH_OPENSSL=ON
 
 RUN cmake -S /src -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCOMPOSITE_BUILD_TESTS=OFF \
         -DCOMPOSITE_INSTALL=ON \
         -DCOMPOSITE_WERROR=ON \
+        -DCOMPOSITE_USE_DPDK=${COMPOSITE_WITH_DPDK} \
+        -DCOMPOSITE_USE_OPENTELEMETRY=${COMPOSITE_WITH_OPENTELEMETRY} \
+        -DCOMPOSITE_USE_OPENSSL=${COMPOSITE_WITH_OPENSSL} \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
     && cmake --build /build --parallel \
     && cmake --install /build --prefix /opt/composite/runtime --component Runtime \
@@ -74,7 +142,9 @@ RUN install -D -m 0644 /build/_deps/argparse-src/LICENSE \
     && install -D -m 0644 /build/_deps/spdlog-src/LICENSE \
         /opt/composite/licenses/spdlog/LICENSE \
     && install -D -m 0644 /usr/local/share/licenses/nlohmann_json/LICENSE.MIT \
-        /opt/composite/licenses/nlohmann_json/LICENSE.MIT
+        /opt/composite/licenses/nlohmann_json/LICENSE.MIT \
+    && install -D -m 0644 /usr/local/share/licenses/opentelemetry-cpp/LICENSE \
+        /opt/composite/licenses/opentelemetry-cpp/LICENSE
 
 FROM ${ROCKY_BASE} AS runtime
 
@@ -104,7 +174,13 @@ LABEL org.opencontainers.image.title="Composite" \
       vendor="Geon Technologies, LLC" \
       license="LGPL-3.0-or-later"
 
-RUN microdnf install -y ca-certificates libgcc libstdc++ \
+# openssl-libs/protobuf/libcurl are the RUNTIME halves of the features now compiled in:
+# opentelemetry-cpp is linked statically, but its protobuf and curl dependencies are not, and
+# cpp-httplib's TLS needs libssl. dpdk is installed only for the DPDK variant — it is ~40MB of
+# drivers that a non-DPDK deployment has no use for.
+ARG COMPOSITE_WITH_DPDK=OFF
+RUN microdnf install -y ca-certificates libgcc libstdc++ libcurl openssl-libs protobuf \
+    && if [ "${COMPOSITE_WITH_DPDK}" = "ON" ]; then microdnf install -y --enablerepo=crb dpdk; fi \
     && microdnf clean all \
     && useradd --uid 10001 --create-home --shell /bin/bash composite \
     && install -d -o 10001 -g 10001 /config /data /workspace
@@ -122,7 +198,7 @@ WORKDIR /workspace
 EXPOSE 5000
 ENTRYPOINT ["/usr/local/bin/composite-cli"]
 
-FROM toolchain AS devel
+FROM ${BUILD_TOOLCHAIN} AS devel
 
 ARG IMAGE_CREATED
 ARG IMAGE_REVISION
@@ -163,14 +239,27 @@ CMD ["/bin/bash"]
 # CI-only target: prove the installed SDK can build the documented external
 # component without access to the Composite source/build tree.
 FROM devel AS devel-smoke
+ARG COMPOSITE_WITH_DPDK=OFF
 COPY --chown=10001:10001 examples/passthrough_gain /tmp/passthrough_gain
 RUN cmake -S /tmp/passthrough_gain -B /tmp/passthrough_gain/build -G Ninja \
     && cmake --build /tmp/passthrough_gain/build --parallel \
     && test -f /tmp/passthrough_gain/build/libpassthrough_gain.so
+# CAPABILITY CHECK. `--version` says nothing about optional features, which is precisely how images
+# advertising OTLP shipped with it compiled out. This asserts what the binary actually links.
+COPY --chown=10001:10001 docker/smoke/check-features.sh /tmp/check-features.sh
+RUN /tmp/check-features.sh "${COMPOSITE_WITH_DPDK}"
+# ...and that the SDK can find the OTel package it was built against, which is what a downstream
+# component needs in order to build against the same exporter.
+RUN test -d /usr/local/lib64/cmake/opentelemetry-cpp || test -d /usr/local/lib/cmake/opentelemetry-cpp
 
 # CI-only target: package a minimal valid graph so the job can verify startup,
 # non-root execution, and SIGTERM delivery through the exec-form entrypoint.
 FROM runtime AS runtime-smoke
+ARG COMPOSITE_WITH_DPDK=OFF
 COPY docker/smoke/empty.json /config/smoke.json
+COPY docker/smoke/check-features.sh /usr/local/bin/check-features.sh
+# Runs at BUILD time so a mis-built image never reaches the registry, and the script stays in the
+# smoke image so the publish job can re-run it against the pulled manifest.
+RUN /usr/local/bin/check-features.sh "${COMPOSITE_WITH_DPDK}"
 CMD ["--server", "0.0.0.0", "/config/smoke.json"]
 

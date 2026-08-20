@@ -3,7 +3,19 @@
 This directory builds the public framework-only container images:
 
 - `composite:<version>` — non-root runtime with `composite-cli` and `libcomposite`;
-- `composite:<version>-devel` — matching SDK with headers, CMake metadata, and a GCC 13 toolchain.
+- `composite:<version>-devel` — matching SDK with headers, CMake metadata, and a GCC 13 toolchain;
+- `composite:<version>-dpdk` — runtime, plus DPDK support (see [DPDK images](#dpdk-images));
+- `composite:<version>-dpdk-devel` — SDK for building DPDK-enabled components.
+
+**Compiled-in features.** Every image — DPDK variant included — is built with **OpenTelemetry** (OTLP/HTTP metric export) and **OpenSSL** (TLS for the REST control plane). Ask any image what it actually shipped with:
+
+```bash
+docker run --rm composite:<version> --features
+# opentelemetry
+# openssl
+```
+
+This is not cosmetic. `--version` reports only the project version, so it cannot distinguish an image with the OTLP exporter compiled in from one without it — and the `0.5.0-rc.1` images shipped with OpenTelemetry, DPDK *and* TLS all compiled out while passing every smoke test. `docker/smoke/check-features.sh` now asserts the exact feature set at image-build time, so a mis-built image cannot reach the registry.
 
 The official component fleet is intentionally out of scope here and will be packaged by `composite-comps` on top of these exact images.
 
@@ -39,7 +51,48 @@ docker buildx build \
   .
 ```
 
-The CI-only `devel-smoke` target builds `examples/passthrough_gain` against the installed SDK. The `runtime-smoke` target starts a valid empty graph for lifecycle/signal verification.
+Build the DPDK variants by selecting the DPDK toolchain and turning the option on. Both arguments are required together: `BUILD_TOOLCHAIN` supplies `dpdk-devel` to the build and SDK stages, and `COMPOSITE_WITH_DPDK` turns the CMake option on and installs the DPDK runtime into the runtime image.
+
+```bash
+docker buildx build \
+  --file docker/Dockerfile.rocky9 \
+  --target runtime \
+  --platform linux/amd64 \
+  --build-arg BUILD_TOOLCHAIN=toolchain-dpdk \
+  --build-arg COMPOSITE_WITH_DPDK=ON \
+  --build-arg IMAGE_VERSION=0.5.0 \
+  --tag composite:local-dpdk \
+  --load \
+  .
+```
+
+The CI-only `devel-smoke` target builds `examples/passthrough_gain` against the installed SDK and asserts the feature set. The `runtime-smoke` target starts a valid empty graph for lifecycle/signal verification and also asserts the feature set.
+
+## DPDK images
+
+DPDK is shipped as a **separate variant rather than in the standard image**, because it is not a library you can simply ship: a DPDK image is only useful on a host configured for it, and those requirements should not be imposed on deployments that do not need them.
+
+A `-dpdk` image needs, from its host:
+
+- **Hugepages.** Allocated on the host and mounted into the container, e.g. `--mount type=bind,source=/dev/hugepages,target=/dev/hugepages`. DPDK's EAL will refuse to initialize without them.
+- **Device access.** `/dev/vfio` for the VFIO driver (`--device /dev/vfio/vfio --device /dev/vfio/<group>`), or `/dev/uio*` for UIO. The NIC must already be bound to a userspace-capable driver on the host — the container cannot do that for you.
+- **Capabilities.** At minimum `--cap-add IPC_LOCK` (hugepage mapping) and typically `--cap-add SYS_RAWIO`. Many deployments use `--privileged` instead; prefer explicit capabilities where you can enumerate them.
+- **Shared memory.** DPDK's runtime files default to `/var/run/dpdk`; give the container a writable path or pass `--file-prefix`.
+- **Non-root caveat.** These images run as UID 10001 like every other Composite image. That user must be able to read the hugepage mount and the VFIO devices, which usually means group ownership on the host side.
+
+`composite-cli --list-dpdk-ports` exists in these images and is the quickest way to confirm the EAL can see the host's NICs:
+
+```bash
+docker run --rm \
+  --mount type=bind,source=/dev/hugepages,target=/dev/hugepages \
+  --device /dev/vfio/vfio \
+  --cap-add IPC_LOCK \
+  composite:<version>-dpdk --list-dpdk-ports
+```
+
+If that lists no ports, the problem is host configuration, not the image.
+
+The DPDK variant is built from the same source and the same OTel/TLS options as the standard image — it is strictly additive.
 
 ## Runtime use
 
@@ -113,6 +166,15 @@ For GA `0.5.0`, publication creates:
 <namespace>/composite:0.5-devel
 <namespace>/composite:latest
 <namespace>/composite:devel
+```
+
+The DPDK variants follow the same scheme with a `-dpdk` / `-dpdk-devel` suffix:
+
+```
+<namespace>/composite:sha-<commit>-dpdk
+<namespace>/composite:sha-<commit>-dpdk-devel
+<namespace>/composite:0.5.0-dpdk
+<namespace>/composite:0.5.0-dpdk-devel
 ```
 
 Release candidates receive only the source-SHA and exact RC tags. They never move the minor, `latest`, or `devel` aliases. For example, an `0.5.0-rc.1` image is compiled from the numeric CMake project version `0.5.0`, while its OCI version label and Docker tag retain `0.5.0-rc.1`.

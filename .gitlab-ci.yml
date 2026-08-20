@@ -294,6 +294,54 @@ build:container:
     - docker run --rm composite:ci-devel cmake --version
     - docker run --rm composite:ci-devel /bin/bash -c 'test "$(id -u)" = 10001; test -f /usr/local/include/composite/composite.hpp; test -f /usr/local/share/composite/cmake/compositeConfig.cmake'
     - docker run --rm composite:ci-devel-smoke /bin/true
+    # Capability assertions. The published 0.5.0-rc.1 images had OpenTelemetry, DPDK and TLS all
+    # compiled out and still passed every check here, because --version cannot tell the difference.
+    # These assert the FEATURE SURFACE, which is the thing that was actually wrong.
+    - |
+      set -eu
+      for role in runtime devel; do
+        feats="$(docker run --rm --entrypoint /usr/local/bin/composite-cli "composite:ci-$role" --features | sort | tr '\n' ',')"
+        test "$feats" = "openssl,opentelemetry," || { echo "unexpected features for $role: [$feats]"; exit 1; }
+      done
+    # The DPDK variant is a real published artifact, so it is BUILT AND EXERCISED here rather than
+    # only compile-checked natively (build:dpdk). Otherwise the first time anyone builds the image
+    # people actually pull is during a release.
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime-smoke
+      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
+      --build-arg COMPOSITE_WITH_DPDK=ON
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-runtime-dpdk
+      --load
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target devel-smoke
+      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
+      --build-arg COMPOSITE_WITH_DPDK=ON
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-devel-dpdk
+      --load
+      .
+    - |
+      set -eu
+      feats="$(docker run --rm --entrypoint /usr/local/bin/composite-cli composite:ci-runtime-dpdk --features | sort | tr '\n' ',')"
+      test "$feats" = "dpdk,openssl,opentelemetry," || { echo "unexpected DPDK features: [$feats]"; exit 1; }
+    # --list-dpdk-ports only exists when DPDK is compiled in, so this is a second, independent
+    # witness that the option really took effect. It is expected to find no ports on a CI runner
+    # with no bound NIC; what matters is that the flag is recognised rather than rejected.
+    - docker run --rm composite:ci-runtime-dpdk --help | grep -q -- --list-dpdk-ports
     - docker run --detach --name composite-runtime-smoke composite:ci-runtime-smoke
     - |
       ready=0
@@ -404,6 +452,11 @@ publish:dockerhub:
     - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     - export RUNTIME_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA"
     - export DEVEL_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-devel"
+    # DPDK variants: separate images because a DPDK build imposes host requirements (hugepages,
+    # VFIO/UIO devices, elevated capabilities) that no non-DPDK deployment should inherit.
+    # See docker/README.md.
+    - export RUNTIME_DPDK_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-dpdk"
+    - export DEVEL_DPDK_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-dpdk-devel"
     - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
     # Preflight the EXTERNAL images while authenticated, before spending a build on them.
     #
@@ -455,14 +508,68 @@ publish:dockerhub:
       --sbom=true
       --push
       .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime
+      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
+      --build-arg COMPOSITE_WITH_DPDK=ON
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag "$RUNTIME_DPDK_SHA_TAG"
+      --provenance=mode=max
+      --sbom=true
+      --push
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target devel
+      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
+      --build-arg COMPOSITE_WITH_DPDK=ON
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag "$DEVEL_DPDK_SHA_TAG"
+      --provenance=mode=max
+      --sbom=true
+      --push
+      .
     # Pull and test the registry manifests before adding release aliases.
     - docker pull "$RUNTIME_SHA_TAG"
     - docker pull "$DEVEL_SHA_TAG"
+    - docker pull "$RUNTIME_DPDK_SHA_TAG"
+    - docker pull "$DEVEL_DPDK_SHA_TAG"
     - test "$(docker run --rm "$RUNTIME_SHA_TAG" --version)" = "$PROJECT_VERSION"
+    - test "$(docker run --rm "$RUNTIME_DPDK_SHA_TAG" --version)" = "$PROJECT_VERSION"
     - docker run --rm --entrypoint /bin/bash "$RUNTIME_SHA_TAG" -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++'
+    - docker run --rm --entrypoint /bin/bash "$RUNTIME_DPDK_SHA_TAG" -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++'
     - docker run --rm "$DEVEL_SHA_TAG" cmake --version
+    - docker run --rm "$DEVEL_DPDK_SHA_TAG" cmake --version
+    # CAPABILITY GATE on the REGISTRY-RESOLVED manifests, not just the local build cache. This is
+    # what the 0.5.0-rc.1 publication lacked: it verified --version and non-root, both of which an
+    # image with every optional feature compiled out passes. Asserted per variant, and the standard
+    # images must NOT claim dpdk — a mixed-up build arg would otherwise publish a DPDK-linked image
+    # under the plain tag, imposing hugepage and device requirements on everyone who pulls it.
+    - |
+      set -eu
+      std="$(docker run --rm --entrypoint /usr/local/bin/composite-cli "$RUNTIME_SHA_TAG" --features | sort | tr '\n' ',')"
+      test "$std" = "openssl,opentelemetry," || { echo "standard runtime features wrong: [$std]"; exit 1; }
+      dev="$(docker run --rm --entrypoint /usr/local/bin/composite-cli "$DEVEL_SHA_TAG" --features | sort | tr '\n' ',')"
+      test "$dev" = "openssl,opentelemetry," || { echo "standard devel features wrong: [$dev]"; exit 1; }
+      dpk="$(docker run --rm --entrypoint /usr/local/bin/composite-cli "$RUNTIME_DPDK_SHA_TAG" --features | sort | tr '\n' ',')"
+      test "$dpk" = "dpdk,openssl,opentelemetry," || { echo "dpdk runtime features wrong: [$dpk]"; exit 1; }
+      dpd="$(docker run --rm --entrypoint /usr/local/bin/composite-cli "$DEVEL_DPDK_SHA_TAG" --features | sort | tr '\n' ',')"
+      test "$dpd" = "dpdk,openssl,opentelemetry," || { echo "dpdk devel features wrong: [$dpd]"; exit 1; }
     - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION" "$RUNTIME_SHA_TAG"
     - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION-devel" "$DEVEL_SHA_TAG"
+    - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION-dpdk" "$RUNTIME_DPDK_SHA_TAG"
+    - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION-dpdk-devel" "$DEVEL_DPDK_SHA_TAG"
     - |
       case "$IMAGE_VERSION" in
         *-rc.*) ;;
@@ -472,10 +579,20 @@ publish:dockerhub:
           docker buildx imagetools create --tag "$IMAGE_NAME:$minor-devel" "$DEVEL_SHA_TAG"
           docker buildx imagetools create --tag "$IMAGE_NAME:latest" "$RUNTIME_SHA_TAG"
           docker buildx imagetools create --tag "$IMAGE_NAME:devel" "$DEVEL_SHA_TAG"
+          # DPDK moves its own minor aliases but deliberately gets NO bare `latest`/`dpdk-latest`:
+          # an unsuffixed floating tag for a variant that needs hugepages and device access is a
+          # trap for anyone who pulls it by habit. The suffix has to be asked for explicitly.
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor-dpdk" "$RUNTIME_DPDK_SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor-dpdk-devel" "$DEVEL_DPDK_SHA_TAG"
           ;;
       esac
+    # Every promoted alias is inspected, DPDK included. An alias that failed to resolve is a
+    # published tag nobody can pull, and it should fail the job that created it rather than the
+    # first user who tries.
     - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION"
     - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-devel"
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-dpdk"
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-dpdk-devel"
   after_script:
     # after_script runs in a fresh shell, so repeat the credential boundary.
     - unset DOCKER_AUTH_CONFIG
