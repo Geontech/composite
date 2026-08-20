@@ -114,6 +114,11 @@ The table below maps the old API to the new one.
 - **Lock-free data path** — bounded SPSC ring ports with an event-driven doorbell (forward for data,
   reverse for backpressure); move-on-last-receiver buffer transfer; direct batched ring handoff.
   Batch overflow callbacks run once with the aggregate rejected-packet count.
+- **Named threads** — every thread the framework spawns carries its owner's name, so `top -H`,
+  `perf` and gdb identify it: a component's worker is named after its id, and a
+  `pipeline_component`'s pool workers as `<id>.wN`. Names are truncated to the 15 characters Linux
+  allows (`composite/util/thread_name.hpp`); previously a longer id was rejected outright and the
+  thread went unnamed.
 - **Park-coordinated reconfiguration** — property writes validate-then-commit under a worker park;
   `config<T>` reactions run at the worker loop-top (no torn config/derived-state).
 - **Callback failure contract (frozen for the v0.5 line).** Validation runs *before* the commit, so a

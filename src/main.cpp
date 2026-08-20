@@ -5,6 +5,7 @@
 
 #include "composite/core/application.hpp"
 #include "composite/util/cpu_affinity.hpp"
+#include "composite/util/thread_name.hpp"
 #include "composite/version.hpp"
 #include "helpers.hpp"
 
@@ -431,7 +432,8 @@ auto main(int argc, char** argv) -> int {
     if (app_json.contains("name") && app_json["name"].is_string()) {
         app_name = app_json["name"].get<std::string>();
     }
-    pthread_setname_np(pthread_self(), app_name.c_str());
+    // Via the helper: names longer than 15 characters were rejected, not truncated.
+    composite::set_thread_name(app_name);
     auto app = composite::application{app_name};
 
     // ========================================

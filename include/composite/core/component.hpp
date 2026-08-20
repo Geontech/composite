@@ -10,6 +10,7 @@
 #include "composite/ports/output_port.hpp"
 #include "composite/ports/port_set.hpp"
 #include "composite/properties/property_set.hpp"
+#include "composite/util/thread_name.hpp"
 #include "lifecycle.hpp"
 #include "park.hpp"
 
@@ -1521,7 +1522,10 @@ private:
             }
             throw;
         }
-        pthread_setname_np(m_thread->native_handle(), m_id.c_str());
+        // Via the helper: the bare pthread call rejected ids longer than 15 characters outright.
+        if (!set_thread_name(m_thread->native_handle(), m_id)) {
+            m_logger->debug("could not set worker thread name for '{}'", m_id);
+        }
 
         // Apply CPU affinity if configured
         if (m_cpu_affinity.has_value()) {

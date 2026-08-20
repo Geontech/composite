@@ -9,6 +9,7 @@
 #include "composite/core/metadata.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
+#include "composite/util/thread_name.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -450,6 +451,9 @@ private:
 
     auto pool_worker(int widx) -> void {
         t_worker_index = widx;
+        // Named from inside the thread: the spawn loop can degrade partway through, so doing it
+        // here needs no bookkeeping over which handles exist.
+        set_thread_name(thread_name_with_suffix(id(), "w" + std::to_string(widx)));
         for (;;) {
             std::size_t my{};
             {

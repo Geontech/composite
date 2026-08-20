@@ -87,6 +87,8 @@ foreach(t
     test_component_concurrency test_connection_cow test_histogram
     test_metrics_lifecycle test_park_coordinator test_pipeline_component
     test_slab_pool test_spsc_ring test_worker_self_write
+    # pool workers and the component worker must appear under readable names in /proc
+    test_thread_name
     # make_component deleter (stop-before-destroy while the leaf is intact) + final lifecycle
     # entry points + connect-time mutability diagnostics
     test_make_component
