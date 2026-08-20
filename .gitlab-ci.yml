@@ -1,11 +1,37 @@
 # composite CI — build + test + sanitizers + public framework images.
-# See ASSESSMENT.md §10 (foundation) and §11 (concurrency test gate).
+#
+# TOOLCHAIN POLICY. Every build/test job runs in the SAME environment the published images are
+# built in: Rocky 9 + GCC Toolset 14, with nlohmann_json and opentelemetry-cpp at the exact
+# commits the Dockerfile pins. That environment is literally the Dockerfile's `toolchain` stage,
+# published to this project's registry by ci:toolchain below.
+#
+# It used to be Debian trixie (gcc:14) everywhere, which meant the gate tested a different
+# compiler, a different libstdc++, a different glibc, and — once the images gained OpenTelemetry —
+# a different opentelemetry-cpp (Debian's 1.19 vs the shipped 1.22). Components cross the DSO
+# boundary as C++ objects and the ABI handshake cannot detect a mismatch, so testing an ABI we do
+# not ship was the wrong risk to carry. Two jobs stay on Debian ON PURPOSE, marked as such:
+# lint:tidy-format (pinned clang-format version) and the arm64 sanitizer, plus one explicit
+# portability job so a newer GCC and a different distro's packaging still get exercised.
 
 stages:
+  - toolchain
   - lint
   - build
   - sanitize
   - publish
+
+variables:
+  # The CI toolchain image tag. BUMP THIS BY HAND when docker/Dockerfile.rocky9's toolchain stage
+  # changes (compiler, cmake, or a pinned dependency revision) — same discipline as the base-image
+  # digest and the nlohmann/otel commit pins, and auditable in the diff. ci:toolchain rebuilds only
+  # when the tag is absent from the registry, so ordinary pipelines skip it in seconds.
+  # The trailing segment is the first 12 hex of sha256(docker/Dockerfile.rocky9). ci:toolchain
+  # RECOMPUTES it and fails if it disagrees, so a Dockerfile edit without a matching tag bump cannot
+  # silently leave the pipeline testing an old toolchain while the release images use the new one.
+  # The value is still literal because `image:` has to resolve before any script runs — the guard is
+  # what makes the manual step safe rather than trusted.
+  TOOLCHAIN_TAG: "rocky9-gcc14-1b23dbf3ef47"
+  CI_TOOLCHAIN_IMAGE: "$CI_REGISTRY_IMAGE/ci-toolchain:$TOOLCHAIN_TAG"
 
 # GCC 14 image; install cmake + git (FetchContent needs git) + nlohmann-json3-dev
 # (nlohmann_json is a REQUIRED system dependency — the public JSON type in the
@@ -51,10 +77,76 @@ stages:
     - export DOCKER_CONTEXT=composite-dind
     - docker buildx inspect --bootstrap
 
+# The primary build/test environment: the same image the release artifacts are built in. No
+# package installation at all — cmake, ninja, git, GCC Toolset 14, nlohmann_json and
+# opentelemetry-cpp are baked in, which is also what removes "which opentelemetry does this job
+# get?" as a question rather than answering it.
+.rocky:
+  image: $CI_TOOLCHAIN_IMAGE
+  before_script:
+    - cmake --version | head -1
+    - g++ --version | head -1
+
+# ---------------------------------------------------------------------------
+# Publish the Dockerfile's toolchain stage to THIS PROJECT's registry so every build/test job can
+# use it. Pushed with $CI_JOB_TOKEN, which is scoped to this project's registry — no long-lived
+# credential, and deliberately not Docker Hub, which is for release artifacts only.
+#
+# IDEMPOTENT: if $TOOLCHAIN_TAG already exists the job exits immediately. Only a deliberate tag
+# bump pays for the opentelemetry-cpp source build, so the common pipeline cost is one manifest
+# lookup.
+# ---------------------------------------------------------------------------
+ci:toolchain:
+  stage: toolchain
+  extends: .docker
+  script:
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    # GUARD FIRST: the tag must encode the current Dockerfile. Without this, skipping the rebuild
+    # when the tag exists means any Dockerfile change — a compiler bump, a new dependency pin —
+    # keeps the pipeline on a stale toolchain while docker/Dockerfile.rocky9 (and therefore every
+    # released image) moves on. That is precisely the tested-vs-shipped divergence this whole
+    # restructure exists to remove, so it fails loudly and tells you the tag to write.
+    - |
+      set -eu
+      want="$(sha256sum docker/Dockerfile.rocky9 | cut -c1-12)"
+      case "$TOOLCHAIN_TAG" in
+        *"$want") echo "TOOLCHAIN_TAG matches docker/Dockerfile.rocky9 ($want)" ;;
+        *)
+          echo "TOOLCHAIN_TAG is stale."
+          echo "  docker/Dockerfile.rocky9 hashes to: $want"
+          echo "  TOOLCHAIN_TAG is:                   $TOOLCHAIN_TAG"
+          echo "Set TOOLCHAIN_TAG in .gitlab-ci.yml to something ending in '$want'"
+          echo "(convention: rocky9-gcc<major>-$want) so CI tests the toolchain the images ship."
+          exit 1
+          ;;
+      esac
+    - |
+      if docker manifest inspect "$CI_TOOLCHAIN_IMAGE" >/dev/null 2>&1; then
+        echo "$CI_TOOLCHAIN_IMAGE already present; nothing to build"
+        exit 0
+      fi
+      echo "building $CI_TOOLCHAIN_IMAGE"
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target toolchain
+      --tag "$CI_TOOLCHAIN_IMAGE"
+      --push
+      .
+    - docker buildx imagetools inspect "$CI_TOOLCHAIN_IMAGE"
+  after_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker logout "$CI_REGISTRY" 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3). The tree is
 # clang-format-clean (formatted with the image's clang-format; re-run inside
 # gcc:14 if versions disagree locally), so the format gate is mandatory.
+#
+# DELIBERATELY still Debian, unlike the build/test jobs. clang-format output is version-specific:
+# Rocky 9 ships clang-tools-extra 21 against trixie's 19, and moving would reformat the entire tree
+# for no functional reason. The format gate cares about the formatter version, not the ABI.
 # clang-tidy surfaces findings as warnings (WarningsAsErrors is still empty);
 # tighten it once the outstanding findings are burned down.
 # ---------------------------------------------------------------------------
@@ -80,7 +172,7 @@ lint:tidy-format:
 # ---------------------------------------------------------------------------
 build:test:
   stage: build
-  extends: .gcc
+  extends: .rocky
   script:
     # `ci` preset = Debug + tests + COMPOSITE_WERROR=ON: the tree is warning-clean
     # under -Wall -Wextra -Wpedantic, so warnings now fail the gate. ctest runs the
@@ -92,16 +184,13 @@ build:test:
 # Build the documented option combinations so the optional-feature paths
 # (OpenSSL / OpenTelemetry, etc.) don't rot. DPDK is its own job below (it pulls
 # libdpdk via pkg-config, which the base gcc image doesn't carry).
-# OpenTelemetry: trixie's opentelemetry-cpp-dev config find_dependency()s absl,
-# protobuf, curl and gRPC (incl. the grpc_cpp_plugin binary), so all of them must
-# be present for configure to succeed. libssl-dev ships in the base image.
+# Optional-feature matrix. No package installation: OpenTelemetry and OpenSSL are already in the
+# toolchain image, at the same pins the published images use. This job used to apt-install Debian's
+# opentelemetry-cpp-dev (1.19) while the images shipped 1.22 — testing one version and releasing
+# another. Now there is only one.
 build:options-matrix:
   stage: build
-  image: gcc:14
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake git nlohmann-json3-dev
-        opentelemetry-cpp-dev libabsl-dev libprotobuf-dev libcurl4-openssl-dev
-        libgrpc++-dev protobuf-compiler-grpc
+  extends: .rocky
   parallel:
     matrix:
       - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
@@ -137,15 +226,31 @@ build:options-matrix:
 # mandatory — the manager can't silently rot.
 build:dpdk:
   stage: build
-  image: gcc:14
+  extends: .rocky
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake git pkg-config libdpdk-dev nlohmann-json3-dev
-    - cmake --version && pkg-config --modversion libdpdk
+    # dpdk-devel is the ONE package any job still installs: it is a fast dnf install from
+    # appstream, and keeping it out of the shared toolchain image avoids paying ~40MB of drivers
+    # on every other job. Same package the -dpdk images use.
+    - microdnf install -y --enablerepo=crb dpdk-devel
+    - cmake --version | head -1 && pkg-config --modversion libdpdk
   script:
     # Build the library (which now contains dpdk_manager.cpp) + the CLI. Tests off:
     # the DPDK paths need a NIC/hugepages to run; compile coverage is the goal here.
     - cmake -B build -DCOMPOSITE_USE_DPDK=ON -DCOMPOSITE_BUILD_TESTS=OFF -DCOMPOSITE_WERROR=ON
     - cmake --build build -j"$(nproc)"
+
+# PORTABILITY, not the gate. The gating jobs run Rocky 9 + GCC Toolset 14 because that is what
+# ships; this one keeps a newer compiler (trixie's GCC 14.4 vs Rocky's 14.2.1) and a completely
+# different distro's packaging of nlohmann_json in the picture, so a change that only compiles
+# against one toolchain still gets caught. Default options: the optional features are covered by
+# build:options-matrix on the shipped toolchain.
+build:portability-debian:
+  stage: build
+  extends: .gcc
+  script:
+    - cmake -B build -DCOMPOSITE_BUILD_TESTS=ON -DCOMPOSITE_WERROR=ON
+    - cmake --build build -j"$(nproc)"
+    - ctest --test-dir build --output-on-failure
 
 # Install the package and build a downstream consumer against it via
 # find_package(composite). Guards the install/export/pkg-config surface: asserts
@@ -154,7 +259,7 @@ build:dpdk:
 # Libs: line).
 build:consumer:
   stage: build
-  extends: .gcc
+  extends: .rocky
   script:
     - cmake -B build -DCMAKE_INSTALL_PREFIX=$CI_PROJECT_DIR/_install -DCOMPOSITE_INSTALL=ON -DCOMPOSITE_BUILD_TESTS=OFF
     - cmake --build build -j"$(nproc)" --target install
@@ -203,15 +308,27 @@ build:consumer:
     - cmake --build examples/passthrough_gain/build
     - test -f "$(find examples/passthrough_gain/build -name 'libpassthrough_gain.so')"  # MODULE .so built
 
-# Build and exercise both public framework image roles. This job never receives
-# Docker Hub credentials and never pushes: merge-request/branch pipelines only
-# prove the packaging contract. The CI-only targets validate an installed SDK
+# Build, exercise, and STAGE both public framework image roles. This job never receives Docker
+# Hub credentials — publication is the release job's job — but it does push the verified,
+# attested artifacts to THIS PROJECT's registry with $CI_JOB_TOKEN, because the release job
+# promotes them by digest rather than rebuilding. The CI-only targets validate an installed SDK
 # consumer and graceful signal handling without adding test assets to runtime.
 build:container:
   stage: build
   extends: .docker
   script:
     - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # LABEL CONTRACT: image labels carry the numeric PROJECT version, which is also what
+    # `composite-cli --version` reports. Release identity — including any `-rc.N` — lives in the
+    # TAG, not in the labels.
+    #
+    # That is forced by promote-by-digest: labels are baked into the image config at build time,
+    # here on develop, where the eventual release tag does not exist yet. The alternative is a
+    # relabel build at promote time, which produces a new config and therefore regenerates the
+    # provenance/SBOM attestations to describe the relabel rather than the real build — trading
+    # accurate supply-chain metadata for a cosmetic string. For final releases the two coincide
+    # anyway (publish asserts RELEASE_BASE_VERSION == PROJECT_VERSION); the divergence is only the
+    # `-rc.N` suffix on prereleases.
     - export IMAGE_VERSION="$(sed -n 's/^project(composite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
     - test -n "$IMAGE_VERSION"
     - >-
@@ -277,6 +394,8 @@ build:container:
         test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.vendor"}}' "$img")" = "Geon Technologies, LLC"
         test "$(docker image inspect --format '{{index .Config.Labels "version"}}' "$img")" = "$IMAGE_VERSION"
         test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img")" = "$IMAGE_VERSION"
+        # $IMAGE_VERSION here IS the project version (see the label contract above), so this also
+        # pins that the labels never drift from what composite-cli reports.
       done
     # Both images redistribute the header-only dependencies' code, so their MIT
     # notices must ship with them.
@@ -317,7 +436,7 @@ build:container:
       --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
       --build-arg IMAGE_VERSION="$IMAGE_VERSION"
       --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
-      --tag composite:ci-runtime-dpdk
+      --tag composite:ci-runtime-dpdk-smoke
       --load
       .
     - >-
@@ -331,17 +450,65 @@ build:container:
       --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
       --build-arg IMAGE_VERSION="$IMAGE_VERSION"
       --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
-      --tag composite:ci-devel-dpdk
+      --tag composite:ci-devel-dpdk-smoke
       --load
       .
     - |
       set -eu
-      feats="$(docker run --rm --entrypoint /usr/local/bin/composite-cli composite:ci-runtime-dpdk --features | sort | tr '\n' ',')"
+      feats="$(docker run --rm --entrypoint /usr/local/bin/composite-cli composite:ci-runtime-dpdk-smoke --features | sort | tr '\n' ',')"
       test "$feats" = "dpdk,openssl,opentelemetry," || { echo "unexpected DPDK features: [$feats]"; exit 1; }
     # --list-dpdk-ports only exists when DPDK is compiled in, so this is a second, independent
     # witness that the option really took effect. It is expected to find no ports on a CI runner
     # with no bound NIC; what matters is that the flag is recognised rather than rejected.
-    - docker run --rm composite:ci-runtime-dpdk --help | grep -q -- --list-dpdk-ports
+    - docker run --rm composite:ci-runtime-dpdk-smoke --help | grep -q -- --list-dpdk-ports
+    # The smoke images above are supersets — runtime-smoke adds a graph config, devel-smoke adds an
+    # example component and the feature-check script — so they are for VERIFICATION only and must
+    # never be published. Build the shippable targets too; they share every layer below the smoke
+    # additions, so the marginal cost is a manifest.
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime
+      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
+      --build-arg COMPOSITE_WITH_DPDK=ON
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-runtime-dpdk
+      --load
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target devel
+      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
+      --build-arg COMPOSITE_WITH_DPDK=ON
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --tag composite:ci-devel-dpdk
+      --load
+      .
+    # Guard against ever staging a smoke image: the release artifacts must NOT contain test assets.
+    - |
+      set -eu
+      for img in composite:ci-runtime composite:ci-runtime-dpdk; do
+        docker run --rm --entrypoint /bin/sh "$img" -c '! test -e /config/smoke.json' \
+          || { echo "$img contains smoke assets — refusing to stage"; exit 1; }
+      done
+      for img in composite:ci-devel composite:ci-devel-dpdk; do
+        docker run --rm --entrypoint /bin/sh "$img" -c '! test -e /tmp/check-features.sh' \
+          || { echo "$img contains smoke assets — refusing to stage"; exit 1; }
+      done
+    # STARTUP + SIGNAL HANDLING. In `script`, and BEFORE anything is pushed: a failure here must
+    # fail the job and must prevent staging. This block previously sat in an after_script, where
+    # GitLab does not fail the job on error — so it never gated anything, and an earlier revision of
+    # this change then discarded it entirely by declaring a second after_script key (last-key-wins,
+    # and both keys are valid YAML, so nothing complains).
     - docker run --detach --name composite-runtime-smoke composite:ci-runtime-smoke
     - |
       ready=0
@@ -355,10 +522,94 @@ build:container:
       test "$ready" = 1
     - docker kill --signal TERM composite-runtime-smoke
     - test "$(docker wait composite-runtime-smoke)" = 0
+    - docker rm -f composite-runtime-smoke
+
+    # STAGE THE BLESSED ARTIFACTS — built again, deliberately, with attestations and pushed
+    # straight to the registry.
+    #
+    # The images verified above were produced with --load, which cannot carry provenance or SBOM
+    # attestations: those are sibling manifests in an image index and require the registry
+    # exporter. Tagging and pushing a --load image would therefore have staged artifacts with no
+    # supply-chain metadata at all, silently dropping what docker/README.md documents and what the
+    # release job is supposed to promote. So the shippable tags are built with the same inputs and
+    # --push, and then PULLED BACK so the verification below runs against the exact manifest the
+    # release job will promote rather than a local look-alike.
+    #
+    # The rebuild is nearly free: every layer is already in the builder cache from the passes above.
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - export STAGED="$CI_REGISTRY_IMAGE/staging"
+    # PIPELINE-SCOPED, and used for every subsequent reference. `staging:<sha>` alone is a MUTABLE
+    # tag — a branch pipeline, a retry, or a tag pipeline on the same commit rewrites it — so
+    # verifying it and later promoting it need not be the same bytes. Adding the pipeline id makes
+    # each pipeline's artifacts its own, and publish:dockerhub runs in this same pipeline (it has no
+    # `rules` excluding it), so it can name exactly what was built and verified here.
+    - export STAGE_REF="$CI_COMMIT_SHA-p$CI_PIPELINE_ID"
+    - |
+      set -eu
+      # target : tag suffix : extra build args
+      printf '%s\n' \
+        "runtime|:|" \
+        "devel|:-devel|" \
+        "runtime|:-dpdk|--build-arg BUILD_TOOLCHAIN=toolchain-dpdk --build-arg COMPOSITE_WITH_DPDK=ON" \
+        "devel|:-dpdk-devel|--build-arg BUILD_TOOLCHAIN=toolchain-dpdk --build-arg COMPOSITE_WITH_DPDK=ON" \
+      | while IFS='|' read -r target suffix extra; do
+          suffix="${suffix#:}"
+          # shellcheck disable=SC2086
+          docker buildx build \
+            --file docker/Dockerfile.rocky9 \
+            --platform linux/amd64 \
+            --target "$target" \
+            $extra \
+            --build-arg IMAGE_CREATED="$IMAGE_CREATED" \
+            --build-arg IMAGE_REVISION="$CI_COMMIT_SHA" \
+            --build-arg IMAGE_VERSION="$IMAGE_VERSION" \
+            --build-arg IMAGE_SOURCE="$CI_PROJECT_URL" \
+            --tag "$STAGED:$STAGE_REF$suffix" \
+            --provenance=mode=max \
+            --sbom=true \
+            --push \
+            .
+        done
+    # Verify the STAGED artifacts, not local copies: pull each back and re-check the feature
+    # surface. This is the manifest the release job promotes, so it is the one that has to be right.
+    - |
+      set -eu
+      for spec in ":openssl,opentelemetry," "-devel:openssl,opentelemetry," "-dpdk:dpdk,openssl,opentelemetry," "-dpdk-devel:dpdk,openssl,opentelemetry,"; do
+        suffix="${spec%%:*}"
+        want="${spec#*:}"
+        img="$STAGED:$STAGE_REF$suffix"
+        docker pull "$img"
+        got="$(docker run --rm --entrypoint /usr/local/bin/composite-cli "$img" --features | sort | tr '\n' ',')"
+        test "$got" = "$want" || { echo "staged $img features wrong: got [$got] want [$want]"; exit 1; }
+        # A shippable image must never contain the smoke fixtures.
+        docker run --rm --entrypoint /bin/sh "$img" -c '! test -e /config/smoke.json && ! test -e /tmp/check-features.sh' \
+          || { echo "staged $img contains smoke assets"; exit 1; }
+      done
+    # Attestations must actually be present, or the release job promotes nothing to carry forward.
+    #
+    # `grep -q .` is NOT good enough and was the first thing written here: buildx prints the literal
+    # string `null` when an attestation is absent, and `null` is four characters, so the check passed
+    # on exactly the images it existed to reject. Require non-empty AND not-null, for BOTH fields —
+    # SBOM was not checked at all.
+    - |
+      set -eu
+      attested() {  # attested <image> <field>
+        val="$(docker buildx imagetools inspect "$1" --format "{{json .$2}}" 2>/dev/null || true)"
+        val="$(printf '%s' "$val" | tr -d '[:space:]')"
+        test -n "$val" && test "$val" != "null" && test "$val" != "{}" && test "$val" != "[]"
+      }
+      for suffix in "" "-devel" "-dpdk" "-dpdk-devel"; do
+        img="$STAGED:$STAGE_REF$suffix"
+        attested "$img" Provenance || { echo "no provenance attestation on $img"; exit 1; }
+        attested "$img" SBOM       || { echo "no SBOM attestation on $img"; exit 1; }
+        echo "attested: $img"
+      done
   after_script:
-    # after_script runs in a fresh shell, so repeat the credential boundary.
+    # ONE after_script, cleanup only. Nothing here is a test: GitLab does not fail a job when
+    # after_script fails, so anything that must gate belongs in `script`.
     - unset DOCKER_AUTH_CONFIG
     - docker rm -f composite-runtime-smoke 2>/dev/null || true
+    - docker logout "$CI_REGISTRY" 2>/dev/null || true
 
 # Build the sibling composite-comps fleet against the freshly-installed framework
 # and run its integration tests — the §6 per-stage exit gate, now that the fleet
@@ -367,7 +618,7 @@ build:container:
 # access is provisioned (the build itself is green).
 build:comps:
   stage: build
-  extends: .gcc
+  extends: .rocky
   allow_failure: true   # pending comps-repo CI access; the build + tests are green locally
   variables:
     COMPS_REPO_URL: "$CI_SERVER_URL/$CI_PROJECT_NAMESPACE/composite-comps.git"
@@ -393,7 +644,7 @@ build:comps:
 # ---------------------------------------------------------------------------
 sanitize:thread:
   stage: sanitize
-  extends: .gcc
+  extends: .rocky
   script:
     - cmake --preset tsan
     - cmake --build --preset tsan -j"$(nproc)"
@@ -404,7 +655,7 @@ sanitize:thread:
 
 sanitize:address:
   stage: sanitize
-  extends: .gcc
+  extends: .rocky
   script:
     - cmake --preset asan-ubsan
     - cmake --build --preset asan-ubsan -j"$(nproc)"
@@ -413,6 +664,9 @@ sanitize:address:
 # Weak-memory (ARM) run: x86 TSO hides the visibility bugs the park
 # happens-before chain guards against (ASSESSMENT §11, T-A/T-C). Requires an
 # aarch64 runner; left allow_failure until one is wired up.
+# DELIBERATELY still Debian: the CI toolchain image is built linux/amd64 only, so this job keeps
+# gcc:14 (which is multi-arch). It is non-gating, and its value is exercising a weak-memory
+# architecture at all — the ordering fixes in park.hpp are the kind of thing only arm64 can show.
 sanitize:thread-arm64:
   stage: sanitize
   extends: .gcc
@@ -458,88 +712,90 @@ publish:dockerhub:
     - export RUNTIME_DPDK_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-dpdk"
     - export DEVEL_DPDK_SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA-dpdk-devel"
     - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
-    # Preflight the EXTERNAL images while authenticated, before spending a build on them.
+    # NOTE: the external-image preflight that used to live here is gone with the builds. It pulled
+    # the Dockerfile's syntax frontend and base image to turn a Docker Hub credential-scope problem
+    # ("insufficient scopes" on public images, because Docker picks credentials per registry HOST
+    # rather than per repository) into a fast, clearly-named failure. That failure mode now belongs
+    # to build:container, which is where the building happens — and which never logs in to Docker
+    # Hub, so it pulls those images anonymously and cannot hit it at all.
+    # PROMOTE, DO NOT REBUILD. These images were built, smoke-tested and capability-checked by
+    # build:container on this exact commit, then staged in this project's registry. Rebuilding here
+    # would publish an artifact nobody tested — and, now that opentelemetry-cpp is built from
+    # source, would pay for four source builds in a fresh dind with no layer cache.
     #
-    # Docker selects credentials per REGISTRY HOST, not per repository, so once logged in every
-    # docker.io pull is made with this token — including public images in other namespaces. A
-    # narrowly scoped token then fails these with "insufficient scopes", even though the same
-    # pulls succeed anonymously (which is why build:container, which never logs in, passes).
-    # The org access token needs "Read public repositories" for these to work.
+    # It also removes the external-image preflight that used to live here: nothing in this job pulls
+    # the Dockerfile's syntax frontend or base image any more, because this job no longer builds.
+    # That whole credential-scope failure mode belongs to build:container now.
     #
-    # Kept permanently, not just for debugging: this turns a credential-scope problem into a
-    # two-second failure naming the exact image, instead of one that surfaces partway into a
-    # build. It will recur whenever a token is rotated or a new base image is introduced.
+    # If the staged tags are absent, the tagged commit's develop pipeline never produced them (a
+    # very old commit, or a skipped pipeline). That is deliberately a hard error rather than a
+    # silent rebuild: publishing an untested artifact is what this change exists to prevent.
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - export STAGED="$CI_REGISTRY_IMAGE/staging"
+    # Same pipeline-scoped ref build:container staged. This job has no `rules` excluding it from the
+    # tag pipeline, so it runs alongside that build and promotes precisely the artifacts that
+    # pipeline verified — not whatever a later branch pipeline may have written over a commit-only
+    # tag while this manual job sat waiting.
+    - export STAGE_REF="$CI_COMMIT_SHA-p$CI_PIPELINE_ID"
+    # RESOLVE TO DIGESTS FIRST, then do everything against the digest.
     #
-    # The pins are READ OUT OF THE DOCKERFILE rather than repeated here, so there is exactly one
-    # place to update when they are refreshed. The `test -n` guards matter: without them a sed
-    # that stopped matching (say the ARG is renamed) would silently degrade into `docker pull ""`
-    # and the preflight would quietly stop checking anything.
-    - export SYNTAX_IMAGE="$(sed -n 's|^# syntax=\(.*\)$|\1|p' docker/Dockerfile.rocky9)"
-    - export ROCKY_BASE_IMAGE="$(sed -n 's|^ARG ROCKY_BASE=\(.*\)$|\1|p' docker/Dockerfile.rocky9)"
-    - test -n "$SYNTAX_IMAGE"
-    - test -n "$ROCKY_BASE_IMAGE"
-    - docker pull "$SYNTAX_IMAGE"
-    - docker pull "$ROCKY_BASE_IMAGE"
-    - >-
-      docker buildx build
-      --file docker/Dockerfile.rocky9
-      --platform linux/amd64
-      --target runtime
-      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
-      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
-      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
-      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
-      --tag "$RUNTIME_SHA_TAG"
-      --provenance=mode=max
-      --sbom=true
-      --push
-      .
-    - >-
-      docker buildx build
-      --file docker/Dockerfile.rocky9
-      --platform linux/amd64
-      --target devel
-      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
-      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
-      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
-      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
-      --tag "$DEVEL_SHA_TAG"
-      --provenance=mode=max
-      --sbom=true
-      --push
-      .
-    - >-
-      docker buildx build
-      --file docker/Dockerfile.rocky9
-      --platform linux/amd64
-      --target runtime
-      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
-      --build-arg COMPOSITE_WITH_DPDK=ON
-      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
-      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
-      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
-      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
-      --tag "$RUNTIME_DPDK_SHA_TAG"
-      --provenance=mode=max
-      --sbom=true
-      --push
-      .
-    - >-
-      docker buildx build
-      --file docker/Dockerfile.rocky9
-      --platform linux/amd64
-      --target devel
-      --build-arg BUILD_TOOLCHAIN=toolchain-dpdk
-      --build-arg COMPOSITE_WITH_DPDK=ON
-      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
-      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
-      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
-      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
-      --tag "$DEVEL_DPDK_SHA_TAG"
-      --provenance=mode=max
-      --sbom=true
-      --push
-      .
+    # `staging:<sha>` is a MUTABLE tag: a branch pipeline, a tag pipeline, or a retry on the same
+    # commit rewrites it, and this job is manual so it can sit for a while before running. Verifying
+    # a tag and then promoting that same tag is a time-of-check/time-of-use gap — the thing promoted
+    # need not be the thing verified. Pinning the digest once closes it: everything below inspects
+    # and promotes that exact manifest, whatever happens to the tag meanwhile.
+    - |
+      set -eu
+      : > /tmp/staged_digests
+      for suffix in "" "-devel" "-dpdk" "-dpdk-devel"; do
+        src="$STAGED:$STAGE_REF$suffix"
+        if ! digest="$(docker buildx imagetools inspect "$src" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+          echo "MISSING staged image: $src"
+          echo "The develop pipeline for $CI_COMMIT_SHA did not stage images. Re-run"
+          echo "build:container on that commit, then re-run this job. Refusing to rebuild and"
+          echo "publish an artifact that was never tested."
+          exit 1
+        fi
+        test -n "$digest"
+        printf '%s|%s\n' "$suffix" "$STAGED@$digest" >> /tmp/staged_digests
+        echo "resolved $src -> $digest"
+      done
+      cat /tmp/staged_digests
+    # Manifest copy FROM THE PINNED DIGESTS, so the published bytes are the ones resolved and
+    # verified above — not whatever the mutable staging tag points at by now.
+    - |
+      set -eu
+      # -F'|' is load-bearing. With awk's default field splitting, leading blanks are discarded, so
+      # the runtime line — whose suffix is the EMPTY string — parsed as a single field and
+      # digest_for '' returned nothing, silently failing to publish the primary image. An explicit
+      # delimiter preserves an empty first field.
+      digest_for() {
+        awk -F'|' -v s="$1" '$1==s {print $2}' /tmp/staged_digests
+      }
+      for sfx in "" "-devel" "-dpdk" "-dpdk-devel"; do
+        test -n "$(digest_for "$sfx")" || { echo "no staged digest resolved for suffix '$sfx'"; exit 1; }
+      done
+      docker buildx imagetools create --tag "$RUNTIME_SHA_TAG"      "$(digest_for '')"
+      docker buildx imagetools create --tag "$DEVEL_SHA_TAG"        "$(digest_for '-devel')"
+      docker buildx imagetools create --tag "$RUNTIME_DPDK_SHA_TAG" "$(digest_for '-dpdk')"
+      docker buildx imagetools create --tag "$DEVEL_DPDK_SHA_TAG"   "$(digest_for '-dpdk-devel')"
+    # ATTESTATIONS MUST SURVIVE THE CROSS-REGISTRY COPY. Provenance and SBOM are sibling manifests
+    # in the image index, so a manifest copy should carry them — but "should" is not verification,
+    # and this is the first point where GitLab's registry and Docker Hub have to agree about
+    # referrer media types. Gate it here rather than leaving a comment telling someone to check by
+    # hand; a silently unattested release is exactly what the staging gate exists to prevent.
+    - |
+      set -eu
+      attested() {
+        val="$(docker buildx imagetools inspect "$1" --format "{{json .$2}}" 2>/dev/null || true)"
+        val="$(printf '%s' "$val" | tr -d '[:space:]')"
+        test -n "$val" && test "$val" != "null" && test "$val" != "{}" && test "$val" != "[]"
+      }
+      for tag in "$RUNTIME_SHA_TAG" "$DEVEL_SHA_TAG" "$RUNTIME_DPDK_SHA_TAG" "$DEVEL_DPDK_SHA_TAG"; do
+        attested "$tag" Provenance || { echo "provenance lost promoting $tag"; exit 1; }
+        attested "$tag" SBOM       || { echo "SBOM lost promoting $tag"; exit 1; }
+        echo "attested on Docker Hub: $tag"
+      done
     # Pull and test the registry manifests before adding release aliases.
     - docker pull "$RUNTIME_SHA_TAG"
     - docker pull "$DEVEL_SHA_TAG"
@@ -547,6 +803,16 @@ publish:dockerhub:
     - docker pull "$DEVEL_DPDK_SHA_TAG"
     - test "$(docker run --rm "$RUNTIME_SHA_TAG" --version)" = "$PROJECT_VERSION"
     - test "$(docker run --rm "$RUNTIME_DPDK_SHA_TAG" --version)" = "$PROJECT_VERSION"
+    # Labels carry the numeric PROJECT version; release identity (including -rc.N) is the TAG. See
+    # the label contract in build:container. Asserted on the promoted artifacts so a staged image
+    # built from a mismatched source tree cannot slip through: the promote is a manifest copy, so
+    # whatever develop baked is what ships.
+    - |
+      set -eu
+      for tag in "$RUNTIME_SHA_TAG" "$DEVEL_SHA_TAG" "$RUNTIME_DPDK_SHA_TAG" "$DEVEL_DPDK_SHA_TAG"; do
+        got="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$tag")"
+        test "$got" = "$PROJECT_VERSION" || { echo "$tag label version=[$got] want [$PROJECT_VERSION]"; exit 1; }
+      done
     - docker run --rm --entrypoint /bin/bash "$RUNTIME_SHA_TAG" -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++'
     - docker run --rm --entrypoint /bin/bash "$RUNTIME_DPDK_SHA_TAG" -c 'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++'
     - docker run --rm "$DEVEL_SHA_TAG" cmake --version
@@ -594,6 +860,8 @@ publish:dockerhub:
     - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-dpdk"
     - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-dpdk-devel"
   after_script:
-    # after_script runs in a fresh shell, so repeat the credential boundary.
+    # after_script runs in a fresh shell, so repeat the credential boundary. TWO registries now:
+    # Docker Hub for publication and this project's registry for the staged inputs.
     - unset DOCKER_AUTH_CONFIG
     - docker logout 2>/dev/null || true
+    - docker logout "$CI_REGISTRY" 2>/dev/null || true

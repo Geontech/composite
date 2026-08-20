@@ -3,10 +3,14 @@
 # floating tag is a mutable input to the one pipeline that produces a signed, SBOM'd release
 # artifact. ROCKY_BASE below is pinned for the same reason.
 #
-# THIS FILE IS THE ONLY PLACE THESE PINS LIVE. The publish job's preflight pull reads both of
-# them straight back out of here (sed on `# syntax=` and `ARG ROCKY_BASE=`), so refreshing a
-# digest is a one-line edit. If either line is reshaped, update that sed — it is guarded by a
-# `test -n`, so a stale pattern fails the job rather than silently skipping the check.
+# THIS FILE IS THE ONLY PLACE THESE PINS LIVE, and it is now also the sole definition of the CI
+# toolchain: ci:toolchain publishes the `toolchain` stage below as the image every build/test job
+# runs in, and its tag must end in sha256(this file)[0:12] or the pipeline fails. So a pin change
+# here propagates to CI and to the released images together, by construction.
+#
+# (The publish job used to pre-pull these pins to surface Docker Hub credential-scope failures
+# early. It no longer builds anything, so that preflight is gone; build:container pulls them
+# anonymously and cannot hit that failure mode.)
 
 # Rocky's organization image is maintained more recently than the legacy
 # library/rockylinux image. Pin the multi-platform index; CI currently selects
@@ -20,17 +24,23 @@ ARG BUILD_TOOLCHAIN=toolchain
 
 FROM ${ROCKY_BASE} AS toolchain
 
-# GCC Toolset 13 satisfies Composite's supported compiler floor while retaining
-# Rocky 9 as the runtime ABI baseline. nlohmann_json is a public Composite SDK
-# dependency but is not packaged by Rocky 9, so install its exact upstream
-# commit as a normal CMake package.
+# GCC Toolset 14 — the SAME compiler the CI jobs use, because this stage IS the CI toolchain
+# image (see .gitlab-ci.yml's ci:toolchain job). Rocky 9 stays the runtime ABI baseline (glibc
+# 2.34), so a binary built here runs on the runtime image while components crossing the DSO
+# boundary see one compiler and one libstdc++ everywhere.
+#
+# Previously this was Toolset 13 while CI gated on Debian's GCC 14 — so the ABI under test was
+# not the ABI being shipped, and the ABI handshake explicitly cannot detect that mismatch.
+#
+# nlohmann_json is a public Composite SDK dependency but is not packaged by Rocky 9, so install
+# its exact upstream commit as a normal CMake package.
 # protobuf/libcurl are opentelemetry-cpp's OTLP-HTTP dependencies; openssl-devel is cpp-httplib's
 # TLS backend. All four come from repos this image already enables (appstream/crb/baseos) — no new
 # repository, and no EPEL.
 RUN microdnf install -y --enablerepo=crb \
         ca-certificates \
         cmake \
-        gcc-toolset-13-gcc-c++ \
+        gcc-toolset-14-gcc-c++ \
         git-core \
         libcurl-devel \
         ninja-build \
@@ -39,10 +49,18 @@ RUN microdnf install -y --enablerepo=crb \
         protobuf-compiler \
         protobuf-devel \
     && microdnf clean all
+# Sanitizer runtimes. Present because this stage doubles as the CI toolchain image and the
+# sanitize:* jobs build -fsanitize=address/thread against it; they add nothing to the runtime or
+# devel images, which are built FROM the base rather than from this stage.
+RUN microdnf install -y --enablerepo=crb \
+        gcc-toolset-14-libasan-devel \
+        gcc-toolset-14-libtsan-devel \
+        gcc-toolset-14-libubsan-devel \
+    && microdnf clean all
 
-ENV PATH="/opt/rh/gcc-toolset-13/root/usr/bin:${PATH}" \
-    CC="/opt/rh/gcc-toolset-13/root/usr/bin/gcc" \
-    CXX="/opt/rh/gcc-toolset-13/root/usr/bin/g++"
+ENV PATH="/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}" \
+    CC="/opt/rh/gcc-toolset-14/root/usr/bin/gcc" \
+    CXX="/opt/rh/gcc-toolset-14/root/usr/bin/g++"
 
 ARG NLOHMANN_JSON_REVISION=9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
 RUN git clone --filter=blob:none https://github.com/nlohmann/json.git /tmp/nlohmann-json \

@@ -3,7 +3,7 @@
 This directory builds the public framework-only container images:
 
 - `composite:<version>` — non-root runtime with `composite-cli` and `libcomposite`;
-- `composite:<version>-devel` — matching SDK with headers, CMake metadata, and a GCC 13 toolchain;
+- `composite:<version>-devel` — matching SDK with headers, CMake metadata, and a GCC Toolset 14 toolchain;
 - `composite:<version>-dpdk` — runtime, plus DPDK support (see [DPDK images](#dpdk-images));
 - `composite:<version>-dpdk-devel` — SDK for building DPDK-enabled components.
 
@@ -121,7 +121,7 @@ The Rocky base image sets its own `name`, `version`, `license`, `vendor`, `summa
 
 ## GitLab CI
 
-`build:container` runs without registry credentials in normal pipelines. It builds and tests the runtime, SDK, external-component consumer, non-root contract, SIGTERM path, OCI labels, and third-party license notices.
+`build:container` never receives Docker Hub credentials. It builds and tests the runtime, SDK, external-component consumer, non-root contract, SIGTERM path, OCI labels, third-party license notices, and the compiled-in feature surface — then **stages** the four verified images to the project's own GitLab registry (`$CI_REGISTRY_IMAGE/staging:<commit-sha>*`) with the job token, built with provenance and SBOM attestations. Staging happens only after every check above passes.
 
 `publish:dockerhub` appears only for tags matching:
 
@@ -130,7 +130,9 @@ v?MAJOR.MINOR.PATCH
 v?MAJOR.MINOR.PATCH-rc.N
 ```
 
-It is initially manual and uses the protected `dockerhub-production` environment. The job builds and pushes source-SHA images with maximum provenance and SBOM attestations, tests the registry-resolved images, and then promotes the same manifests to release aliases.
+It is initially manual and uses the protected `dockerhub-production` environment. The job **does not build**: it resolves the staged images to immutable digests, verifies those exact manifests (version, non-root, feature surface, labels, attestations), copies them to source-SHA tags on Docker Hub, and then promotes the same manifests to release aliases.
+
+Building once and promoting means the published bytes are the ones the develop pipeline tested. Rebuilding at tag time published an artifact that had never been exercised — and with opentelemetry-cpp built from source it also meant four source builds in a fresh dind with no layer cache. Image **labels carry the numeric project version**; release identity, including any `-rc.N`, is the tag. That falls out of promoting rather than rebuilding: labels are baked on develop, before the release tag exists.
 
 Before the first publication, configure GitLab to:
 

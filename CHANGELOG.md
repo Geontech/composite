@@ -16,14 +16,25 @@ All notable changes to **composite** are documented here. The project follows
   (`CMAKE_CXX_STANDARD 20`, `STANDARD_REQUIRED ON`). Components cross the DSO boundary as C++
   objects, so build them with the *same* compiler and standard library as the framework — the
   ABI handshake below does not detect a mismatch.
-  - **Gating, on every pipeline:** **GCC 14** with **libstdc++**, on **x86-64**. Covered
-    modes: Debug + `-Wall -Wextra -Wpedantic -Werror` with the full ctest suite (`ci` preset),
-    Release, `-DCOMPOSITE_USE_OPENSSL=ON`, `-DCOMPOSITE_USE_OPENTELEMETRY=ON`,
-    `-DCOMPOSITE_USE_DPDK=ON` (compile-only — no NIC in CI), an installed-package consumer
-    build, ASan+UBSan, and TSan.
-  - **Non-gating:** **arm64** TSan runs with `allow_failure: true` and excludes the HTTP
-    integration suite. Treat arm64 as buildable-and-exercised, not as a supported target,
-    until that job gates.
+  - **Gating, on every pipeline:** **Rocky 9** with **GCC Toolset 14** and **libstdc++**, on
+    **x86-64** — glibc 2.34. This is deliberately the *exact* environment the published container
+    images are built in, down to the pinned `nlohmann_json` and `opentelemetry-cpp` revisions,
+    because the paragraph above is only meaningful if the ABI under test is the ABI being shipped.
+    Until v0.5 the gate ran on Debian trixie (GCC 14.4, glibc 2.41, Debian's opentelemetry-cpp
+    1.19) while the images shipped GCC Toolset 13 and OTel 1.22 — so this section previously
+    described a toolchain nothing was released against. Covered modes: Debug + `-Wall -Wextra
+    -Wpedantic -Werror` with the full ctest suite (`ci` preset), Release,
+    `-DCOMPOSITE_USE_OPENSSL=ON`, `-DCOMPOSITE_USE_OPENTELEMETRY=ON`, both of those under
+    ASan+UBSan and TSan, `-DCOMPOSITE_USE_DPDK=ON` (compile-only — no NIC in CI), and an
+    installed-package consumer build.
+  - **Also gating, as a portability check:** one **Debian trixie / GCC 14.4** job building the
+    default option set and running ctest. It is not the reference toolchain; it exists so a change
+    that only compiles against one compiler or one distro's packaging still fails.
+  - **Non-gating:** **arm64** TSan runs with `allow_failure: true`, on Debian (the CI toolchain
+    image is amd64-only) and excludes the HTTP integration suite. Treat arm64 as
+    buildable-and-exercised, not as a supported target, until that job gates. It is currently the
+    only job that could surface a weak-memory ordering bug, which is worth knowing when reading
+    any claim about atomic ordering in `park.hpp`.
   - **NOT verified: Clang, in any version, and libc++.** There is no Clang job in the
     pipeline. Do not read "GCC and Clang floors" in any planning document as coverage that
     exists — if Clang support is to be advertised for v0.5, a gating job has to be added
