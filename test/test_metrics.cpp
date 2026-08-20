@@ -20,6 +20,8 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <cmath>
+#include <limits>
 
 #include "composite/metrics/metrics.hpp"
 
@@ -257,6 +259,81 @@ TEST_CASE("Histogram power-of-2 boundaries", "[metrics][histogram]") {
         REQUIRE_THAT(bounds[2], WithinAbs(4.0, 0.001));
         REQUIRE_THAT(bounds[3], WithinAbs(8.0, 0.001));
         REQUIRE_THAT(bounds[4], WithinAbs(16.0, 0.001));
+    }
+}
+
+// v0.5 API guarantee: observations must be finite and non-negative. This is what makes sum()
+// monotonic, which is what lets the OTLP bridge export `_sum` as a Counter rather than an
+// UpDownCounter — a decreasing counter is read downstream as a reset and fabricates a huge rate.
+// A single NaN is worse than wrong: NaN + x is NaN forever, so it would poison the sum permanently.
+TEST_CASE("Histogram rejects negative and non-finite observations", "[metrics][histogram]") {
+    histogram h{{1.0, 10.0, 100.0}};
+
+    h.record(5.0);
+    const auto baseline = h.snapshot();
+    REQUIRE(baseline.count == 1);
+    REQUIRE(baseline.sum == 5.0);
+    REQUIRE(h.rejected_observations() == 0);
+
+    SECTION("zero is VALID and is recorded") {
+        h.record(0.0);
+        const auto snap = h.snapshot();
+        REQUIRE(snap.count == 2);
+        REQUIRE(snap.sum == 5.0);
+        REQUIRE(h.rejected_observations() == 0);
+        REQUIRE(snap.bucket_counts[0] == 1); // 0.0 lands in the first bucket (<= 1.0)
+    }
+
+    SECTION("negative is rejected, touching no field") {
+        h.record(-1.0);
+        const auto snap = h.snapshot();
+        REQUIRE(snap.count == baseline.count); // not counted
+        REQUIRE(snap.sum == baseline.sum);     // not summed
+        REQUIRE(snap.bucket_counts == baseline.bucket_counts);
+        REQUIRE(h.rejected_observations() == 1);
+    }
+
+    SECTION("NaN is rejected and does not poison the sum") {
+        h.record(std::numeric_limits<double>::quiet_NaN());
+        const auto snap = h.snapshot();
+        REQUIRE(snap.count == baseline.count);
+        REQUIRE(snap.sum == 5.0); // the decisive one: a NaN here would make this NaN forever
+        REQUIRE(!std::isnan(snap.sum));
+        REQUIRE(h.rejected_observations() == 1);
+        h.record(3.0); // and the histogram still works afterwards
+        REQUIRE(h.snapshot().sum == 8.0);
+    }
+
+    SECTION("+infinity is rejected") {
+        h.record(std::numeric_limits<double>::infinity());
+        const auto snap = h.snapshot();
+        REQUIRE(snap.count == baseline.count);
+        REQUIRE(snap.sum == 5.0);
+        REQUIRE(std::isfinite(snap.sum));
+        REQUIRE(h.rejected_observations() == 1);
+    }
+
+    SECTION("-infinity is rejected") {
+        h.record(-std::numeric_limits<double>::infinity());
+        const auto snap = h.snapshot();
+        REQUIRE(snap.count == baseline.count);
+        REQUIRE(snap.sum == 5.0);
+        REQUIRE(h.rejected_observations() == 1);
+    }
+
+    SECTION("sum is monotonic across a mixed stream") {
+        double previous = h.snapshot().sum;
+        const std::vector<double> stream{
+            2.0, -5.0, 0.0, std::numeric_limits<double>::quiet_NaN(), 50.0, -std::numeric_limits<double>::infinity(),
+            1.0};
+        for (const auto v : stream) {
+            h.record(v);
+            const auto now = h.snapshot().sum;
+            REQUIRE(now >= previous); // never decreases — the property `_sum`-as-Counter rests on
+            previous = now;
+        }
+        REQUIRE(h.rejected_observations() == 3);
+        REQUIRE(h.snapshot().count == 5); // 5.0 + the four valid stream values
     }
 }
 

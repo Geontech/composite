@@ -18,6 +18,7 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <cstdio>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -383,14 +384,14 @@ public:
     /// until it is stopped; for a source/batch component it returns when process() returns FINISH.
     auto wait_until_finished() -> void {
         std::unique_lock lk{m_finished_mtx};
-        m_finished_cv.wait(lk, [this] { return m_worker_done; });
+        m_finished_cv.wait(lk, [this] { return m_worker_done.load(std::memory_order_acquire); });
     }
 
     /// Bounded wait_until_finished(); returns true if the worker exited within @p timeout.
     template <typename Rep, typename Period>
     auto wait_until_finished(std::chrono::duration<Rep, Period> timeout) -> bool {
         std::unique_lock lk{m_finished_mtx};
-        return m_finished_cv.wait_for(lk, timeout, [this] { return m_worker_done; });
+        return m_finished_cv.wait_for(lk, timeout, [this] { return m_worker_done.load(std::memory_order_acquire); });
     }
 
     /// Signal end-of-stream on every output port: no more data will be produced. Called
@@ -1234,10 +1235,15 @@ private:
     std::string m_finish_error;            ///< what() behind a finish_reason::error; see finish_error()
     std::mutex m_finished_mtx;
     std::condition_variable m_finished_cv;
-    bool m_worker_done{true};
+    /// ATOMIC so the worker's completion guard can publish it without a lock. That guard runs on
+    /// every exit path including a thrown one, and mutex::lock() can itself throw — if publishing
+    /// completion depended on acquiring the mutex, the one case that most needs the signal (a
+    /// worker dying unexpectedly) is the case that could fail to send it, stranding every
+    /// wait_until_finished() waiter and every later stop().
+    std::atomic<bool> m_worker_done{true};
     // Pairs on_worker_start() with on_worker_stop() so the latter runs EXACTLY ONCE per successful
     // start, whether the reap is reached by stop_locked() or by a self-finishing worker's completion
-    // tail in thread_func() — never both, and never zero. Exchange-guarded; see
+    // tail in finish_worker() — never both, and never zero. Exchange-guarded; see
     // worker_resources_down().
     std::atomic<bool> m_worker_resources_up{false};
     bool m_measure_process_time{
@@ -1436,7 +1442,7 @@ private:
         // ordered after this reset even if the worker exits immediately.
         {
             std::scoped_lock lk{m_finished_mtx};
-            m_worker_done = false;
+            m_worker_done.store(false, std::memory_order_release);
         }
         // Bring up subclass worker resources (e.g. pipeline_component's pool), THEN spawn the main
         // worker — both under ONE try. A throw from on_worker_start() is realistic, not exotic:
@@ -1452,9 +1458,9 @@ private:
             // Pair-flag set BEFORE the worker can run, so a fast self-finishing worker's reap
             // (worker_resources_down) always observes it set — see worker_resources_down().
             m_worker_resources_up.store(true, std::memory_order_release);
-            // Lambda (rather than &component::thread_func member-pointer) so std::jthread
+            // Lambda (rather than &component::thread_entry member-pointer) so std::jthread
             // reliably injects the stop_token across libstdc++ versions.
-            m_thread.emplace([this](std::stop_token token) { thread_func(token); });
+            m_thread.emplace([this](std::stop_token token) { thread_entry(std::move(token)); });
         } catch (...) {
             // No live worker exists (on_worker_start threw, or emplace threw before spawning): undo
             // the done-flag so wait_until_finished() doesn't block, report the failed run as errored
@@ -1462,7 +1468,7 @@ private:
             // safe because nothing is running to reap them, so this cannot race a worker's own reap.
             {
                 std::scoped_lock lk{m_finished_mtx};
-                m_worker_done = true;
+                m_worker_done.store(true, std::memory_order_release);
             }
             m_finish_reason.store(finish_reason::error, std::memory_order_release);
             try {
@@ -1502,7 +1508,7 @@ private:
     /// How long either shutdown wait stays quiet before it starts reporting.
     static constexpr auto k_stop_report_interval = std::chrono::seconds(5);
 
-    /// Wait for the worker to leave thread_func, REPORTING progress instead of waiting mutely.
+    /// Wait for the worker to leave thread_entry, REPORTING progress instead of waiting mutely.
     ///
     /// The join cannot be abandoned: after a timeout the worker would still be running
     /// against an object stop() is about to tear down (and ~component is one of stop()'s
@@ -1513,7 +1519,7 @@ private:
     auto await_worker_exit_reporting() -> void {
         for (int elapsed = 0;; elapsed += static_cast<int>(k_stop_report_interval.count())) {
             if (wait_until_finished(k_stop_report_interval)) {
-                break; // worker has left thread_func; the join below returns immediately
+                break; // worker has left thread_entry; the join below returns immediately
             }
             logger()->warn("{}: worker still running {}s into stop() — process() (or something it "
                            "calls) is not returning. It must observe the stop token and use bounded "
@@ -1606,7 +1612,7 @@ private:
         // Tear down subclass worker resources (e.g. pipeline_component's pool) AFTER the main worker
         // is joined — runs on every stop path (direct stop() AND app/reconcile disable). Exchange-
         // guarded so a worker that already self-finished (and reaped its own resources in
-        // thread_func's completion tail) is not torn down a second time here.
+        // finish_worker()) is not torn down a second time here.
         worker_resources_down();
 
         // NOTE: a reaction staged just before this stop is NOT drained here — that would
@@ -1654,7 +1660,78 @@ private:
         return false;
     }
 
-    auto thread_func(std::stop_token token) -> void {
+    /// No-throw, no-allocation last resort. Used only on paths that are already handling an
+    /// exception, where the ordinary logger (which formats, and therefore allocates) could throw
+    /// again and take the process down with it.
+    static auto emergency_note(const char* id, const char* what) noexcept -> void {
+        std::fputs("composite: worker '", stderr);
+        std::fputs(id != nullptr ? id : "?", stderr);
+        std::fputs("' terminated abnormally: ", stderr);
+        std::fputs(what != nullptr ? what : "unknown", stderr);
+        std::fputs("\n", stderr);
+    }
+
+    /// Publishes worker completion on EVERY exit path, including a thrown one. Deliberately does
+    /// not need the mutex to do it: m_worker_done is atomic, so the signal cannot be lost even if
+    /// locking fails, and a waiter's predicate re-check picks it up.
+    struct completion_guard {
+        component& c;
+        explicit completion_guard(component& comp) noexcept : c(comp) {}
+        completion_guard(const completion_guard&) = delete;
+        auto operator=(const completion_guard&) -> completion_guard& = delete;
+        completion_guard(completion_guard&&) = delete;
+        auto operator=(completion_guard&&) -> completion_guard& = delete;
+        ~completion_guard() {
+            c.m_worker_done.store(true, std::memory_order_release);
+            // Taking the mutex only orders us against a waiter sitting between its predicate
+            // check and its wait; the store above is what actually publishes. If it throws, the
+            // notify still goes out and the predicate is already true.
+            try {
+                const std::scoped_lock lk{c.m_finished_mtx};
+            } catch (...) { // NOLINT(bugprone-empty-catch) — the store above already published
+            }
+            c.m_finished_cv.notify_all();
+        }
+    };
+
+    /// THREAD ENTRY. noexcept, because this is what std::jthread invokes: anything escaping here
+    /// terminates the process. The loop body and the completion tail are both fallible — the tail
+    /// runs user hooks (on_finished, send_eos, on_worker_stop) and the body's own error handling
+    /// formats log messages, which can throw while already unwinding — so neither may be the
+    /// outermost frame.
+    auto thread_entry(std::stop_token token) noexcept -> void {
+        const completion_guard done{*this}; // outermost: signals even if everything below throws
+        auto exit_reason = finish_reason::none;
+        try {
+            exit_reason = worker_body(std::move(token));
+        } catch (const std::exception& ex) {
+            exit_reason = finish_reason::error;
+            record_worker_fault(ex.what());
+        } catch (...) {
+            exit_reason = finish_reason::error;
+            record_worker_fault("unknown exception escaped the worker loop");
+        }
+        try {
+            finish_worker(exit_reason);
+        } catch (const std::exception& ex) {
+            emergency_note(m_id.c_str(), ex.what());
+        } catch (...) {
+            emergency_note(m_id.c_str(), "exception escaped worker finalization");
+        }
+    }
+
+    /// Record an escaped worker fault without formatting or allocating beyond what finish_error()
+    /// already does. Contained: this runs while an exception is being handled.
+    auto record_worker_fault(const char* what) noexcept -> void {
+        set_finish_error(what); // already noexcept
+        try {
+            logger()->error("component '{}' worker terminated by an unhandled exception: {}", m_id, what);
+        } catch (...) {
+            emergency_note(m_id.c_str(), what); // logging itself failed; do not compound it
+        }
+    }
+
+    auto worker_body(std::stop_token token) -> finish_reason {
         using enum retval;
         // Guard FIRST. worker_started() publishes m_worker_id and the RUNNING state, and its
         // wait can throw (std::system_error from the CV). A throw between that publish and the
@@ -1822,9 +1899,16 @@ private:
             // NO_YIELD: loop immediately without yielding (component opted out; streak untouched)
         }
 
-        // Completion: if the loop self-terminated (FINISH / exception, not an external stop), record
-        // the reason and fire on_finished() ON THIS worker thread before it exits. Then, regardless
-        // of how the loop ended, signal wait_until_finished() waiters that the worker is done.
+        return exit_reason; // the caller (thread_entry) runs the completion tail
+    }
+
+    /// Completion tail, run by thread_entry() after the loop has ended for ANY reason. Split out so
+    /// the loop is not the outermost frame: everything here runs USER code (on_finished, send_eos,
+    /// on_worker_stop), each piece contained individually, with thread_entry()'s catch as the net
+    /// and completion_guard publishing m_worker_done regardless of what happens in here.
+    auto finish_worker(finish_reason exit_reason) -> void {
+        // If the loop self-terminated (FINISH / exception, not an external stop), record the reason
+        // and fire on_finished() ON THIS worker thread before it exits.
         if (exit_reason != finish_reason::none) {
             m_finish_reason.store(exit_reason, std::memory_order_release);
             try {
@@ -1871,13 +1955,6 @@ private:
                 m_state->set(0.0);
             }
         }
-        // ALWAYS signal completion last (even if on_finished/send_eos/reap above threw) so a
-        // wait_until_finished() waiter can never be stranded.
-        {
-            std::scoped_lock lk{m_finished_mtx};
-            m_worker_done = true;
-        }
-        m_finished_cv.notify_all();
     }
 
 }; // class component

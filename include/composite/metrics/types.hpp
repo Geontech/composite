@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -427,9 +428,32 @@ public:
 
     /**
      * @brief Record a value in the histogram
-     * @param value Value to record
+     *
+     * Observations MUST be finite and non-negative. An observation that is negative, NaN, or
+     * infinite is REJECTED — it updates neither the buckets, nor count(), nor sum() — and is
+     * counted in rejected_observations().
+     *
+     * This is a v0.5 API guarantee, not a defensive nicety, and it exists so that sum() is
+     * monotonic. The OTLP bridge exports a histogram as three instruments, and its `_sum` is a
+     * monotonic Counter: a sum that could decrease would be read downstream as a counter RESET,
+     * making the collector add the whole new value and invent an enormous spurious rate. One NaN
+     * observation is worse still — it would poison the accumulated sum permanently, since
+     * NaN + x is NaN forever after.
+     *
+     * Stays noexcept, and rejects silently rather than throwing: this is the hot data path, called
+     * from process(), and a throwing metric would turn an instrumentation bug into a component
+     * fault. Check rejected_observations() to find bad instrumentation.
+     *
+     * @param value Value to record; finite and >= 0
      */
     void record(double value) noexcept {
+        // Rejected BEFORE any field is touched, so a bad observation cannot leave count, buckets
+        // and sum disagreeing with each other. `!(value >= 0.0)` rather than `value < 0.0`: NaN
+        // compares false against everything, so this catches NaN in the same test.
+        if (!(value >= 0.0) || std::isinf(value)) {
+            m_rejected.value.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         // ONE bucketing rule for all boundaries (power-of-2 boundaries are just a
         // special case), so create_histogram and create_histogram_pow2 agree on
         // which bucket a value lands in. (The old O(1) power-of-2 fast path used a
@@ -450,6 +474,18 @@ public:
             double new_sum = std::bit_cast<double>(current_bits) + value;
             new_bits = std::bit_cast<uint64_t>(new_sum);
         } while (!m_sum.value.compare_exchange_weak(current_bits, new_bits, std::memory_order_relaxed));
+    }
+
+    /**
+     * @brief Observations refused by record() for being negative, NaN, or infinite.
+     *
+     * Non-zero means instrumentation somewhere is feeding a histogram values it cannot represent.
+     * The data is not silently wrong — the rejected observations are simply absent — but the
+     * caller's intent was not honoured, so this is worth alerting on.
+     */
+    [[nodiscard]]
+    auto rejected_observations() const noexcept -> uint64_t {
+        return m_rejected.value.load(std::memory_order_relaxed);
     }
 
     /**
@@ -533,7 +569,8 @@ private:
     std::vector<double> m_boundaries;
     std::vector<aligned_atomic<uint64_t>> m_buckets;
     aligned_atomic<uint64_t> m_count{};
-    aligned_atomic<uint64_t> m_sum{}; // Stored as bits of double
+    aligned_atomic<uint64_t> m_sum{};      // Stored as bits of double
+    aligned_atomic<uint64_t> m_rejected{}; // negative / NaN / infinite observations refused
     bool m_power_of_2{false};
 };
 

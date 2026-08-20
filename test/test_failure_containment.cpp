@@ -1098,6 +1098,39 @@ int main() {
     // the coordinator counts — so such a test faults by construction and would be measuring the
     // caller's lifetime bug, not ours. Case (22) covers the part that IS ours, deterministically.
 
+    // ---- (23) a self-finishing worker whose every completion hook throws ----
+    // thread_entry() is the std::jthread entry function, so ANY exception escaping it terminates
+    // the process — and an escape would also skip the completion publication, stranding
+    // wait_until_finished() and every later stop(). The loop is therefore no longer the outermost
+    // frame: it returns a reason to a noexcept entry wrapper, the tail runs under that wrapper's
+    // catch, and a completion_guard publishes m_worker_done before anything else can go wrong.
+    //
+    // This drives the whole tail with every hook hostile at once — the FINISH dispatch, EOS
+    // propagation, and the resource reap — and asserts the two things that must survive it.
+    {
+        class hostile_finish_comp : public component {
+        public:
+            explicit hostile_finish_comp(std::string_view id) : component(id) { add_port(out); }
+            auto process() -> retval override { return retval::FINISH; }
+            auto on_finished(finish_reason) -> void override { throw std::runtime_error("on_finished threw"); }
+            auto on_worker_stop() -> void override { throw std::runtime_error("on_worker_stop threw"); }
+            output_port<immutable_buffer<float>> out{"out"};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        hostile_finish_comp c{"hostilefinish"};
+        c.start();
+        // The decisive assertion: completion is published even though every hook on the way out
+        // threw. If an exception escaped instead, this hangs (or the process is already dead).
+        check(c.wait_until_finished(std::chrono::seconds(5)),
+              "worker exit: completion was published despite every completion hook throwing");
+        check(c.is_finished(), "worker exit: the component reports itself finished");
+        check(c.finished_reason() == finish_reason::completed,
+              "worker exit: a FINISH return is still reported as an orderly completion");
+        // ...and the component is still stoppable afterwards, i.e. nothing was left half-torn-down.
+        check(c.try_stop(std::chrono::seconds(5)), "worker exit: a later stop still completes");
+    }
+
     if (g_fails != 0) {
         std::fprintf(stderr, "%d containment check(s) FAILED\n", g_fails);
         return 1;

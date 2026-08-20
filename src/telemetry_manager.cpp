@@ -766,19 +766,16 @@ auto manager::group_for(const std::string& otel_name, const std::string& base_na
         callback = &observe_hist_count;
         break;
     case instrument_role::hist_sum:
-        // An UpDownCounter: a cumulative SUM that does NOT claim monotonicity.
+        // A monotonic Counter, matching `_count` and `_bucket`, so the whole histogram family
+        // shares one aggregation temporality and a collector can reconstruct it.
         //
-        // Neither obvious choice is right. A Gauge puts this third of the histogram family on a
-        // different aggregation temporality from `_count` and `_bucket`, so a collector cannot
-        // reconstruct the histogram. A monotonic Counter would be a lie: histogram::record()
-        // accepts negative observations (metrics/types.hpp), so the sum genuinely can decrease —
-        // and a decreasing OTLP counter is read as a COUNTER RESET, making the collector add the
-        // whole new value and invent an enormous spurious rate.
-        //
-        // UpDownCounter is the honest encoding: same Sum type and temporality as the other two,
-        // is_monotonic=false. If negative observations are ever rejected at record(), this can
-        // become a plain Counter and rate() over `_sum` becomes meaningful.
-        group->instrument = m_impl->meter->CreateDoubleObservableUpDownCounter(otel_name, description, unit);
+        // This is only sound because histogram::record() REJECTS negative, NaN and infinite
+        // observations (metrics/types.hpp) — a v0.5 API guarantee. Without it the sum could
+        // decrease, and a decreasing OTLP counter is read as a counter RESET: the collector adds
+        // the whole new value and invents an enormous spurious rate. If that invariant is ever
+        // relaxed, this must become an UpDownCounter (a Sum with is_monotonic=false) in the same
+        // commit.
+        group->instrument = m_impl->meter->CreateDoubleObservableCounter(otel_name, description, unit);
         callback = &observe_hist_sum;
         break;
     case instrument_role::hist_bucket:

@@ -106,12 +106,18 @@ build:options-matrix:
     matrix:
       - OPTS: "-DCOMPOSITE_USE_OPENSSL=ON"
       - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON"
-      # The OTel bridge SANITIZED. The sanitize:* jobs below build the default option set, which
-      # excludes OpenTelemetry, so without this entry the most sanitizer-hungry code in the tree —
-      # raw void* round-trips, a `this` pointer handed to a C callback the SDK invokes from its own
-      # export thread, and cross-thread mutation of a group's series list — ran under no sanitizer
-      # at all, in any job.
+      # The OTel bridge SANITIZED, under BOTH sanitizers. The sanitize:* jobs below build the
+      # default option set, which excludes OpenTelemetry, so without these entries the most
+      # sanitizer-hungry code in the tree — raw void* round-trips, a `this` pointer handed to a C
+      # callback the SDK invokes from its own export thread, and cross-thread mutation of a group's
+      # series list — ran under no sanitizer at all, in any job.
+      #
+      # TSan is not redundant with ASan here: what this code gets wrong is ORDERING (an export
+      # callback racing a registration or a deregistration), and ASan only sees it once the race
+      # has already produced a bad access. The registry/telemetry defects this suite exists to
+      # catch were all races first and use-after-frees second.
       - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON -DCOMPOSITE_SANITIZER=address,undefined"
+      - OPTS: "-DCOMPOSITE_USE_OPENTELEMETRY=ON -DCOMPOSITE_SANITIZER=thread"
   script:
     # Tests ON so the option-specific suites are built AND RUN. The OTLP grouping test in
     # particular only exists under -DCOMPOSITE_USE_OPENTELEMETRY=ON, and the failure it guards
