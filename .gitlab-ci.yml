@@ -722,17 +722,31 @@ sanitize:address:
     - cmake --build --preset asan-ubsan -j"$(nproc)"
     - ctest --preset asan-ubsan
 
-# Weak-memory (ARM) run: x86 TSO hides the visibility bugs the park
-# happens-before chain guards against (ASSESSMENT §11, T-A/T-C). Requires an
-# aarch64 runner; left allow_failure until one is wired up.
-# DELIBERATELY still Debian: the CI toolchain image is built linux/amd64 only, so this job keeps
-# gcc:14 (which is multi-arch). It is non-gating, and its value is exercising a weak-memory
-# architecture at all — the ordering fixes in park.hpp are the kind of thing only arm64 can show.
+# Weak-memory (ARM) run: x86 TSO hides the visibility bugs the park happens-before chain guards
+# against, so this is the only job that could surface an ordering bug in park.hpp.
+#
+# Off unless ARM64_RUNNER is set to "true" as a project CI/CD variable, because `tags: [arm64]`
+# with no arm64 runner does not fail — it leaves the job pending until it times out, which holds
+# the whole pipeline open and reports "stuck because ... no runners that match all of the job's
+# tags". allow_failure does not help: it governs a job that ran and failed, not one that never
+# started. Skipping it outright is the only state that neither blocks nor lies about coverage.
+#
+# The variable is deliberately not given a default here, so enabling it is one project setting and
+# there is no precedence question between this file and the project's own variables.
+#
+# Still Debian on purpose: the CI toolchain image is amd64-only, so this keeps the multi-arch
+# gcc:14. When a runner is wired up, set the variable and expect real failures at first.
 sanitize:thread-arm64:
   stage: sanitize
-  extends: [.gcc, .not-on-tag]
+  extends: .gcc
   tags: [arm64]
   allow_failure: true
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $ARM64_RUNNER != "true"
+      when: never
+    - when: on_success
   script:
     - cmake --preset tsan
     - cmake --build --preset tsan -j"$(nproc)"

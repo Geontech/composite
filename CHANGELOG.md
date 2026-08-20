@@ -30,11 +30,15 @@ All notable changes to **composite** are documented here. The project follows
   - **Also gating, as a portability check:** one **Debian trixie / GCC 14.4** job building the
     default option set and running ctest. It is not the reference toolchain; it exists so a change
     that only compiles against one compiler or one distro's packaging still fails.
-  - **Non-gating:** **arm64** TSan runs with `allow_failure: true`, on Debian (the CI toolchain
-    image is amd64-only) and excludes the HTTP integration suite. Treat arm64 as
-    buildable-and-exercised, not as a supported target, until that job gates. It is currently the
-    only job that could surface a weak-memory ordering bug, which is worth knowing when reading
-    any claim about atomic ordering in `park.hpp`.
+  - **NOT verified: arm64, or any weak-memory architecture.** There is an arm64 TSan job, but no
+    arm64 runner has ever been attached, so it has never executed — with `tags: [arm64]` and
+    nothing to match, it sat pending until it timed out, holding the pipeline open. It is now off
+    unless `ARM64_RUNNER` is set to `"true"`, which is honest about the coverage and stops the
+    stuck job. Do not read its presence in the file as evidence anything ran on arm64.
+    Concretely: **every ordering claim about `park.hpp` in this changelog and in the source has
+    only ever been tested on x86-64**, whose TSO hides exactly the visibility bugs those
+    seq_cst pairings exist to prevent. Attaching a runner and flipping the variable should be
+    expected to find real failures, not to confirm the current state.
   - **NOT verified: Clang, in any version, and libc++.** There is no Clang job in the
     pipeline. Do not read "GCC and Clang floors" in any planning document as coverage that
     exists — if Clang support is to be advertised for v0.5, a gating job has to be added
