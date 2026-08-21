@@ -151,7 +151,7 @@ ci:toolchain:
     - docker logout "$CI_REGISTRY" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3).
+# Static analysis / formatting.
 #
 # ADVISORY BY DESIGN — not an RC2-STOPGAP. Style drift should never hold a pipeline hostage:
 # the job still runs everything and still FAILS (shows orange) when findings exist, but
@@ -682,8 +682,8 @@ build:container:
     - docker logout "$CI_REGISTRY" 2>/dev/null || true
 
 # Build the sibling composite-comps fleet against the freshly-installed framework
-# and run its integration tests — the §6 per-stage exit gate, now that the fleet
-# is migrated to the new APIs (all 5 components build; framer tests pass). Defaults
+# and run its integration tests — the cross-repo exit gate: the framework does not
+# ship an API the fleet cannot build and pass against. Defaults
 # to a sibling project in the same group; allow_failure only until the repo's CI
 # access is provisioned (the build itself is green).
 build:comps:
@@ -703,7 +703,7 @@ build:comps:
     - cmake -S comps_src -B comps_src/build -DCMAKE_PREFIX_PATH=$CI_PROJECT_DIR/_install
 
 # ---------------------------------------------------------------------------
-# Sanitizer gate for the concurrency core + buffers (ASSESSMENT §11).
+# Sanitizer gate for the concurrency core + buffers.
 #
 # These now drive the CMake `tsan` / `asan-ubsan` presets — a single source of
 # truth shared with local dev (`cmake --preset tsan && ctest --preset tsan`).
