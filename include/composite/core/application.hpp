@@ -436,9 +436,8 @@ public:
             // is the same posture a false try_stop() leaves: not torn down, do not destroy.
             {
                 std::unique_lock lk{m_mtx};
-                const bool id_free =
-                    std::none_of(m_components.begin(), m_components.end(),
-                                 [&](const component_ptr& c) { return c->id() == target->id(); });
+                const bool id_free = std::none_of(m_components.begin(), m_components.end(),
+                                                  [&](const component_ptr& c) { return c->id() == target->id(); });
                 if (id_free) {
                     m_components.push_back(target);
                 } else {
