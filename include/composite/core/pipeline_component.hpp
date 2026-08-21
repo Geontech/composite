@@ -439,7 +439,15 @@ private:
     }
 
     auto stop_pool() -> void {
-        m_pool_stop.store(true, std::memory_order_release);
+        {
+            // The stop flag MUST be written under m_mtx even though it is atomic: pool_worker()
+            // evaluates its wait predicate under that lock, and an unlocked store+notify can land
+            // between a worker's predicate check (reads false) and its block — a lost wakeup on
+            // the one UNBOUNDED wait in this class. The worker then sleeps forever and the join
+            // below wedges the stopping thread with it.
+            const std::scoped_lock lk{m_mtx};
+            m_pool_stop.store(true, std::memory_order_release);
+        }
         m_work_cv.notify_all();
         for (auto& t : m_pool) {
             if (t.joinable()) {
