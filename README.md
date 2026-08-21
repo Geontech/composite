@@ -646,7 +646,7 @@ stringified.
 | `GET /app/components` | Array of component documents. |
 | `POST /app/components` | Create + add a component at runtime (`{library, id, properties?}`). `201` on success; `409` on duplicate id. |
 | `GET /app/components/:id` | One component document (`404` if unknown). |
-| `DELETE /app/components/:id` | Stop, disconnect, and unload a component (`404` if unknown). |
+| `DELETE /app/components/:id` | Stop, disconnect, and unload a component (`404` if unknown). **Atomic:** if a connected peer's worker cannot be quiesced to release its edge, nothing is destroyed — the component stays registered (stopped) and the request fails with `500` naming the cause; retry once the peer has stopped. |
 | `PATCH /app/components/:id` | Set a batch of `{ "properties": { ... } }` on one component (atomic per component). |
 | `PATCH /app/components` | Multi-component batch `{ "components": [ { id, properties }, ... ] }`. Per-component atomic but **not** transactional across components — returns **`207 Multi-Status`** if any component fails, with a per-component `results` array. |
 
@@ -673,10 +673,20 @@ object or array (`null` resets/erases). There are **no** `/items` or `/fields` s
 | `DELETE /app/connections` | Remove a specific connection (same body shape as POST). |
 | `DELETE /app/components/:id/ports/:port_name/connections` | Disconnect all of a port's connections. |
 
-**Status codes & limits.** `201` on create; `207` on a partially-failed multi-component batch;
-`403` for a write to a non-runtime property (`config_violation`); `404` for an unknown property or
-component; `400` for a validation/decoding error; `409` for a duplicate component id; `500` otherwise.
-Request bodies are capped at 8 MiB; CORS is `*`. Only `RUNTIME` properties are writable over REST.
+**Metrics**
+
+| Method & path | Description |
+|---|---|
+| `GET /app/metrics` | Snapshot of every registered metric (name, type, labels, value/buckets). |
+| `GET /app/metrics/stream` | Server-Sent Events stream of metric snapshots. `?interval=<ms>` sets the cadence (default 1000, clamped to 100–60000). At most **8 concurrent streams**; excess requests get `503`. |
+
+**Status codes & limits.** `201` on create; `207` on a partially-failed multi-component batch **and**
+on a partially-completed `POST /app/stop` (`not_stopped` list); `403` for a write to a non-runtime
+property (`config_violation`); `404` for an unknown property or component; `400` for a
+validation/decoding error; `405` with an `Allow: GET, PATCH, DELETE` header for `PUT` on a single
+property (withdrawn — see the property table); `409` for a duplicate component id; `503` when the
+SSE stream cap is reached; `500` otherwise. Request bodies are capped at 8 MiB; CORS is `*`. Only
+`RUNTIME` properties are writable over REST.
 
 ```bash
 # Inspect

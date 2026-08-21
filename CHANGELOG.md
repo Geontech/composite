@@ -17,7 +17,12 @@ All notable changes to **composite** are documented here. The project follows
   objects, so build them with the *same* compiler and standard library as the framework — the
   ABI handshake below does not detect a mismatch.
   - **Gating, on every pipeline:** **Rocky 9** with **GCC Toolset 14** and **libstdc++**, on
-    **x86-64** — glibc 2.34. This is deliberately the *exact* environment the published container
+    **x86-64** — glibc 2.34.
+    *Temporary exception (2026-08-20, delete this note with the stopgap):* the test and sanitizer
+    jobs are currently `allow_failure: true` (`grep RC2-STOPGAP .gitlab-ci.yml`) so a red test could
+    not block publishing the first OpenTelemetry/DPDK images. While those lines exist this bullet
+    describes intent, not enforcement; they must be removed — after one unaided green pipeline —
+    before v0.5.0 final is tagged. This is deliberately the *exact* environment the published container
     images are built in, down to the pinned `nlohmann_json` and `opentelemetry-cpp` revisions,
     because the paragraph above is only meaningful if the ABI under test is the ABI being shipped.
     Until v0.5 the gate ran on Debian trixie (GCC 14.4, glibc 2.41, Debian's opentelemetry-cpp
@@ -72,6 +77,12 @@ All notable changes to **composite** are documented here. The project follows
 
 ## 0.5.0 — the "inverted-core" redesign
 
+**Release status:** unreleased (final tag pending).
+Pre-releases: **v0.5.0-rc.1** — 2026-08-18, the API/behavior freeze and the first stable ABI-1
+baseline (see *RC1 is the first stable ABI-1 baseline* above); **v0.5.0-rc.2** — 2026-08-20,
+first tags publishing the OpenTelemetry/OpenSSL and DPDK container image families, promote-by-digest
+tag pipeline, OTel instrument-grouping fix.
+
 This release reworks the framework's core (lock-free data path, park-coordinated reconfiguration,
 typed/reflected properties, a single component ABI, a logging facade, and an overhauled REST control
 plane). The wire/JSON contract for properties is preserved, but several **C++ and REST APIs changed**.
@@ -110,14 +121,36 @@ The table below maps the old API to the new one.
 | **`GET /app/components/:id/schema`** | an ARRAY of per-property descriptors, each with a `name` field, in a bespoke vocabulary (`fields`, `choices`, `unit`, `powerOfTwo`) | a single **JSON Schema 2020-12 document**: `$schema` / `type: object` / `additionalProperties: false` / `title` (the component id) / `properties` keyed by property name. Structural keywords are standard (`properties` not `fields`, `enum` not `choices`, nested `properties`/`items`); composite metadata moved to vendor extensions — `unit` → `x-composite-unit`, `configurability` → `x-composite-configurability`, `powerOfTwo` → `x-composite-powerOfTwo`. `required` is deliberately omitted so a partial `PATCH` body validates. **The 0.5 pre-releases advertised 2020-12 export but did not actually publish it — this makes the endpoint match what the docs always claimed.** A client that walked the array looking for `name` must now index `properties` by key |
 | **Stopping** | `stop()` only — unbounded, and silent while it waited | adds a **bounded pair**: `component::request_stop()` (signals without joining the worker — it still takes the lifecycle lock and runs the user wake hook, so it is not instantaneous) and `component::try_stop(timeout) -> bool`, plus `application::try_stop(timeout)` returning a `not_stopped` list of ids. A `false`/non-empty return means **not torn down — do not destroy it**, and covers three cases: the lifecycle lock was unavailable, the worker did not exit, or a property write was still in flight; nothing is torn down, so a later `try_stop()`/`stop()` completes the job. The budget covers the lifecycle lock, the worker-exit wait and any in-flight property write, but cannot cover synchronous user hooks (`on_park_requested`, `on_worker_stop`). `stop()` itself is unchanged in behaviour but now REPORTS on an interval instead of waiting mutely, naming the component and what to look at |
 | **`POST /app/stop`** | ran the unbounded `stop()`; one component whose `process()` never returned blocked the request forever | bounded to a shared 10s budget. `200` when everything stopped, or **`207 Multi-Status`** with a `not_stopped` list. A component lands there if its worker did not exit, its lifecycle lock was unavailable, or a property write was still in flight; in every case it was not torn down and is still registered |
+| **`application::remove_component` / `DELETE /app/components/:id`** | removal always "succeeded"; if a connected peer's worker never parked, the disconnect's park-timeout exception escaped mid-unwire and the caller could destroy a component a live producer still pointed into | removal is **atomic**: if any edge cannot be quiesced (peer worker did not park within the timeout), the target is re-registered, nothing is destroyed, and the call throws (`DELETE` → 500 naming the cause). Same posture as `try_stop()`: not torn down means do not destroy; retry once the peer is stopped or has quiesced |
 | **REST: `PUT` on a single property** | `PUT` and `PATCH` both accepted on `/app/components/:id/properties/:name`, sharing one handler | **`PUT` removed; use `PATCH`** (identical behavior — the shared handler was always a merge). `PUT` was a misnomer: HTTP defines it as replace, but a `PUT` of `{"port": 5000}` onto a `{ip, port, mtu}` struct property merged and left the other fields untouched. Rather than freeze a verb that does not do what it says, it is withdrawn; it may return later as a genuine replace operation. Replace semantics are available today as `DELETE` (reset to default) followed by `PATCH` |
 | **Logging** | `spdlog::logger` exposed in the public API | `composite::logger` facade (spdlog is private); levels via `composite::log_level` |
+
+### Fixed since v0.5.0-rc.2 (2026-08-21)
+
+- **`pipeline_component` pool-stop deadlock.** `stop_pool()` wrote the stop flag and notified
+  without holding the mutex the pool worker's (unbounded) wait predicate is evaluated under — a
+  lost wakeup that left the worker asleep forever and wedged whoever joined it (a disable, stop,
+  resize, or destructor). Rare (~1% of runs under contention; two multi-hour hangs observed under
+  TSan) and invisible to a light-load pass. The flag is now written under the mutex. Verified
+  0/800 stress runs post-fix versus 2/230 pre-fix.
+- **`remove_component` made atomic on unwire failure** — see the migration row above; the
+  pre-fix behavior was a use-after-free window, not a usable contract.
+- **Paused input depths survive stacked pauses.** A worker error give-up pauses the inputs
+  (depth 0, drop-all); a subsequent operator disable used to overwrite the saved depths with that
+  0, so the re-enable "restored" 0 — the component reported running while silently discarding
+  everything, and an EOS then reported `completed`. Pauses are now idempotent, and a direct
+  `start()` (not only the `enabled` reconcile) restores saved depths.
+- **A malformed `telemetry` config block failed the load cleanly** instead of escaping `main()`
+  to `std::terminate` (the `dpdk` block already had this guard; the telemetry block was missed).
+- **Batch overflow-callback doc corrected**: the aggregate-once guarantee holds on the
+  single-consumer direct path; the fan-out fallback fires per rejected packet (see Highlights).
 
 ### Highlights
 
 - **Lock-free data path** — bounded SPSC ring ports with an event-driven doorbell (forward for data,
   reverse for backpressure); move-on-last-receiver buffer transfer; direct batched ring handoff.
-  Batch overflow callbacks run once with the aggregate rejected-packet count.
+  Batch overflow callbacks run once with the aggregate rejected-packet count on the
+  single-consumer direct path (fan-out falls back to per-buffer sends, which fire per packet).
 - **Named threads** — every thread the framework spawns carries its owner's name, so `top -H`,
   `perf` and gdb identify it: a component's worker is named after its id, and a
   `pipeline_component`'s pool workers as `<id>.wN`. Names are truncated to the 15 characters Linux
@@ -184,3 +217,52 @@ The table below maps the old API to the new one.
     error.
   - **`application::drain_stop(timeout)`** — graceful shutdown: stop the sources, let EOS propagate
     so downstream drains and self-finishes, then hard-stop any straggler.
+
+### Upgrading: check your configs first
+
+**A config file that started cleanly on 0.4 (or a 0.5 pre-release) can now FAIL to load.** Unknown
+property keys are rejected at load (see the *Unknown property keys* migration row): a stale or
+misspelled key in a component's `properties` block — previously ignored silently — now stops the
+application at startup, naming the offending key. Audit configs for leftovers of removed or renamed
+properties before upgrading; a known example in the wild is a `"max_packet_size"` key on
+`udp_source` (the real receive-size override is `"overrides": {"msg_size": ...}`). Application-level
+globals still work: they are filtered per component, and a global matching no component warns
+instead of failing.
+
+### Feature verification status (framework, v0.5.0)
+
+Derived from what CI actually runs — see *Supported toolchains* above for the environments.
+
+| Feature | Status |
+|---|---|
+| Core dataflow (ports, buffers, lifecycle, park), properties/`config<T>`, component ABI/loader | **Fully gated** — unit + integration tests under Debug/Werror, Release, ASan+UBSan, TSan |
+| REST control plane, JSON Schema export, metrics registry + SSE | **Fully gated** — includes live-server integration tests and an OpenAPI drift guard |
+| OpenSSL TLS (server-auth and mutual) | **Tested** — built and ctest-run in the options matrix at the shipped OpenSSL pin |
+| OpenTelemetry OTLP export | **Tested** — built and ctest-run at the shipped opentelemetry-cpp pin, including sanitized (ASan+UBSan, TSan) matrix entries |
+| DPDK integration (`dpdk_manager`) | **Compile-verified only** — no NIC or hugepages in CI; the EAL-free bookkeeping it delegates to is unit-tested. Treat runtime behavior as experimental until a hardware qualification run is recorded |
+| arm64 / weak-memory architectures | **Not verified** — see *Supported toolchains* |
+| Clang / libc++ | **Not verified** — no Clang job exists |
+
+### What to exercise in an RC (and what not to evaluate)
+
+RC adopters get the most value exercising: the property system end to end (typed writes over REST,
+validation rejections, `config<T>` reactions under load), lifecycle edges (disable/enable cycles,
+`try_stop` on busy graphs, component removal while connected), completion semantics (EOS-driven
+self-finish on batch/file graphs), and metrics/SSE + OTLP export under sustained load. Do **not**
+evaluate on this RC: DPDK runtime behavior (compile-verified only), arm64 (unverified), or Clang
+builds (unverified) — findings there are expected and not regressions.
+
+### Known issues (v0.5.0)
+
+- **An open SSE metrics stream can delay shutdown** by up to its `interval` (max 60 s): the
+  stream's inter-event wait watches client liveness but cannot observe server shutdown, so SIGTERM
+  waits out the current interval. With container grace periods shorter than the interval, the
+  process is SIGKILLed past its telemetry/DPDK teardown. Keep stream intervals short, or stop
+  streams before shutdown. Fix slated for 0.5.x.
+- **Components created via `POST /app/components` diverge from config-loaded ones**: the REST path
+  does not apply `cpu_affinity`, does not propagate the CLI log level, and does not call
+  `initialize()`. Components relying on any of those should be declared in the config file for
+  now. Fix slated for 0.5.x.
+- **Fan-out batch sends invoke the overflow callback per rejected packet** rather than once per
+  batch (single-consumer direct sends aggregate as documented). Callbacks doing per-invocation
+  work should be written accordingly. Aggregation on the fan-out path is slated for 0.5.x.

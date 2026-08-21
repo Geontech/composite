@@ -212,8 +212,10 @@ public:
      * may accept only a PREFIX of the batch; the rejected suffix is released as well —
      * every element of @p bufs is left in a moved-from (empty) state on return, and the
      * caller must not read the buffers back. Rejection is not silent: the drop is counted
-     * in the input's packet-drop statistics and the overflow callback fires ONCE for the
-     * batch with the aggregate rejected-packet count.
+     * in the input's packet-drop statistics. On the single-immutable-consumer direct path
+     * the overflow callback fires ONCE for the batch with the aggregate rejected-packet
+     * count; on the per-buffer fallback (fan-out, or a mutable consumer) it fires per
+     * rejected packet, exactly as scalar send_data() does.
      *
      * Every admitted packet carries the same @p ts and the same metadata instance.
      *
@@ -418,8 +420,10 @@ public:
      * admitted. The port is bounded, so admission may accept only a PREFIX; the rejected
      * suffix is released as well — every element of @p bufs is left in a moved-from
      * (empty) state on return, and the caller must not read the buffers back. Rejection
-     * is counted in the input's packet-drop statistics, and the overflow callback fires
-     * ONCE for the batch with the aggregate rejected-packet count.
+     * is counted in the input's packet-drop statistics. On the single-consumer direct
+     * path (moved for mutable, promoted for immutable) the overflow callback fires ONCE
+     * for the batch with the aggregate rejected-packet count; on the per-buffer fan-out
+     * fallback it fires per rejected packet, exactly as scalar send_data() does.
      *
      * Every admitted packet carries the same @p ts and the same metadata instance.
      *
