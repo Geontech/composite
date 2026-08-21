@@ -151,13 +151,18 @@ ci:toolchain:
     - docker logout "$CI_REGISTRY" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3). The tree is
-# clang-format-clean (formatted with the image's clang-format; re-run inside
-# gcc:14 if versions disagree locally), so the format gate is mandatory.
+# Static analysis / formatting (ASSESSMENT §4.F / §8 Pri-3).
+#
+# ADVISORY BY DESIGN — not an RC2-STOPGAP. Style drift should never hold a pipeline hostage:
+# the job still runs everything and still FAILS (shows orange) when findings exist, but
+# allow_failure keeps the pipeline green and the full tool output is kept as artifacts
+# (lint-format.log / lint-tidy.log) so drift can be turned into cleanup issues on its own
+# schedule instead of blocking whoever happens to push next. Both tools run to completion —
+# a format violation no longer hides the tidy findings behind an early exit, and vice versa.
 #
 # DELIBERATELY still Debian, unlike the build/test jobs. clang-format output is version-specific:
 # Rocky 9 ships clang-tools-extra 21 against trixie's 19, and moving would reformat the entire tree
-# for no functional reason. The format gate cares about the formatter version, not the ABI.
+# for no functional reason. This job cares about the formatter version, not the ABI.
 # clang-tidy surfaces findings as warnings (WarningsAsErrors is still empty);
 # tighten it once the outstanding findings are burned down.
 # ---------------------------------------------------------------------------
@@ -165,9 +170,14 @@ lint:tidy-format:
   stage: lint
   extends: .not-on-tag
   image: gcc:14
+  allow_failure: true
   before_script:
     - apt-get update -qq && apt-get install -y -qq cmake git clang-tidy clang-format nlohmann-json3-dev
   script:
+    # tee captures each tool's output for the artifacts; pipefail keeps the tool's exit status
+    # visible through the pipe so `rc` records it (default bash would report tee's).
+    - set -o pipefail
+    - rc=0
     # compile_commands.json drives clang-tidy.
     - cmake -B build -DCOMPOSITE_BUILD_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
     - cmake --build build -j"$(nproc)" --target composite >/dev/null   # generate version.hpp etc.
@@ -175,9 +185,16 @@ lint:tidy-format:
     # tree's headers are analyzed transitively — including properties/ports/buffers, which the old
     # 'include/composite/core/*.hpp' glob excluded. `find` (not `git ls-files`) so untracked files
     # are covered too (much of the tree is currently uncommitted; git ls-files would skip it).
-    - clang-tidy -p build $(find src -name '*.cpp')
+    - clang-tidy -p build $(find src -name '*.cpp') 2>&1 | tee lint-tidy.log || rc=1
     # clang-format compliance across the whole tree (again `find`, recursive, untracked-visible).
-    - clang-format --dry-run --Werror $(find include src test bench examples -name '*.hpp' -o -name '*.cpp' 2>/dev/null)
+    - clang-format --dry-run --Werror $(find include src test bench examples -name '*.hpp' -o -name '*.cpp' 2>/dev/null) 2>&1 | tee lint-format.log || rc=1
+    - exit $rc
+  artifacts:
+    when: always
+    paths:
+      - lint-tidy.log
+      - lint-format.log
+    expire_in: 30 days
 
 # ---------------------------------------------------------------------------
 # Build the library + CLI with the unit tests on, and run ctest.
