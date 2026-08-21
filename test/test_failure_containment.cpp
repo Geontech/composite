@@ -1212,6 +1212,140 @@ int main() {
         check(c.try_stop(std::chrono::seconds(5)), "worker exit: a later stop still completes");
     }
 
+    // ---- (24) stacked pauses must not clobber the saved input depths with 0 ----
+    // A worker error give-up pauses the inputs (depth -> 0) with no matching resume. The
+    // natural operator remediation — disable, then re-enable — pauses AGAIN; if that second
+    // pause overwrites the saved depth with the already-paused 0, the re-enable "restores" 0
+    // and the component runs while silently discarding everything.
+    {
+        class giveup_comp : public component {
+        public:
+            explicit giveup_comp(std::string_view id) : component(id) { add_port(m_in); }
+            auto process() -> retval override {
+                if (auto pkt = m_in.try_get()) {
+                    if (!m_threw.exchange(true)) {
+                        throw std::runtime_error("first packet: boom"); // error_restart_max=0 -> give up
+                    }
+                    m_got.fetch_add(1, std::memory_order_acq_rel);
+                }
+                return retval::NOOP;
+            }
+            input_port<immutable_buffer<float>> m_in{"in", 8};
+            std::atomic<bool> m_threw{false};
+            std::atomic<int> m_got{0};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        giveup_comp c{"pauseclobber"};
+        output_port<immutable_buffer<float>> out{"out"};
+        check(out.connect(&c.m_in), "pause-clobber: connected the feeding output");
+        c.start();
+        out.send_data(make_immutable<float>(1), timestamp{}); // first packet -> throw -> give up
+        check(c.wait_until_finished(std::chrono::seconds(5)), "pause-clobber: worker gave up on the first error");
+        check(c.finished_reason() == finish_reason::error, "pause-clobber: give-up is reported as an error finish");
+
+        // Remediate the way an operator would: disable (second pause), then re-enable.
+        c.set_properties(json{{"enabled", false}}, config_type::RUNTIME);
+        c.set_properties(json{{"enabled", true}}, config_type::RUNTIME);
+
+        for (int i = 0; i < 4; ++i) {
+            out.send_data(make_immutable<float>(1), timestamp{});
+        }
+        check(wait_until([&] { return c.m_got.load(std::memory_order_acquire) >= 4; }, std::chrono::seconds(2)),
+              "pause-clobber: the re-enabled component RECEIVES data (restore did not re-apply the paused 0)");
+        c.stop();
+    }
+
+    // ---- (25) a direct start() after a give-up must resume the paused inputs ----
+    // Same give-up pause, but restarted through the public start() (embedders that do not drive
+    // `enabled`). start() must restore the saved depths — a worker running against inputs still
+    // at depth 0 silently discards while the component reports running.
+    {
+        class giveup_comp2 : public component {
+        public:
+            explicit giveup_comp2(std::string_view id) : component(id) { add_port(m_in); }
+            auto process() -> retval override {
+                if (auto pkt = m_in.try_get()) {
+                    if (!m_threw.exchange(true)) {
+                        throw std::runtime_error("first packet: boom");
+                    }
+                    m_got.fetch_add(1, std::memory_order_acq_rel);
+                }
+                return retval::NOOP;
+            }
+            input_port<immutable_buffer<float>> m_in{"in", 8};
+            std::atomic<bool> m_threw{false};
+            std::atomic<int> m_got{0};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        giveup_comp2 c{"giveupstart"};
+        output_port<immutable_buffer<float>> out{"out"};
+        check(out.connect(&c.m_in), "give-up restart: connected the feeding output");
+        c.start();
+        out.send_data(make_immutable<float>(1), timestamp{});
+        check(c.wait_until_finished(std::chrono::seconds(5)), "give-up restart: worker gave up on the first error");
+
+        c.start(); // direct restart — no reconcile in the path
+        for (int i = 0; i < 4; ++i) {
+            out.send_data(make_immutable<float>(1), timestamp{});
+        }
+        check(wait_until([&] { return c.m_got.load(std::memory_order_acquire) >= 4; }, std::chrono::seconds(2)),
+              "give-up restart: direct start() resumed the paused inputs (data flows again)");
+        c.stop();
+    }
+
+    // ---- (26) remove_component() must not hand over a target a live producer still points into ----
+    // disconnect() parks the producer's worker; a wedged producer makes that park TIME OUT and
+    // throw. The removal must then fail atomically — target re-registered, NOT returned for
+    // destruction (the caller dropping the last reference with a live edge into the target's
+    // rings is a use-after-free on the producer's next send) — and a retry after the producer
+    // quiesces must complete.
+    {
+        class wedged_producer : public component {
+        public:
+            explicit wedged_producer(std::string_view id) : component(id) { add_port(m_out); }
+            auto process() -> retval override {
+                m_entered.store(true, std::memory_order_release);
+                while (!m_release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // ignores park requests
+                }
+                return retval::NOOP;
+            }
+            output_port<immutable_buffer<float>> m_out{"out"};
+            std::atomic<bool> m_entered{false};
+            std::atomic<bool> m_release{false};
+            component::auto_stop m_auto_stop{*this};
+        };
+
+        application app{"remove_wedged"};
+        auto prod = std::make_shared<wedged_producer>("wp");
+        auto cons = std::make_shared<consumer_comp>("victim");
+        app.add_component(prod);
+        app.add_component(cons);
+        check(prod->connect("out", cons, "in"), "unremovable: connected wp->victim");
+        prod->start();
+        check(wait_until([&] { return prod->m_entered.load(std::memory_order_acquire); }, std::chrono::seconds(2)),
+              "unremovable: producer is wedged inside process()");
+
+        bool threw = false;
+        try {
+            auto removed = app.remove_component("victim"); // park times out (~5s) -> must fail atomically
+            (void)removed;
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(threw, "unremovable: removal with a wedged producer FAILS loudly instead of returning the target");
+        check(app.components().size() == 2, "unremovable: the target is still REGISTERED (not lost, retryable)");
+
+        // Producer quiesces; the retry must now complete and actually remove.
+        prod->m_release.store(true, std::memory_order_release);
+        prod->stop();
+        auto removed = app.remove_component("victim");
+        check(removed != nullptr, "unremovable: retry after the producer quiesced removed the component");
+        check(app.components().size() == 1, "unremovable: registry reflects the completed removal");
+    }
+
     if (g_fails != 0) {
         std::fprintf(stderr, "%d containment check(s) FAILED\n", g_fails);
         return 1;

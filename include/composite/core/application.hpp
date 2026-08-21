@@ -8,6 +8,7 @@
 #include "component.hpp"
 #include "lifecycle.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -348,6 +349,12 @@ public:
      *
      * @param id The id of the component to remove.
      * @return The removed component (sole remaining owner), or nullptr if not found.
+     * @throws std::runtime_error if an edge could not be quiesced (a connected peer's worker
+     *         did not park within the timeout). The component is stopped but NOT destroyed:
+     *         it is re-registered (or retained internally if its id was re-taken meanwhile),
+     *         because returning it for destruction with a live edge into its rings would be a
+     *         use-after-free on the peer's next send. Same posture as try_stop(): not torn
+     *         down means do not destroy; retry once the peer quiesces.
      */
     auto remove_component(std::string_view id) -> component_ptr {
         // Serialize against connect/disconnect: held across the whole teardown so no edge
@@ -381,17 +388,66 @@ public:
         // Disconnect every peer-producer edge feeding the target's inputs. disconnect()
         // parks the producer's worker, so the producer is not mid-send when the target's
         // input releases its producer-claim.
+        // CONTAINED per edge: with_worker_parked() throws on a park timeout or a closed
+        // admission gate, and an escape here unwinds past the return — destroying the target
+        // (the registry entry is already erased) while the remaining peers still hold edges
+        // into its rings. One unresponsive producer must not abandon the other edges; whether
+        // EVERY edge came off decides below if the removal may complete at all.
+        bool unwired = true;
         for (auto& producer : others) {
             for (const auto& c : producer->connections()) {
                 if (c.input.first == target->id()) {
-                    producer->disconnect(c.output.second, target, c.input.second);
+                    try {
+                        producer->disconnect(c.output.second, target, c.input.second);
+                    } catch (const std::exception& ex) {
+                        unwired = false;
+                        producer->logger()->error("remove_component('{}'): disconnecting producer '{}' failed: {}",
+                                                  target->id(), producer->id(), ex.what());
+                    } catch (...) {
+                        unwired = false;
+                        producer->logger()->error("remove_component('{}'): disconnecting producer '{}' failed",
+                                                  target->id(), producer->id());
+                    }
                 }
             }
         }
-        // Disconnect the target's own outputs from downstream consumers (target is stopped,
-        // so its worker park is trivial). Redundant calls per fan-out output port are no-ops.
+        // Disconnect the target's own outputs from downstream consumers (trivial when the target
+        // stopped; the same park timeout applies if it did not). Redundant calls per fan-out
+        // output port are no-ops.
         for (const auto& c : target->connections()) {
-            target->disconnect_all(c.output.second);
+            try {
+                target->disconnect_all(c.output.second);
+            } catch (const std::exception& ex) {
+                unwired = false;
+                target->logger()->error("remove_component('{}'): disconnecting output '{}' failed: {}", target->id(),
+                                        c.output.second, ex.what());
+            } catch (...) {
+                unwired = false;
+                target->logger()->error("remove_component('{}'): disconnecting output '{}' failed", target->id(),
+                                        c.output.second);
+            }
+        }
+        if (!unwired) {
+            // The removal cannot complete: an edge is still live, so handing the last reference
+            // to the caller destroys a component a running peer still points into. Put the
+            // target back (the topology lock has kept new edges out the whole time; only a
+            // concurrent add_component() could have re-taken the id, in which case the target
+            // is retained internally so it simply cannot be destroyed). Stopped-but-registered
+            // is the same posture a false try_stop() leaves: not torn down, do not destroy.
+            {
+                std::unique_lock lk{m_mtx};
+                const bool id_free =
+                    std::none_of(m_components.begin(), m_components.end(),
+                                 [&](const component_ptr& c) { return c->id() == target->id(); });
+                if (id_free) {
+                    m_components.push_back(target);
+                } else {
+                    m_unremovable.push_back(target);
+                }
+            }
+            throw std::runtime_error("cannot remove component '" + target->id() +
+                                     "': a connected edge could not be quiesced (peer worker did not park); the "
+                                     "component was stopped but was NOT destroyed — retry once the peer is stopped");
         }
         return target;
     }
@@ -427,6 +483,9 @@ private:
     mutable std::shared_mutex m_mtx;   ///< Guards m_components (readers shared, mutators unique).
     mutable std::mutex m_topology_mtx; ///< Serializes edge mutation (connect/disconnect/remove); see topology_lock().
     std::vector<component_ptr> m_components; ///< Components managed by this application.
+    /// Components whose removal failed to unwire while a concurrent add re-took their id: kept
+    /// alive (never destroyed while a peer holds an edge into them), invisible to lookups.
+    std::vector<component_ptr> m_unremovable;
 
 }; // class application
 

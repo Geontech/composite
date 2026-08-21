@@ -1359,14 +1359,18 @@ private:
 
     auto pause_input_ports() -> void {
         const std::scoped_lock depths{m_saved_depths_mtx}; // worker vs. lifecycle thread
-        m_saved_input_depths.clear();
         for (const auto& [name, port] : m_port_set.ports()) {
             if (auto* input_port = dynamic_cast<input_port_base*>(port)) {
-                // Save current depth
-                m_saved_input_depths[name] = input_port->depth();
+                // Save the current depth — but never OVERWRITE one saved by an earlier pause
+                // that resume_input_ports() has not yet consumed. Pauses can stack (a worker
+                // error give-up followed by an operator disable), and clobbering the saved
+                // value with the already-paused 0 would make the eventual resume "restore" 0:
+                // the component would report running while every input silently discards.
+                const auto [it, saved] = m_saved_input_depths.emplace(name, input_port->depth());
                 // Set to 0 to drop all incoming data
                 input_port->depth(0);
-                logger()->debug("Paused input port '{}' (saved depth: {})", name, m_saved_input_depths[name]);
+                logger()->debug("Paused input port '{}' ({} depth: {})", name, saved ? "saved" : "kept earlier saved",
+                                it->second);
             }
         }
     }
@@ -1469,6 +1473,12 @@ private:
                 out->reopen();
             }
         }
+        // Restore any depths a prior pause saved (worker error give-up pauses without a matching
+        // resume). A no-op when nothing is saved. Without this, a direct start() after a give-up
+        // runs the worker against inputs still at depth 0 — every packet silently discarded while
+        // the component reports running. The reconcile path resumes before calling here; that
+        // makes this call a no-op there, not a double-restore (resume clears the saved map).
+        resume_input_ports();
         // m_worker_done=false BEFORE we spawn, so the worker's exit (which sets it true) is always
         // ordered after this reset even if the worker exits immediately.
         {
