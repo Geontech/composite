@@ -400,6 +400,60 @@ TEST_CASE_METHOD(rest_fixture, "POST app start/stop", "[http]") {
     REQUIRE(start->status == 200);
 }
 
+// The 207 path is the REASON POST /app/stop became bounded — a wedged process() must not take
+// the control plane down with it — but until now only the 200 path was exercised over HTTP.
+// A component that ignores the stop token wedges the stop; the route must answer 207 with the
+// component named in `not_stopped`, tear nothing down, and let a retry succeed once it clears.
+TEST_CASE_METHOD(rest_fixture, "POST app stop: wedged component -> 207 not_stopped, retry -> 200", "[http]") {
+    class wedge_component : public component {
+    public:
+        explicit wedge_component(std::string_view id) : component(id) {}
+        auto process() -> retval override {
+            m_entered.store(true, std::memory_order_release);
+            while (!m_release.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(50ms); // deliberately ignores the stop token
+            }
+            return retval::NOOP;
+        }
+        std::atomic<bool> m_entered{false};
+        std::atomic<bool> m_release{false};
+        component::auto_stop m_auto_stop{*this};
+    };
+
+    auto wedge = std::make_shared<wedge_component>("wedge");
+    m_app.add_component(wedge);
+
+    auto cli = client();
+    // The stop budget is 10s server-side; httplib's default 5s read timeout would abort the
+    // request client-side and this test would dereference a null response.
+    cli.set_read_timeout(60, 0);
+
+    auto start = cli.Post("/app/start");
+    REQUIRE(start);
+    REQUIRE(start->status == 200);
+    // The wedge must be INSIDE process() before the stop is issued, or its worker would observe
+    // the stop token at the loop top and exit cleanly (a 200, and no test).
+    for (int i = 0; i < 400 && !wedge->m_entered.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE(wedge->m_entered.load(std::memory_order_acquire));
+
+    auto stop = cli.Post("/app/stop");
+    REQUIRE(stop);
+    REQUIRE(stop->status == 207); // partial: everything but the wedge stopped
+    auto body = json::parse(stop->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE(body.contains("not_stopped"));
+    REQUIRE(body["not_stopped"].get<std::vector<std::string>>() == std::vector<std::string>{"wedge"});
+
+    // Nothing was torn down (the contract behind the 207): once the wedge clears, a plain retry
+    // completes and reports full success.
+    wedge->m_release.store(true, std::memory_order_release);
+    auto retry = cli.Post("/app/stop");
+    REQUIRE(retry);
+    REQUIRE(retry->status == 200);
+}
+
 // GET /app/openapi.json serves a well-formed OpenAPI 3.1 doc whose path+method set exactly
 // matches the expected REST surface — a drift guard so a route added/removed without updating
 // rest_catalog() (or this list) fails CI.
