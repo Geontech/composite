@@ -411,15 +411,24 @@ auto main(int argc, char** argv) -> int {
         telemetry_initialized = false;
     };
 
-    if (app_json.contains("telemetry") && app_json["telemetry"].value("enabled", false)) {
-        spdlog::debug("initializing OpenTelemetry");
-        auto telemetry_cfg = composite::parse_telemetry_config(app_json["telemetry"]);
-        if (!composite::telemetry::manager::instance().initialize(telemetry_cfg)) {
-            spdlog::error("failed to initialize OpenTelemetry");
-            shutdown_dpdk();
-            return EXIT_FAILURE;
+    // Guard the telemetry-config read + parse, same as the dpdk block above: a malformed
+    // telemetry block (non-object, non-boolean "enabled", wrong-typed field) throws
+    // nlohmann::json::type_error, which would otherwise escape main() -> std::terminate.
+    try {
+        if (app_json.contains("telemetry") && app_json["telemetry"].value("enabled", false)) {
+            spdlog::debug("initializing OpenTelemetry");
+            auto telemetry_cfg = composite::parse_telemetry_config(app_json["telemetry"]);
+            if (!composite::telemetry::manager::instance().initialize(telemetry_cfg)) {
+                spdlog::error("failed to initialize OpenTelemetry");
+                shutdown_dpdk();
+                return EXIT_FAILURE;
+            }
+            telemetry_initialized = true;
         }
-        telemetry_initialized = true;
+    } catch (const std::exception& e) {
+        spdlog::error("invalid telemetry configuration: {}", e.what());
+        shutdown_dpdk();
+        return EXIT_FAILURE;
     }
 #else
     auto shutdown_telemetry = []() {};
