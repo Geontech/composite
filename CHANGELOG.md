@@ -17,12 +17,7 @@ All notable changes to **composite** are documented here. The project follows
   objects, so build them with the *same* compiler and standard library as the framework — the
   ABI handshake below does not detect a mismatch.
   - **Gating, on every pipeline:** **Rocky 9** with **GCC Toolset 14** and **libstdc++**, on
-    **x86-64** — glibc 2.34.
-    *Temporary exception (2026-08-20, delete this note with the stopgap):* the test and sanitizer
-    jobs are currently `allow_failure: true` (`grep RC2-STOPGAP .gitlab-ci.yml`) so a red test could
-    not block publishing the first OpenTelemetry/DPDK images. While those lines exist this bullet
-    describes intent, not enforcement; they must be removed — after one unaided green pipeline —
-    before v0.5.0 final is tagged. This is deliberately the *exact* environment the published container
+    **x86-64** — glibc 2.34. This is deliberately the *exact* environment the published container
     images are built in, down to the pinned `nlohmann_json` and `opentelemetry-cpp` revisions,
     because the paragraph above is only meaningful if the ABI under test is the ABI being shipped.
     Until v0.5 the gate ran on Debian trixie (GCC 14.4, glibc 2.41, Debian's opentelemetry-cpp
@@ -77,11 +72,14 @@ All notable changes to **composite** are documented here. The project follows
 
 ## 0.5.0 — the "inverted-core" redesign
 
-**Release status:** unreleased (final tag pending).
+**Released:** 2026-08-21 (v0.5.0).
 Pre-releases: **v0.5.0-rc.1** — 2026-08-18, the API/behavior freeze and the first stable ABI-1
 baseline (see *RC1 is the first stable ABI-1 baseline* above); **v0.5.0-rc.2** — 2026-08-20,
 first tags publishing the OpenTelemetry/OpenSSL and DPDK container image families, promote-by-digest
-tag pipeline, OTel instrument-grouping fix.
+tag pipeline, OTel instrument-grouping fix; **v0.5.0-rc.3** — 2026-08-21, the rc.2→final fixes
+below (pool-stop deadlock, atomic removal, paused-depth restore) plus the release documentation.
+The final tag differs from rc.3 only by re-arming the CI gates (the RC2-era `allow_failure`
+stopgap was removed once a pipeline ran green unaided) and this heading.
 
 This release reworks the framework's core (lock-free data path, park-coordinated reconfiguration,
 typed/reflected properties, a single component ABI, a logging facade, and an overhauled REST control
