@@ -5,6 +5,7 @@
 
 #include "composite/core/application.hpp"
 #include "composite/metrics/metrics.hpp"
+#include "composite/metrics/prometheus.hpp"
 #include "composite/properties/serialization.hpp"
 
 #include "helpers.hpp"
@@ -20,6 +21,7 @@
 #include <spdlog/spdlog.h>
 #include <thread>
 #include <variant>
+#include <vector>
 
 namespace composite {
 
@@ -388,6 +390,22 @@ auto make_server(application& app, composite::component_handles_type& handles) -
                 return true;  // Continue streaming
             }
         );
+    });
+
+    // GET /metrics - Prometheus text exposition (scrape target)
+    //
+    // Deliberately at the root rather than under /app: /metrics is the
+    // conventional scrape path, so a Prometheus PodMonitor or ServiceMonitor
+    // needs no path override. Same registry as /app/metrics, different format.
+    server->Get("/metrics", [](const httplib::Request& req, httplib::Response& res) {
+        auto& registry = metrics::registry::instance();
+        auto snapshots = req.has_param("prefix")
+            ? registry.snapshot_by_prefix(req.get_param_value("prefix"))
+            : registry.snapshot_all();
+        res.set_content(
+            metrics::to_prometheus(snapshots),
+            "text/plain; version=0.0.4; charset=utf-8");
+        res.status = httplib::OK_200;
     });
 
     // GET application

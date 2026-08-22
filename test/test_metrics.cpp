@@ -21,8 +21,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "composite/core/stage_stats.hpp"
 #include "composite/metrics/metrics.hpp"
+#include "composite/metrics/prometheus.hpp"
 
+#include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1234,4 +1238,240 @@ TEST_CASE("Deregistration observer notifications", "[metrics][registry][removal]
 
         registry::instance().remove_deregistration_observer(observer_id);
     }
+}
+
+// ============================================================================
+// Prometheus Text Exposition
+// ============================================================================
+
+namespace {
+
+/// True if `text` contains `needle` as a complete line.
+auto has_line(const std::string& text, const std::string& needle) -> bool {
+    if (text.starts_with(needle + "\n")) {
+        return true;
+    }
+    return text.find("\n" + needle + "\n") != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("Prometheus name mapping", "[prometheus]") {
+    SECTION("Dots become underscores and counters gain _total") {
+        auto snap = metric_snapshot{
+            "composite.port.packets_transferred", "", "1",
+            metric_type::counter, {}, uint64_t{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(snap) == "composite_port_packets_transferred_total");
+    }
+
+    SECTION("Unit suffix is skipped when the name already carries it") {
+        // "bytes_transferred" already says bytes, so unit "By" must not append
+        // a second "_bytes".
+        auto snap = metric_snapshot{
+            "composite.port.bytes_transferred", "", "By",
+            metric_type::counter, {}, uint64_t{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(snap) == "composite_port_bytes_transferred_total");
+    }
+
+    SECTION("Unit suffix is appended when the name lacks it") {
+        auto snap = metric_snapshot{
+            "composite.stage.busy", "", "ns",
+            metric_type::counter, {}, uint64_t{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(snap) == "composite_stage_busy_nanoseconds_total");
+    }
+
+    SECTION("Non-counters do not gain _total") {
+        auto gauge_snap = metric_snapshot{
+            "composite.stage.queue_depth", "", "1",
+            metric_type::gauge, {}, double{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(gauge_snap) == "composite_stage_queue_depth");
+
+        auto hist_snap = metric_snapshot{
+            "composite.stage.process_duration", "", "s",
+            metric_type::histogram, {}, histogram_snapshot{}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(hist_snap) == "composite_stage_process_duration_seconds");
+    }
+
+    SECTION("Unit suffix is skipped when the name uses the abbreviation") {
+        // Regression: the long-form check alone turned "lettuce.cell_cfo_hz"
+        // with unit "Hz" into "lettuce_cell_cfo_hz_hertz", which no dashboard
+        // query written against the obvious name would ever match.
+        auto snap = metric_snapshot{
+            "lettuce.cell_cfo_hz", "", "Hz",
+            metric_type::gauge, {}, double{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(snap) == "lettuce_cell_cfo_hz");
+    }
+
+    SECTION("A genuinely absent unit is still appended") {
+        auto snap = metric_snapshot{
+            "some.latency", "", "ms",
+            metric_type::gauge, {}, double{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(snap) == "some_latency_milliseconds");
+    }
+
+    SECTION("A name already ending in _total is not doubled") {
+        auto snap = metric_snapshot{
+            "some.errors_total", "", "1",
+            metric_type::counter, {}, uint64_t{0}, {}
+        };
+        REQUIRE(composite::metrics::prometheus_name(snap) == "some_errors_total");
+    }
+}
+
+TEST_CASE("Prometheus exposition format", "[prometheus]") {
+    registry::instance().remove_by_prefix("promtest.");
+
+    SECTION("HELP and TYPE are emitted once for a multi-label family") {
+        auto& a = registry::instance().get_or_create_counter(
+            "promtest.packets", "Packets seen", "1", {{"port", "in"}});
+        auto& b = registry::instance().get_or_create_counter(
+            "promtest.packets", "Packets seen", "1", {{"port", "out"}});
+        a.add(3);
+        b.add(5);
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("promtest."));
+
+        // Exactly one HELP/TYPE pair, but a line per label set.
+        REQUIRE(has_line(text, "# HELP promtest_packets_total Packets seen"));
+        REQUIRE(has_line(text, "# TYPE promtest_packets_total counter"));
+        REQUIRE(text.find("# TYPE promtest_packets_total") == text.rfind("# TYPE promtest_packets_total"));
+        REQUIRE(has_line(text, "promtest_packets_total{port=\"in\"} 3"));
+        REQUIRE(has_line(text, "promtest_packets_total{port=\"out\"} 5"));
+    }
+
+    SECTION("updown_counter is exposed as a gauge") {
+        // Non-monotonic, so declaring it a counter would invite a rate() that
+        // silently discards the decrements.
+        auto& q = registry::instance().get_or_create_updown_counter(
+            "promtest.inflight", "In-flight requests", "1");
+        q.add(4);
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("promtest.inflight"));
+        REQUIRE(has_line(text, "# TYPE promtest_inflight gauge"));
+        REQUIRE(has_line(text, "promtest_inflight 4"));
+    }
+
+    SECTION("Histogram buckets are cumulative and le-bounded") {
+        auto& h = registry::instance().get_or_create_histogram(
+            "promtest.latency", "Latency", "s", {0.001, 0.01, 0.1});
+        h.record(0.0005);  // bucket 0
+        h.record(0.005);   // bucket 1
+        h.record(0.5);     // overflow
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("promtest.latency"));
+
+        REQUIRE(has_line(text, "# TYPE promtest_latency_seconds histogram"));
+        REQUIRE(has_line(text, "promtest_latency_seconds_bucket{le=\"0.001\"} 1"));
+        REQUIRE(has_line(text, "promtest_latency_seconds_bucket{le=\"0.01\"} 2"));
+        REQUIRE(has_line(text, "promtest_latency_seconds_bucket{le=\"0.1\"} 2"));
+        REQUIRE(has_line(text, "promtest_latency_seconds_bucket{le=\"+Inf\"} 3"));
+        REQUIRE(has_line(text, "promtest_latency_seconds_count 3"));
+    }
+
+    SECTION("Small boundaries avoid exponent notation") {
+        // `le` is matched as a string, so "1e-04" would not answer a query
+        // written against the conventional "0.0001".
+        auto& h = registry::instance().get_or_create_histogram(
+            "promtest.tiny", "Tiny", "s", {0.0001, 1.0});
+        h.record(0.00005);
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("promtest.tiny"));
+        REQUIRE(text.find("le=\"0.0001\"") != std::string::npos);
+        REQUIRE(text.find("le=\"1e-04\"") == std::string::npos);
+        REQUIRE(text.find("le=\"1\"") != std::string::npos);
+    }
+
+    SECTION("Label values are escaped") {
+        auto& c = registry::instance().get_or_create_counter(
+            "promtest.escaped", "Escaping", "1", {{"note", "a\"b\\c"}});
+        c.add(1);
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("promtest.escaped"));
+        REQUIRE(has_line(text, "promtest_escaped_total{note=\"a\\\"b\\\\c\"} 1"));
+    }
+
+    registry::instance().remove_by_prefix("promtest.");
+}
+
+// ============================================================================
+// stage_stats
+// ============================================================================
+
+TEST_CASE("stage_stats records a stage's throughput", "[stage_stats]") {
+    registry::instance().remove_by_prefix("composite.stage.");
+
+    static constexpr std::string_view reasons[] = {"no_sync", "empty"};
+    composite::stage_stats stats;
+    REQUIRE_FALSE(stats.is_registered());
+    stats.register_metrics("test_stage", reasons);
+    REQUIRE(stats.is_registered());
+
+    SECTION("record() advances frames, samples, busy, and kernel") {
+        stats.record(512000, 614400,
+                     std::chrono::nanoseconds{20'000'000},
+                     std::chrono::nanoseconds{19'000'000});
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("composite.stage."));
+        const auto id = std::string{"{component_id=\"test_stage\"}"};
+
+        REQUIRE(has_line(text, "composite_stage_frames_in_total" + id + " 1"));
+        REQUIRE(has_line(text, "composite_stage_frames_out_total" + id + " 1"));
+        REQUIRE(has_line(text, "composite_stage_samples_in_total" + id + " 512000"));
+        REQUIRE(has_line(text, "composite_stage_samples_out_total" + id + " 614400"));
+        REQUIRE(has_line(text, "composite_stage_busy_nanoseconds_total" + id + " 20000000"));
+        REQUIRE(has_line(text, "composite_stage_kernel_nanoseconds_total" + id + " 19000000"));
+    }
+
+    SECTION("record_drop() counts the input but not an output") {
+        stats.record_drop("no_sync");
+        stats.record_drop("no_sync");
+        stats.record_drop("empty");
+
+        const auto text = composite::metrics::to_prometheus(
+            registry::instance().snapshot_by_prefix("composite.stage."));
+
+        REQUIRE(has_line(text, "composite_stage_frames_in_total{component_id=\"test_stage\"} 3"));
+        REQUIRE(has_line(text, "composite_stage_frames_out_total{component_id=\"test_stage\"} 0"));
+        REQUIRE(has_line(
+            text,
+            "composite_stage_frames_dropped_total{component_id=\"test_stage\",reason=\"no_sync\"} 2"));
+        REQUIRE(has_line(
+            text,
+            "composite_stage_frames_dropped_total{component_id=\"test_stage\",reason=\"empty\"} 1"));
+    }
+
+    SECTION("An unregistered drop reason does not grow the registry") {
+        const auto before = registry::instance().snapshot_by_prefix("composite.stage.").size();
+        stats.record_drop("typo_reason");
+        const auto after = registry::instance().snapshot_by_prefix("composite.stage.").size();
+        REQUIRE(after == before);
+        // The input is still counted, so the frame is not lost from the totals.
+        REQUIRE(has_line(
+            composite::metrics::to_prometheus(
+                registry::instance().snapshot_by_prefix("composite.stage.")),
+            "composite_stage_frames_in_total{component_id=\"test_stage\"} 1"));
+    }
+
+    SECTION("register_metrics() is idempotent") {
+        const auto before = registry::instance().snapshot_by_prefix("composite.stage.").size();
+        composite::stage_stats again;
+        again.register_metrics("test_stage", reasons);
+        const auto after = registry::instance().snapshot_by_prefix("composite.stage.").size();
+        REQUIRE(after == before);
+    }
+
+    registry::instance().remove_by_prefix("composite.stage.");
 }

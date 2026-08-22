@@ -28,6 +28,9 @@
 // Core component interface
 #include "composite/core/component.hpp"
 
+// Per-stage throughput/latency metrics (companion to ports/port_stats.hpp)
+#include "composite/core/stage_stats.hpp"
+
 // Buffer types
 #include "composite/buffers/buffer.hpp"
 
