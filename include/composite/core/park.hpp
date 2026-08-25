@@ -240,6 +240,21 @@ public:
         m_data_pending = false;
     }
 
+    /// Consumer: sleep out a backoff of @p d, waking early ONLY for a park request or stop —
+    /// never for data. The error-restart backoff must not be shortened by a data signal: the
+    /// doorbell is not armed on the backoff path, but a signal can land in the window between
+    /// a producer's armed-load and the worker's unconditional disarm, and that stale
+    /// m_data_pending would satisfy wait_for_data() immediately — truncating the backoff the
+    /// caller is deliberately serving. The stale flag is consumed here (under the lock) so it
+    /// also cannot leak a spurious wake into the next wait_for_data().
+    auto wait_backoff(std::chrono::nanoseconds d, std::stop_token token) -> void {
+        std::unique_lock lk{m_run_mtx};
+        m_data_pending = false; // the data this signalled was already attempted (and threw)
+        m_run_cv.wait_for(lk, d, [this, &token] {
+            return token.stop_requested() || m_park.load(std::memory_order_acquire) == state::PARK_REQUESTED;
+        });
+    }
+
     // ------------------------------------------------------------------ writer
 
     /**

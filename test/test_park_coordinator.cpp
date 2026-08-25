@@ -1,10 +1,12 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <composite/core/park.hpp>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -270,11 +272,88 @@ static void test_throw_resumes() {
                 (unsigned long long)iters.load());
 }
 
+// ---------- 0.5.1 regression: a stale data signal must not truncate wait_backoff ----------
+//
+// The error-restart backoff waits on the park CV. signal_data() can land in the window between
+// a producer's armed-load and the worker's unconditional disarm; that leaves m_data_pending set
+// with nobody consuming it. wait_for_data() is satisfied immediately by the stale flag — so a
+// backoff served through it collapses to zero. wait_backoff() must serve the full delay (data
+// never wakes it) while still waking promptly for stop/park.
+static void test_backoff_ignores_stale_data() {
+    using namespace std::chrono;
+    const watchdog wd{20, "B1 backoff-stale-data"};
+    park_coordinator coord{"backoff"};
+
+    // Plant the stale flag exactly as the race does: signal while armed, then disarm unconsumed.
+    const auto plant_stale_flag = [&coord] {
+        coord.arm_doorbell();
+        coord.signal_data();
+        coord.disarm_doorbell();
+    };
+
+    // The data-honoring wait IS satisfied immediately by the stale flag — this is the old
+    // backoff behavior, kept as a baseline so this test documents the difference it pins.
+    plant_stale_flag();
+    std::stop_source unset;
+    const auto t0 = steady_clock::now();
+    coord.wait_for_data(milliseconds(500), unset.get_token());
+    const auto data_wait = duration_cast<milliseconds>(steady_clock::now() - t0);
+    if (data_wait >= milliseconds(400)) {
+        std::fprintf(stderr, "B1 FAIL: stale flag did not satisfy wait_for_data (baseline broke: %lldms)\n",
+                     static_cast<long long>(data_wait.count()));
+        std::abort();
+    }
+    watchdog_progress();
+
+    // The backoff wait must serve the full delay despite the same stale flag.
+    plant_stale_flag();
+    const auto t1 = steady_clock::now();
+    coord.wait_backoff(milliseconds(150), unset.get_token());
+    const auto served = duration_cast<milliseconds>(steady_clock::now() - t1);
+    if (served < milliseconds(120)) {
+        std::fprintf(stderr, "B1 FAIL: wait_backoff truncated by stale data flag (%lldms of 150ms)\n",
+                     static_cast<long long>(served.count()));
+        std::abort();
+    }
+    watchdog_progress();
+
+    // ...and the stale flag was consumed: the next data wait times out instead of firing early.
+    const auto t2 = steady_clock::now();
+    coord.wait_for_data(milliseconds(150), unset.get_token());
+    const auto after = duration_cast<milliseconds>(steady_clock::now() - t2);
+    if (after < milliseconds(120)) {
+        std::fprintf(stderr, "B1 FAIL: wait_backoff leaked the stale flag into the next wait (%lldms)\n",
+                     static_cast<long long>(after.count()));
+        std::abort();
+    }
+    watchdog_progress();
+
+    // Stop still wakes the backoff promptly (cancel_waiters notifies the CV under the mutex).
+    std::stop_source ss;
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(milliseconds(30));
+        ss.request_stop();
+        coord.cancel_waiters();
+    });
+    const auto t3 = steady_clock::now();
+    coord.wait_backoff(seconds(30), ss.get_token());
+    stopper.join();
+    const auto woke = duration_cast<milliseconds>(steady_clock::now() - t3);
+    if (woke >= seconds(20)) {
+        std::fprintf(stderr, "B1 FAIL: stop did not wake wait_backoff (%lldms)\n",
+                     static_cast<long long>(woke.count()));
+        std::abort();
+    }
+    std::printf("B1 backoff-stale-data: served=%lldms (>=120 required), stop woke in %lldms\n",
+                static_cast<long long>(served.count()), static_cast<long long>(woke.count()));
+}
+
 int main() {
     test_visibility();
     test_reentrancy_and_reader();
     test_park_vs_stop();
     test_throw_resumes();
+    test_backoff_ignores_stale_data();
     std::printf("ALL PARK TESTS PASSED\n");
     return 0;
 }

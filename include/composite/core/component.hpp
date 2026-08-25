@@ -483,8 +483,9 @@ public:
             return false;
         }
 
-        // Check element type compatibility
-        if (out_port->element_type_id() != in_port->element_type_id()) {
+        // Check element type compatibility (type_index, not hash_code — hashes may collide,
+        // and the send path static_casts on the strength of this check)
+        if (out_port->element_type() != in_port->element_type()) {
             m_logger->error("type mismatch connecting {}:{} ({}) to {}:{} ({})", id(), output_port_name,
                             out_port->element_type().name(), other->id(), input_port_name,
                             in_port->element_type().name());
@@ -1537,12 +1538,9 @@ private:
             m_logger->debug("could not set worker thread name for '{}'", m_id);
         }
 
-        // Apply CPU affinity if configured
-        if (m_cpu_affinity.has_value()) {
-            if (pthread_setaffinity_np(m_thread->native_handle(), sizeof(*m_cpu_affinity), &(*m_cpu_affinity)) != 0) {
-                m_logger->warn("Failed to set thread CPU affinity: {}", strerror(errno));
-            }
-        }
+        // CPU affinity is applied by the WORKER ITSELF at thread_entry, before its first
+        // iteration — applying it here on the handle raced the already-running worker and let
+        // the first process() calls execute unpinned.
 
         if (m_state) {
             m_state->set(1.0);
@@ -1763,6 +1761,21 @@ private:
         static_assert(noexcept(emergency_note("", "")), "the last-ditch note must not throw");
 
         const completion_guard done{*this}; // outermost: signals even if everything below throws
+
+        // Apply the configured CPU affinity FROM THE WORKER ITSELF, before the first process()
+        // iteration. The starter also applies it to the handle (start_locked), but by then this
+        // thread is already running — that ordering let the first iterations execute unpinned,
+        // observable as work landing on excluded cores at every start. Self-application closes
+        // the window: no iteration runs before the mask is in force. (m_cpu_affinity is set
+        // before start and not mutated while the worker lives, so this read is race-free.)
+        if (m_cpu_affinity.has_value()) {
+            // pthread_setaffinity_np RETURNS the error code (it does not set errno).
+            if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(*m_cpu_affinity), &(*m_cpu_affinity));
+                rc != 0) {
+                m_logger->warn("Failed to set thread CPU affinity: {}", strerror(rc));
+            }
+        }
+
         auto exit_reason = finish_reason::none;
         try {
             exit_reason = worker_body(std::move(token));
@@ -1879,7 +1892,9 @@ private:
                     // Wait out the backoff on the park CV so a stop OR a property-write park request
                     // wakes us promptly — a raw sleep here would leave a concurrent set_properties
                     // (with_worker_parked) waiting for us to reach a park point until it times out.
-                    m_park.wait_for_data(std::chrono::duration_cast<std::chrono::nanoseconds>(backoff), token);
+                    // wait_backoff (not wait_for_data): a stale doorbell flag from the pre-throw
+                    // iteration must not truncate the backoff to zero.
+                    m_park.wait_backoff(std::chrono::duration_cast<std::chrono::nanoseconds>(backoff), token);
                     if (token.stop_requested()) {
                         break;
                     }
