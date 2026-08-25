@@ -70,6 +70,129 @@ All notable changes to **composite** are documented here. The project follows
 
 ---
 
+## 0.5.1 — unreleased
+
+Patch release: correctness fixes and the three v0.5.0 known issues. **No inherited object
+layout, vtable, or documented configuration shape changed** — the component ABI stays 1 and no
+fleet source change is required. (One header-only, factory-heap-only type, `slab_pool`, gained a
+private counter member; it is not a type components inherit from or can embed by value — its
+constructor is tag-gated behind `create()` — so it is outside the ABI inventory above. Rebuild
+recommended as with any header change.)
+
+### Fixed (v0.5.0 known issues)
+
+- **An open SSE metrics stream no longer delays shutdown.** The stream's inter-event wait
+  watched only client liveness, so `server->stop()` waited out the remaining interval (up to
+  60 s) — long enough for a container grace period to SIGKILL the process past its
+  telemetry/DPDK teardown. The server's task queue now signals shutdown to every stream before
+  joining its workers (`TaskQueue::shutdown()` runs on the listen thread, ahead of the join),
+  so a full stop completes within ~one 100 ms poll. Regression: `test_http_integration`,
+  "SSE stream does not delay server shutdown".
+- **`POST /app/components` now applies the log level, `cpu_affinity`, and `initialize()` like
+  the config loader.** Both paths run one shared `setup_component()` helper (`helpers.hpp`) —
+  log level from the new `global_log_level()`, `cpu_affinity` resolved against the new
+  `process_available_cores()` — and the handler calls `initialize()` after INITIALIZE-context
+  properties, before the component becomes visible. The POST body accepts `cpu_affinity` like a
+  config entry (an unparsable value fails the request and registers nothing). Parity is
+  deliberately NARROW: application-level "globals" merging and the app-wide startup sequence
+  remain loader-only. Regressions: the suite's first dlopen'd module (`test_parity_module`)
+  records the behaviors as readable properties; `cpu_affinity` accept/reject cases; and an
+  applied-affinity case — the probe's worker self-reports the mask it actually runs under
+  (`pthread_getaffinity_np` from `process()`), so the test fails if the value is accepted but
+  never applied.
+- **Component creation over REST holds a per-id reservation.** Two concurrent
+  `POST /app/components` with the same id could both construct — and, with the parity fix,
+  both initialize — before one lost at registration; the loser's destructor then deregistered
+  every metric carrying the SHARED `component_id` label, deleting the winner's live lifecycle
+  series. The duplicate check, construction, `initialize()`, and registration are now one
+  exclusive unit **per id** (a reservation set, not one creation mutex, so a slow or stuck
+  `initialize()` cannot head-of-line block unrelated creations): concurrent duplicates get
+  exactly one `201` and otherwise `409`, and the winner's metrics survive. A twin of an
+  in-flight creation is refused even if that creation later fails — the ordinary retry
+  contract. (The race predates 0.5.1; initialization-before-registration made it more
+  consequential.) Regressions: a multi-round concurrent duplicate-POST stress case, and a
+  slow-initializer case proving an unrelated creation is not delayed.
+- **Fan-out batch overflow callbacks aggregate.** `send_batch` on fan-out (and on a single
+  mutable consumer) fell back to per-buffer sends, invoking each input's overflow callback once
+  per rejected packet. Both overloads now deliver port-outer — one `add_batch` per input
+  (share/copy to all but the last, move/promote to the last) — so each input's callback fires
+  ONCE per batch with its aggregate rejected count, packet order per port is unchanged, and the
+  output still counts a packet as transferred if any consumer admitted it.
+
+### Fixed (correctness scan)
+
+- **Error-restart backoff can no longer be truncated by a stale doorbell flag.** A producer's
+  `signal_data()` landing between its armed-load and the worker's unconditional disarm left
+  `m_data_pending` set; a `process()` throw then entered a backoff wait that the stale flag
+  satisfied immediately. Narrow (the backoff path never arms the doorbell, so the flag could
+  not recur per retry — one truncated backoff, not a retry storm), but real. The backoff now
+  uses `park_coordinator::wait_backoff()`, which wakes only for park/stop and consumes the
+  stale flag.
+- **Connect-time element-type checks compare `std::type_index`, not `type_info::hash_code()`**
+  (`port_base::connect`, `component::connect`). Hashes may collide, and the send path
+  `static_cast`s on the strength of this check — a collision was undefined behavior.
+- **`registry::max_metrics()` was a data race** (unlocked read of a mutex-guarded member); the
+  pair is atomic now. TSan-verified both ways.
+- **`slab_pool::release()` validation is always on.** The range + stride check was debug-only;
+  a release build pushed a garbage index and corrupted the free stack (reproduced as a segfault).
+  An invalid pointer is now refused — the slot intentionally leaks — and counted in the new
+  `invalid_releases()` accessor (silent-but-counted, the `histogram::record()` posture; the
+  check cannot detect a double release of a currently-free slot).
+- **Component ids can no longer inject spdlog pattern flags.** The id was interpolated into
+  `set_pattern()`; ids arrive from config files and `POST /app/components`, so `%v`/`%^` in an
+  id rewrote the log format (message duplicated into the prefix). The pattern now renders the
+  id via `%n` (the logger's own name), byte-for-byte.
+- **`aligned_atomic` no longer declares a zero-length padding array** when the atomic fills the
+  cache line (ill-formed ISO C++); `alignas` already provides the padding.
+- **A worker's first iterations no longer run unpinned.** `cpu_affinity` was applied by the
+  STARTING thread on the worker's handle after the worker was already executing, so early
+  `process()` calls could land on excluded cores at every start (found by the new
+  applied-affinity regression test, which intermittently observed the full mask). The worker
+  now applies its own mask at `thread_entry`, before the first iteration. Also fixes the error
+  report: `pthread_setaffinity_np` returns its error code — `strerror(errno)` printed noise.
+- **DPDK `--lcores` is rejected instead of silently passed through — unconditionally.** Every
+  other core list is written in logical indices and translated to physical; `--lcores` bypassed
+  the translation, mixing two coordinate systems in one config. Both spellings (`--lcores <map>`
+  and `--lcores=<map>`) now fail the load with a clear error naming `-l` as the supported form.
+  The rejection lives in `parse_dpdk_config()` — the choke point every load path crosses — not
+  only in the core translator, which runs solely when CPU discovery produced a core list (left
+  there alone, a failed discovery let `--lcores` reach EAL untouched). Unparsable `-l` tokens
+  also raise a clean config error instead of `std::stoi` escaping `main()` to `std::terminate`
+  (the translate call site is guarded too).
+
+### Triage notes (scanned findings that are NOT 0.5.1 changes)
+
+- `send_batch` partial-admission stats over-count: **already fixed in v0.5.0**;
+  `test_failure_containment` retains the coverage.
+- Consumer-side unlocked ring reads racing an unclaimed-port resize: **not reproducible by
+  design** — the consumer touches ring storage only after observing non-empty, and `depth()`
+  grows only an EMPTY, unclaimed ring under the same mutex `claim_producer()` takes. The
+  invariant is now documented at the read site (`input_port::pop`).
+
+### Deprecated
+
+- **`counter::reset()`** — a `counter` is the monotonic instrument; the OTLP bridge exports it
+  as a monotonic sum, and a collector reads any decrease as a counter reset (fabricated rates).
+  Removal in 0.6; there is no replacement — track a baseline and subtract, or use
+  `updown_counter` (whose `reset()` remains).
+
+### Added (ABI-neutral)
+
+- `composite::global_log_level()`, `composite::process_available_cores()`,
+  `composite::setup_component()` (shared creation-path setup), `slab_pool::invalid_releases()`,
+  `park_coordinator::wait_backoff()`.
+- **The CPU-affinity utilities are now actually linkable from `composite::composite`.** Their
+  declarations always lived in an installed header (`composite/util/cpu_affinity.hpp`), but the
+  implementation was compiled only into `composite-cli`, so a package consumer could not resolve
+  them. `cpu_affinity.cpp` moved into `libcomposite` with `COMPOSITE_API` exports.
+- Test coverage: `test_logger` (pattern-injection capture test), `test_cpu_affinity` (EAL
+  translation table), `test_parity_module` + REST parity case, SSE shutdown timing case,
+  fan-out overflow aggregation cases, `wait_backoff` stale-flag cases, slab invalid-release
+  cases, and a TSan-targeted `max_metrics` race case. Every fix's regression test was
+  demonstrated to fail with its fix reverted.
+
+---
+
 ## 0.5.0 — the "inverted-core" redesign
 
 **Released:** 2026-08-21 (v0.5.0).

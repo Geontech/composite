@@ -644,7 +644,7 @@ stringified.
 | `POST /app/start` | Start (reconcile to desired-`enabled`) every component. |
 | `POST /app/stop` | Stop every component's worker (the server keeps running). **Bounded:** every component is signalled first, then collected against one shared deadline. Returns `200` when all stopped, or `207 Multi-Status` with a `not_stopped` list. A component lands there if its worker did not exit, its lifecycle lock was unavailable, or a property write was still in flight — in every case it was **not** torn down and is still registered. |
 | `GET /app/components` | Array of component documents. |
-| `POST /app/components` | Create + add a component at runtime (`{library, id, properties?}`). `201` on success; `409` on duplicate id. |
+| `POST /app/components` | Create + add a component at runtime (`{library, id, properties?, cpu_affinity?}`). `201` on success; `409` on duplicate id (creation holds a per-id reservation, so concurrent duplicates yield exactly one `201` — and a duplicate of a creation still in flight is refused). The process log level and `cpu_affinity` are applied and `initialize()` runs before the component appears in the graph — application-level `properties` globals are **not** applied to REST-created components. |
 | `GET /app/components/:id` | One component document (`404` if unknown). |
 | `DELETE /app/components/:id` | Stop, disconnect, and unload a component (`404` if unknown). **Atomic:** if a connected peer's worker cannot be quiesced to release its edge, nothing is destroyed — the component stays registered (stopped) and the request fails with `500` naming the cause; retry once the peer has stopped. |
 | `PATCH /app/components/:id` | Set a batch of `{ "properties": { ... } }` on one component (atomic per component). |
