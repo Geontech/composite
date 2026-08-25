@@ -5,6 +5,7 @@
 
 #include "composite/core/logger.hpp"
 
+#include <atomic>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
@@ -41,9 +42,12 @@ logger::logger() = default; // null logger: m_impl == nullptr (should_log() fals
 
 logger::logger(std::string name) : m_impl(std::make_shared<impl>()) {
     auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-    m_impl->sp = std::make_shared<spdlog::logger>(name, std::move(sink));
-    // Same per-component pattern as before: timestamp, colored level, [id], message.
-    m_impl->sp->set_pattern(std::format("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [{}] %v", name));
+    m_impl->sp = std::make_shared<spdlog::logger>(std::move(name), std::move(sink));
+    // Same per-component pattern as before: timestamp, colored level, [id], message. The id is
+    // rendered via %n (the logger's own name), NOT interpolated into the pattern string:
+    // component ids arrive from config files and POST /app/components, so an id containing
+    // pattern flags (%v, %^, ...) would otherwise be compiled into the pattern itself.
+    m_impl->sp->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v");
 }
 
 logger::~logger() = default;
@@ -75,8 +79,20 @@ auto logger::name() const -> const std::string& {
     return (m_impl && m_impl->sp) ? m_impl->sp->name() : empty;
 }
 
+namespace {
+// Tracked alongside the spdlog global: component loggers are constructed unregistered (their
+// own sink, not spdlog's registry), so spdlog::set_level does not reach them — creation paths
+// read this back via global_log_level() and apply it per component.
+std::atomic<log_level> g_global_level{log_level::info};
+} // namespace
+
 auto set_global_log_level(log_level level) -> void {
+    g_global_level.store(level, std::memory_order_relaxed);
     spdlog::set_level(to_spdlog(level));
+}
+
+auto global_log_level() -> log_level {
+    return g_global_level.load(std::memory_order_relaxed);
 }
 
 auto log_level_from_string(std::string_view name) -> log_level {

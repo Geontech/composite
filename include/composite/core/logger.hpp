@@ -75,6 +75,11 @@ private:
 /// Set the process-wide default log level (CLI --log-level). Mirrors the prior global behavior.
 COMPOSITE_API auto set_global_log_level(log_level level) -> void;
 
+/// The level last passed to set_global_log_level() (info until then). Exists so every
+/// component-creation path — the config loader and POST /app/components — applies the SAME
+/// process-wide level instead of only the path that happens to have the CLI value in scope.
+[[nodiscard]] COMPOSITE_API auto global_log_level() -> log_level;
+
 /// Parse a level name ("trace"/"debug"/"info"/"warn"/"error"/"critical"/"off"); unknown -> info.
 [[nodiscard]] COMPOSITE_API auto log_level_from_string(std::string_view name) -> log_level;
 
