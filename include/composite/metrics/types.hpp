@@ -124,20 +124,12 @@ public:
         return m_storage.value.load(std::memory_order_relaxed);
     }
 
-    /**
-     * @brief Reset counter to zero
-     *
-     * @deprecated A `counter` is the framework's MONOTONIC instrument: the OTLP bridge exports
-     * it as a monotonic sum, and a collector reads any decrease as a counter reset — it then
-     * adds the whole new value and fabricates an enormous rate (the exact failure 0.5 fixed
-     * for histogram sums). Scheduled for removal in 0.6 with no replacement: track a baseline
-     * and subtract, or use `updown_counter` (whose `reset()` remains) for resettable values.
-     */
-    [[deprecated("counters are exported as monotonic sums; resetting one fabricates rates in "
-                 "OTLP collectors. Removed in 0.6 — track a baseline, or use updown_counter.")]]
-    void reset() noexcept {
-        m_storage.value.store(0, std::memory_order_relaxed);
-    }
+    // NOTE: there is deliberately no reset(). A `counter` is the framework's MONOTONIC
+    // instrument: the OTLP bridge exports it as a monotonic sum, and a collector reads any
+    // decrease as a counter reset — it then adds the whole new value and fabricates an
+    // enormous rate (the exact failure 0.5 fixed for histogram sums). Deprecated in 0.5.1,
+    // removed at ABI 2. No replacement: track a baseline and subtract, or use
+    // `updown_counter` (whose reset() remains — it has no monotonicity contract).
 
     // ---- Arithmetic operators ----
 

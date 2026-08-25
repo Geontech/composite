@@ -209,7 +209,7 @@ Components are dynamically loaded shared libraries:
 
   Both macros emit the single signature the loader calls —
   `create(std::string_view id, const composite::create_args& args)` — and a
-  `composite_abi_version()` symbol. The loader checks the ABI version (currently `1`) *before* calling
+  `composite_abi_version()` symbol. The loader checks the ABI version (currently `2`) *before* calling
   `create()` and refuses a library built against an incompatible framework, so a stale `.so` fails
   cleanly instead of being called through a mismatched signature.
 
@@ -994,8 +994,8 @@ the generation current at that packet's **ingest** — use the latter when the m
 
 - The package is versioned with **SemVer**; the installed CMake config declares
   `COMPATIBILITY SameMinorVersion`, so `find_package(composite x.y)` accepts the same `x.y` line.
-- The component **ABI version** is independent and currently `1` (`composite::abi_version`). The loader
-  refuses any `.so` whose `composite_abi_version()` doesn't match. Rebuild components against the
-  framework when the ABI version changes.
+- The component **ABI version** is independent and currently `2` (`composite::abi_version`; the 0.5
+  line is ABI `1`). The loader refuses any `.so` whose `composite_abi_version()` doesn't match.
+  Rebuild components against the framework when the ABI version changes.
 
 See [CHANGELOG.md](CHANGELOG.md) for the 0.5 API migration table (old → new) and release notes.

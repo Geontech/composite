@@ -9,7 +9,8 @@ All notable changes to **composite** are documented here. The project follows
   `COMPATIBILITY SameMinorVersion`, so `find_package(composite x.y)` accepts any `x.y.*` but **not**
   a different minor. Pin to the minor line you build against.
 - **Component ABI version.** Loadable components carry an independent `composite_abi_version()`
-  (`composite::abi_version`, currently **1**), emitted by the `COMPOSITE_REGISTER_*` macros. The loader
+  (`composite::abi_version`, currently **2** — the 0.6 line; the 0.5 line is ABI **1**), emitted by
+  the `COMPOSITE_REGISTER_*` macros. The loader
   refuses to call `create()` on a library whose ABI version differs from the framework's, so a stale
   `.so` fails cleanly. Rebuild components whenever the ABI version is bumped.
 - **Supported toolchains (what CI actually verifies).** C++20 is required
@@ -85,6 +86,9 @@ longer match, and there is no window where a layout change could merge ahead of 
   production framework code changed.
 - **ABI 2 declared** (FR-1 opens the window; components built against 0.5 must be rebuilt —
   the loader refuses ABI-1 modules).
+- **`counter::reset()` removed** (deprecated in 0.5.1): counters export as monotonic sums, and
+  a reset reads as a counter-reset to OTLP collectors, fabricating rates. No replacement —
+  track a baseline and subtract, or use `updown_counter` (whose `reset()` remains).
 - **`pipeline_component`: per-packet ingest context (FR-1).** `work()` runs on pool threads
   arbitrarily later than ingest, so a subclass whose `work()` depends on runtime-changeable
   configuration could not know which config generation a packet was accepted and

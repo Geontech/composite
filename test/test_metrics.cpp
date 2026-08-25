@@ -57,17 +57,9 @@ TEST_CASE("Counter basic operations", "[metrics][counter]") {
         REQUIRE(c.value() == 15);
     }
 
-    SECTION("reset() sets value to zero (deprecated — removed in 0.6)") {
-        // counter::reset() is deprecated: counters export as monotonic sums, and a reset reads
-        // as a counter-reset to OTLP collectors (fabricated rates). The behavior is still
-        // verified until the 0.6 removal; suppress only the deprecation diagnostic here.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        c.add(100);
-        c.reset();
-        REQUIRE(c.value() == 0);
-#pragma GCC diagnostic pop
-    }
+    // counter::reset() was removed at ABI 2 (deprecated in 0.5.1): counters export as
+    // monotonic sums, and a reset reads as a counter-reset to OTLP collectors (fabricated
+    // rates). updown_counter::reset() remains and keeps its section below.
 }
 
 TEST_CASE("Counter arithmetic operators", "[metrics][counter]") {
