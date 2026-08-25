@@ -409,8 +409,9 @@ public:
      * @param max Maximum number of metrics (0 = unlimited)
      */
     auto set_max_metrics(std::size_t max) -> void {
-        auto lock = std::unique_lock{m_mutex};
-        m_max_metrics = max;
+        // Atomic (not mutex-guarded): max_metrics() below is documented lock-free and callable
+        // from any thread; a plain member here made that pair a data race.
+        m_max_metrics.store(max, std::memory_order_relaxed);
     }
 
     /**
@@ -418,7 +419,7 @@ public:
      */
     [[nodiscard]]
     auto max_metrics() const -> std::size_t {
-        return m_max_metrics;
+        return m_max_metrics.load(std::memory_order_relaxed);
     }
 
     /**
@@ -1604,10 +1605,11 @@ private:
      * @throws metric_limit_exceeded_error if limit would be exceeded
      */
     auto check_metric_limit() const -> void {
-        if (m_max_metrics > 0) {
+        const auto limit = m_max_metrics.load(std::memory_order_relaxed); // one load: check and report the same value
+        if (limit > 0) {
             auto current = m_counters.size() + m_updown_counters.size() + m_gauges.size() + m_histograms.size();
-            if (current >= m_max_metrics) {
-                throw metric_limit_exceeded_error(m_max_metrics);
+            if (current >= limit) {
+                throw metric_limit_exceeded_error(limit);
             }
         }
     }
@@ -1677,7 +1679,7 @@ private:
     }
 
     mutable std::shared_mutex m_mutex;
-    std::size_t m_max_metrics{DEFAULT_MAX_METRICS};
+    std::atomic<std::size_t> m_max_metrics{DEFAULT_MAX_METRICS};
     error_callback m_error_handler;
 
     // Separate storage for each type (avoids variant overhead in hot path)

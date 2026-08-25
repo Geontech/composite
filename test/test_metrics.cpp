@@ -20,6 +20,7 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -56,10 +57,16 @@ TEST_CASE("Counter basic operations", "[metrics][counter]") {
         REQUIRE(c.value() == 15);
     }
 
-    SECTION("reset() sets value to zero") {
+    SECTION("reset() sets value to zero (deprecated — removed in 0.6)") {
+        // counter::reset() is deprecated: counters export as monotonic sums, and a reset reads
+        // as a counter-reset to OTLP collectors (fabricated rates). The behavior is still
+        // verified until the 0.6 removal; suppress only the deprecation diagnostic here.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         c.add(100);
         c.reset();
         REQUIRE(c.value() == 0);
+#pragma GCC diagnostic pop
     }
 }
 
@@ -557,6 +564,33 @@ TEST_CASE("Counter thread safety", "[metrics][threading]") {
     }
 
     REQUIRE(c.value() == num_threads * increments_per_thread);
+}
+
+// 0.5.1 regression: max_metrics() used to read a plain member the (locked) setter wrote — a
+// data race on the public API. The pair is atomic now; this pins it for the TSan preset, where
+// the pre-fix code reports a race (the assertion itself is trivially true in any build mode).
+TEST_CASE("Registry max_metrics set/get is race-free", "[metrics][registry][threading]") {
+    auto& reg = registry::instance();
+    const auto saved = reg.max_metrics();
+    constexpr int iterations = 50000;
+
+    std::size_t observed_floor = std::numeric_limits<std::size_t>::max();
+    std::thread writer([&reg]() {
+        for (int i = 0; i < iterations; ++i) {
+            reg.set_max_metrics(10000 + static_cast<std::size_t>(i & 1));
+        }
+    });
+    std::thread reader([&reg, &observed_floor]() {
+        for (int i = 0; i < iterations; ++i) {
+            observed_floor = std::min(observed_floor, reg.max_metrics());
+        }
+    });
+    writer.join();
+    reader.join();
+    reg.set_max_metrics(saved);
+
+    // Every observed value is one the writer actually stored (or the pre-test value).
+    REQUIRE(observed_floor >= 10000);
 }
 
 TEST_CASE("UpDownCounter thread safety", "[metrics][threading]") {

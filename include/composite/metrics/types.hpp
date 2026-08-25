@@ -77,10 +77,11 @@ struct alignas(64) aligned_atomic {
     aligned_atomic() = default;
     explicit aligned_atomic(T initial) : value(initial) {}
 
-    // Padding to fill cache line
-    // 64 bytes - sizeof(atomic<T>) bytes of padding
-    [[maybe_unused]] char padding[64 - sizeof(std::atomic<T>)]{};
+    // No manual padding member: alignas(64) on the struct already rounds sizeof to a full
+    // cache line, and the previous char[64 - sizeof(atomic<T>)] became a zero-length array
+    // (ill-formed ISO C++) whenever the atomic exactly filled the line.
 };
+static_assert(sizeof(aligned_atomic<std::uint64_t>) == 64, "aligned_atomic must occupy a full cache line");
 
 // ============================================================================
 // Counter - Monotonically increasing value
@@ -125,8 +126,18 @@ public:
 
     /**
      * @brief Reset counter to zero
+     *
+     * @deprecated A `counter` is the framework's MONOTONIC instrument: the OTLP bridge exports
+     * it as a monotonic sum, and a collector reads any decrease as a counter reset — it then
+     * adds the whole new value and fabricates an enormous rate (the exact failure 0.5 fixed
+     * for histogram sums). Scheduled for removal in 0.6 with no replacement: track a baseline
+     * and subtract, or use `updown_counter` (whose `reset()` remains) for resettable values.
      */
-    void reset() noexcept { m_storage.value.store(0, std::memory_order_relaxed); }
+    [[deprecated("counters are exported as monotonic sums; resetting one fabricates rates in "
+                 "OTLP collectors. Removed in 0.6 — track a baseline, or use updown_counter.")]]
+    void reset() noexcept {
+        m_storage.value.store(0, std::memory_order_relaxed);
+    }
 
     // ---- Arithmetic operators ----
 
