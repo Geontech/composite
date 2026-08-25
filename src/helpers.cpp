@@ -5,9 +5,11 @@
 
 #include "helpers.hpp"
 #include "composite/core/application.hpp"
+#include "composite/core/logger.hpp"
 #include "composite/core/register.hpp"
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
+#include "composite/util/cpu_affinity.hpp"
 
 #include <format>
 #include <iostream>
@@ -160,6 +162,34 @@ auto validate_component_connection(const nlohmann::json& conn) -> std::tuple<std
     auto component = conn["component"].get<std::string>();
     auto port = conn["port"].get<std::string>();
     return {component, port, {}};
+}
+
+auto setup_component(composite::component& comp, const nlohmann::json& comp_json) -> void {
+    // Process-wide component log level. Component loggers are unregistered spdlog loggers, so
+    // spdlog::set_level cannot reach them — every creation path applies the level explicitly.
+    comp.log_level(global_log_level());
+
+    if (comp_json.contains("cpu_affinity")) {
+        if (!comp_json["cpu_affinity"].is_string()) {
+            throw std::runtime_error(
+                std::format("component '{}': 'cpu_affinity' must be a string (e.g. \"0-3\")", comp.id()));
+        }
+        const auto affinity_str = comp_json["cpu_affinity"].get<std::string>();
+        const auto& cores = process_available_cores();
+        if (cores.empty()) {
+            spdlog::warn("component '{}': cpu_affinity '{}' ignored (available CPUs could not be captured)",
+                         comp.id(), affinity_str);
+            return;
+        }
+        const auto cpuset_opt = parse_affinity_config(affinity_str, cores);
+        if (cpuset_opt.has_value()) {
+            comp.set_cpu_affinity(*cpuset_opt);
+            spdlog::debug("component '{}' cpu_affinity configured: '{}'", comp.id(), affinity_str);
+        } else if (affinity_str != "none" && !affinity_str.empty()) {
+            throw std::runtime_error(
+                std::format("failed to parse cpu_affinity '{}' for component '{}'", affinity_str, comp.id()));
+        }
+    }
 }
 
 auto validate_connection(const nlohmann::json& conn) -> std::tuple<std::string, std::string, std::string> {

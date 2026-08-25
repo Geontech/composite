@@ -34,6 +34,22 @@ auto make_component(const nlohmann::json& comp_json) -> std::shared_ptr<composit
 
 auto validate_connection(const nlohmann::json& conn_json) -> std::tuple<std::string, std::string, std::string>;
 
+/// Post-construction setup shared by the config loader (main.cpp) and the REST create path
+/// (POST /app/components). The two paths MUST stay behaviorally identical — they diverged
+/// once (the v0.5.0 known issue: REST-created components silently skipped the log level and
+/// cpu_affinity), and a shared helper is what keeps that from recurring.
+///
+/// Applies, from @p comp_json and process-wide state:
+///  - the process-wide component log level (global_log_level());
+///  - "cpu_affinity" (logical indices resolved against process_available_cores()).
+///
+/// Deliberately NOT here: property application (the two paths differ on globals merging)
+/// and initialize() (the config path defers it to application::initialize(); the REST path
+/// calls it per component because the application has already initialized).
+///
+/// @throws std::runtime_error on an unparsable "cpu_affinity" value.
+auto setup_component(composite::component& comp, const nlohmann::json& comp_json) -> void;
+
 /**
  * @brief Parse DPDK configuration from JSON
  * @param dpdk_json JSON object containing DPDK configuration

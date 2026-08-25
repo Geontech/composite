@@ -17,7 +17,9 @@
 #include <format>
 #include <httplib.h>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <thread>
@@ -305,6 +307,33 @@ auto set_component_properties(composite::application::component_ptr comp, const 
 }
 
 namespace {
+
+/// httplib's worker pool, wrapped so server shutdown is OBSERVABLE from inside a running
+/// handler. Server::stop() is non-virtual and only closes the listen socket; is_running()
+/// flips false only AFTER the task queue has joined its workers — so neither can end a
+/// long-lived SSE stream, whose provider is exactly what the join is waiting on (the v0.5.0
+/// "SSE stream delays shutdown" known issue). TaskQueue::shutdown() IS virtual and runs on
+/// the listen thread after the accept loop exits, BEFORE the worker join: flipping the flag
+/// there lets every stream wait bail within one poll instead of riding out its interval.
+struct shutdown_signalling_task_queue final : httplib::TaskQueue {
+    explicit shutdown_signalling_task_queue(std::shared_ptr<std::atomic<bool>> flag)
+        : m_flag(std::move(flag)), m_pool(CPPHTTPLIB_THREAD_POOL_COUNT) {
+        // A queue is constructed per listen session, so a stopped-then-relistened server
+        // starts with the signal cleared instead of instantly killing every new stream.
+        m_flag->store(false, std::memory_order_release);
+    }
+    auto enqueue(std::function<void()> fn) -> bool override { return m_pool.enqueue(std::move(fn)); }
+    auto shutdown() -> void override {
+        m_flag->store(true, std::memory_order_release); // streams observe this BEFORE the join below
+        m_pool.shutdown();
+    }
+    auto on_idle() -> void override { m_pool.on_idle(); }
+
+private:
+    std::shared_ptr<std::atomic<bool>> m_flag;
+    httplib::ThreadPool m_pool;
+};
+
 /// Everything both server flavours share, applied to an ALREADY-CONSTRUCTED server.
 ///
 /// Previously the two flavours were spliced together by an #ifdef across the signature and the
@@ -355,6 +384,12 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
     // content provider is destroyed (client disconnect or shutdown).
     static std::atomic<int> sse_active{0};
     static constexpr int max_sse_streams = 8;
+
+    // Shutdown signal for those streams: flipped by the task queue's shutdown() (listen
+    // thread, before the worker join) so a stream's inter-event wait ends within one poll of
+    // server->stop() instead of riding out its interval. Per-server, shared with the SSE route.
+    auto server_stopping = std::make_shared<std::atomic<bool>>(false);
+    server->new_task_queue = [server_stopping] { return new shutdown_signalling_task_queue(server_stopping); };
 
     // Add a common handler for preflight requests (OPTIONS method)
     server->Options(".*", [](const httplib::Request&, httplib::Response& res) {
@@ -412,7 +447,7 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
 
     // GET /app/metrics/stream - SSE endpoint for metrics streaming
     endpoint = std::format("/{}/{}/stream", APP, METRICS);
-    server->Get(endpoint, [](const httplib::Request& req, httplib::Response& res) {
+    server->Get(endpoint, [server_stopping](const httplib::Request& req, httplib::Response& res) {
         // Admission control: bound the number of concurrent streams.
         if (sse_active.fetch_add(1, std::memory_order_acq_rel) >= max_sse_streams) {
             sse_active.fetch_sub(1, std::memory_order_acq_rel);
@@ -454,11 +489,19 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
         res.set_header("Connection", "keep-alive");
 
         res.set_chunked_content_provider("text/event-stream",
-                                         [interval_ms, prefix_filter, label_key, label_value,
+                                         [server_stopping, interval_ms, prefix_filter, label_key, label_value,
                                           sse_slot](std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
                                              // Check if client disconnected before doing any work
                                              if (sink.is_writable != nullptr && !sink.is_writable()) {
                                                  return false; // Client disconnected
+                                             }
+                                             // Server shutting down: end the stream now. Without
+                                             // this the inter-event wait below rode out its full
+                                             // interval (up to 60s) past a SIGTERM — long enough
+                                             // for container runtimes to SIGKILL the process past
+                                             // its telemetry/DPDK teardown (v0.5.0 known issue).
+                                             if (server_stopping->load(std::memory_order_acquire)) {
+                                                 return false;
                                              }
 
                                              auto& registry = metrics::registry::instance();
@@ -481,8 +524,10 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
                                                  return false; // Connection closed
                                              }
 
-                                             // Sleep in smaller chunks to detect disconnection faster
-                                             // Poll every 100ms to check connection status
+                                             // Sleep in smaller chunks to detect disconnection AND
+                                             // server shutdown faster (poll every 100ms). The
+                                             // shutdown check is what bounds SIGTERM latency to
+                                             // ~one poll instead of the full interval.
                                              constexpr int poll_interval_ms = 100;
                                              int remaining_ms = interval_ms;
                                              while (remaining_ms > 0) {
@@ -490,9 +535,12 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
                                                  std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
                                                  remaining_ms -= sleep_ms;
 
-                                                 // Check if client disconnected during sleep
+                                                 // Client disconnected or server stopping during sleep
                                                  if (sink.is_writable != nullptr && !sink.is_writable()) {
                                                      return false; // Client disconnected
+                                                 }
+                                                 if (server_stopping->load(std::memory_order_acquire)) {
+                                                     return false; // Server shutting down
                                                  }
                                              }
 
@@ -559,9 +607,32 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
         json_ok(res, nlohmann::json(app.components()));
     });
 
-    // POST components
+    // POST components. Creation holds a PER-ID reservation: the duplicate check, construction,
+    // initialize(), and registration must be one exclusive unit per id. Without it, two
+    // concurrent POSTs with the same id could both construct and initialize; the loser's
+    // destructor then removes every metric carrying that SHARED component_id label
+    // (~component deregisters by label) — deleting the winner's live series — and any external
+    // side effects of initialize() run twice. add_component()'s own atomicity cannot help: the
+    // damage is in the loser's construction/teardown, not the registration. A reservation SET
+    // (not one creation mutex) so exclusivity is per id: arbitrary component code runs in
+    // initialize(), and one slow initializer must not head-of-line block unrelated creations.
+    // A concurrent twin of an in-flight creation gets 409 immediately — even if that creation
+    // later fails and frees the id — which is the ordinary retry contract.
+    struct creation_reservations {
+        std::mutex mtx;
+        std::set<std::string> ids;
+        auto try_reserve(const std::string& id) -> bool {
+            const std::scoped_lock lk{mtx};
+            return ids.insert(id).second;
+        }
+        auto release(const std::string& id) -> void {
+            const std::scoped_lock lk{mtx};
+            ids.erase(id);
+        }
+    };
+    auto reservations = std::make_shared<creation_reservations>();
     endpoint = std::format("/{}/{}", APP, COMPONENTS);
-    server->Post(endpoint, [&app](const httplib::Request& req, httplib::Response& res) {
+    server->Post(endpoint, [&app, reservations](const httplib::Request& req, httplib::Response& res) {
         try {
             auto comp_json = nlohmann::json::parse(req.body);
 
@@ -573,6 +644,15 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
             }
 
             auto comp_id = comp_json["id"].get<std::string>();
+            // Reserve BEFORE the registry lookup: the reservation excludes a concurrent twin
+            // for the whole construct/initialize window, and is released on every exit path
+            // below — after add_component() on success, so there is no gap in which the id is
+            // neither reserved nor registered.
+            if (!reservations->try_reserve(comp_id)) {
+                return error(res, std::format("component id already exists: {}", comp_id), 409);
+            }
+            const auto reservation = std::shared_ptr<void>(
+                nullptr, [reservations, comp_id](void*) { reservations->release(comp_id); });
             if (app.get_component(comp_id) != nullptr) {
                 return error(res, std::format("component id already exists: {}", comp_id), 409);
             }
@@ -585,6 +665,11 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
                 return error(res, msg, 500);
             }
 
+            // Behavioral parity with config-loaded components (v0.5.0 known issue: this path
+            // silently skipped the log level, cpu_affinity, and initialize()). Same helper as
+            // the loader, then the same sequence: properties -> initialize() -> registered.
+            composite::setup_component(*comp_ptr, comp_json);
+
             if (comp_json.contains("properties")) {
                 spdlog::trace("setting component-level properties on {}", comp_ptr->id());
                 // Strict: this is a single component's OWN property block — there is no
@@ -594,6 +679,12 @@ auto configure_server(application& app, std::unique_ptr<httplib::Server> server)
                 comp_ptr->set_properties(comp_json["properties"], composite::properties::config_type::INITIALIZE,
                                          /*allow_unknown=*/false);
             }
+
+            // Config-loaded components get initialize() from application::initialize(); that
+            // ran long before this request, so this path must call it per component — after
+            // INITIALIZE-context properties (same ordering the startup sequence guarantees),
+            // before the component becomes visible in the graph.
+            comp_ptr->initialize();
 
             if (!app.add_component(comp_ptr)) {
                 return error(res, std::format("component id already exists: {}", comp_id), 409);

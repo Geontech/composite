@@ -147,15 +147,10 @@ auto main(int argc, char** argv) -> int {
     // ========================================
     // CPU Affinity Capture
     // ========================================
-    // Get available CPUs from cgroups/container for affinity mapping
-    std::vector<int> available_cores;
-    if (auto cpuset_opt = composite::get_available_cpus()) {
-        const auto& cpuset = *cpuset_opt;
-        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-            if (CPU_ISSET(cpu, &cpuset)) {
-                available_cores.push_back(cpu);
-            }
-        }
+    // One shared capture (cgroups/container mask) — the same view setup_component() resolves
+    // per-component "cpu_affinity" against, on both the config-load and REST create paths.
+    const auto& available_cores = composite::process_available_cores();
+    if (!available_cores.empty()) {
         spdlog::info("Captured {} available CPU cores for component affinity", available_cores.size());
         spdlog::debug("Available physical CPU cores: [{}]", [&available_cores]() {
             std::string result;
@@ -523,33 +518,10 @@ auto main(int argc, char** argv) -> int {
             if (comp_ptr == nullptr) {
                 return cleanup_and_exit("failed to load component");
             }
-            // Set log level
-            comp_ptr->log_level(level);
-
-            // Configure CPU affinity if specified
-            if (!available_cores.empty() && comp.contains("cpu_affinity")) {
-                auto affinity_str = comp["cpu_affinity"].get<std::string>();
-                auto cpuset_opt = composite::parse_affinity_config(affinity_str, available_cores);
-                if (cpuset_opt.has_value()) {
-                    comp_ptr->set_cpu_affinity(*cpuset_opt);
-                    spdlog::debug("Component '{}' cpu_affinity resolved cores: [{}]", comp_ptr->id(), [&cpuset_opt]() {
-                        std::string result;
-                        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-                            if (CPU_ISSET(cpu, &(*cpuset_opt))) {
-                                if (!result.empty()) {
-                                    result += ", ";
-                                }
-                                result += std::to_string(cpu);
-                            }
-                        }
-                        return result;
-                    }());
-                    spdlog::debug("Component '{}' cpu_affinity configured: '{}'", comp_ptr->id(), affinity_str);
-                } else if (affinity_str != "none" && !affinity_str.empty()) {
-                    return cleanup_and_exit(std::format("Failed to parse cpu_affinity '{}' for component '{}'",
-                                                        affinity_str, comp_ptr->id()));
-                }
-            }
+            // Log level + cpu_affinity, via the helper POST /app/components also uses — the two
+            // creation paths must stay identical (a bad affinity value throws; the enclosing
+            // try routes it through cleanup_and_exit like every other construction error).
+            composite::setup_component(*comp_ptr, comp);
 
             // Set properties
             try {
