@@ -362,6 +362,11 @@ private:
         auto* producer_doorbell = m_producer_doorbell.load(std::memory_order_acquire);
         bool was_full = false;
         if (producer_doorbell != nullptr) {
+            // Unlocked m_ring reads here (and below) are safe for a different reason than the
+            // producer's claim-exclusion: this point is reached only past the head!=tail check
+            // above, and depth(value) replaces the ring only when it is EMPTY (checked under
+            // m_resize_mtx). Non-empty excludes the replacement; the consumer's release-store
+            // of head orders its last slot read before any later, legal replacement.
             const auto cap = depth() < m_ring.size() ? depth() : m_ring.size(); // match add_data's clamp
             was_full = (tail - head) >= cap;
         }

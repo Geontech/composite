@@ -469,6 +469,79 @@ int main() {
               "promotion path: transferred + dropped equals packets offered");
     }
 
+    // ---- (13c) fan-out batch overflow: the callback fires ONCE per input per batch ----
+    // 0.5.1 regression (v0.5.0 known issue): the fan-out fallback used per-buffer sends, so a
+    // batch overflow invoked the callback once per rejected PACKET. Port-outer add_batch now
+    // aggregates per input: one invocation carrying that input's rejected count.
+    {
+        input_port<immutable_buffer<float>> in_a{"in_a", 2};
+        input_port<immutable_buffer<float>> in_b{"in_b", 2};
+        output_port<immutable_buffer<float>> out{"out"};
+        check(out.connect(&in_a), "fanout overflow: connected consumer A");
+        check(out.connect(&in_b), "fanout overflow: connected consumer B");
+
+        std::size_t calls_a = 0;
+        std::size_t dropped_a = 0;
+        std::size_t calls_b = 0;
+        std::size_t dropped_b = 0;
+        in_a.set_overflow_callback([&](std::size_t n) {
+            ++calls_a;
+            dropped_a += n;
+        });
+        in_b.set_overflow_callback([&](std::size_t n) {
+            ++calls_b;
+            dropped_b += n;
+        });
+
+        std::vector<immutable_buffer<float>> bufs;
+        bufs.reserve(5);
+        for (int i = 0; i < 5; ++i) {
+            bufs.push_back(make_immutable<float>(4));
+        }
+        out.send_batch(std::span<immutable_buffer<float>>{bufs}, timestamp{});
+
+        check(calls_a == 1 && dropped_a == 3, "fanout consumer A: ONE aggregated overflow callback (3 rejected)");
+        check(calls_b == 1 && dropped_b == 3, "fanout consumer B: ONE aggregated overflow callback (3 rejected)");
+        check(in_a.pending() == 2 && in_b.pending() == 2, "fanout overflow: both rings hold the admitted prefix");
+        bool all_consumed = true;
+        for (const auto& b : bufs) {
+            all_consumed = all_consumed && b.empty();
+        }
+        check(all_consumed, "fanout overflow: the span is consumed in full");
+    }
+    {
+        // Same contract on the MUTABLE fan-out (deep copies to all but the last, moves last).
+        input_port<mutable_buffer<float>> in_a{"in_a", 2};
+        input_port<mutable_buffer<float>> in_b{"in_b", 2};
+        output_port<mutable_buffer<float>> out{"out"};
+        check(out.connect(&in_a), "mutable fanout overflow: connected consumer A");
+        check(out.connect(&in_b), "mutable fanout overflow: connected consumer B");
+
+        std::size_t calls_a = 0;
+        std::size_t dropped_a = 0;
+        std::size_t calls_b = 0;
+        std::size_t dropped_b = 0;
+        in_a.set_overflow_callback([&](std::size_t n) {
+            ++calls_a;
+            dropped_a += n;
+        });
+        in_b.set_overflow_callback([&](std::size_t n) {
+            ++calls_b;
+            dropped_b += n;
+        });
+
+        std::vector<mutable_buffer<float>> bufs;
+        bufs.reserve(5);
+        for (int i = 0; i < 5; ++i) {
+            bufs.push_back(make_mutable<float>(4));
+        }
+        out.send_batch(std::span<mutable_buffer<float>>{bufs}, timestamp{});
+
+        check(calls_a == 1 && dropped_a == 3, "mutable fanout consumer A: ONE aggregated overflow callback");
+        check(calls_b == 1 && dropped_b == 3, "mutable fanout consumer B: ONE aggregated overflow callback");
+        check(in_a.pending() == 2 && in_b.pending() == 2, "mutable fanout overflow: admitted prefixes delivered");
+    }
+
     // ---- (14) a slow process() makes stop() REPORT, and the join still completes ----
     // The join cannot be abandoned (~component is one of stop()'s callers), so the fix for a
     // wedged process() is diagnosability, not a timeout. Hold process() past the reporting

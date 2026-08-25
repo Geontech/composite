@@ -204,18 +204,17 @@ public:
     /**
      * @brief Send a batch of buffers (sharing one timestamp/metadata) to connected
      *        inputs. With a single immutable consumer this is one amortized
-     *        add_batch (single ring publish); otherwise it falls back to per-buffer
-     *        send_data (fan-out / mutable targets).
+     *        add_batch (single ring publish); fan-out / mutable targets take one
+     *        add_batch per input (share/copy to all but the last, move to the last).
      *
      * **Buffer ownership (frozen for the v0.5 line).** The call consumes the ENTIRE
      * span, whether or not every packet is admitted. The port is bounded, so admission
      * may accept only a PREFIX of the batch; the rejected suffix is released as well —
      * every element of @p bufs is left in a moved-from (empty) state on return, and the
      * caller must not read the buffers back. Rejection is not silent: the drop is counted
-     * in the input's packet-drop statistics. On the single-immutable-consumer direct path
-     * the overflow callback fires ONCE for the batch with the aggregate rejected-packet
-     * count; on the per-buffer fallback (fan-out, or a mutable consumer) it fires per
-     * rejected packet, exactly as scalar send_data() does.
+     * in the input's packet-drop statistics, and each input's overflow callback fires ONCE
+     * per batch with that input's aggregate rejected-packet count — on the direct path and
+     * on fan-out alike (fan-out fired per rejected packet before 0.5.1).
      *
      * Every admitted packet carries the same @p ts and the same metadata instance.
      *
@@ -238,9 +237,57 @@ public:
             m_stats.record_transfer(bytes, accepted);
             return;
         }
-        for (auto& b : bufs) {
-            send_data(std::move(b), ts, md);
+        // Fan-out (or a mutable consumer): PORT-outer, one add_batch per input, so each input's
+        // overflow callback fires ONCE with its aggregate rejected count — the same contract as
+        // the direct path above. The old per-buffer send_data fallback fired it per rejected
+        // packet (v0.5.0 known issue). Ring admission takes a PREFIX, so per-port packet order
+        // and copy-to-all-but-last/move-on-last are preserved; the longest admitted prefix
+        // across consumers is what this output records as transferred (fan-out counts the
+        // packet, not the deliveries — matching send_data).
+        std::size_t best_k = 0;
+        std::size_t best_bytes = 0;
+        for (std::size_t p = 0; p < ports->size(); ++p) {
+            auto* port = (*ports)[p];
+            if (port == nullptr) {
+                continue;
+            }
+            const bool last = (p + 1 == ports->size());
+            std::size_t bytes = 0;
+            std::size_t k = 0;
+            if (port->is_mutable()) {
+                // immutable → mutable: deep copy per receiver (independent writable storage)
+                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
+                std::vector<mutable_buffer<T>> copies;
+                copies.reserve(bufs.size());
+                for (const auto& b : bufs) {
+                    copies.push_back(mutable_buffer<T>{std::make_unique<std::vector<T>>(b.begin(), b.end())});
+                }
+                k = mutable_port->add_batch(std::span<mutable_buffer<T>>{copies}, ts, md, &bytes);
+            } else {
+                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
+                if (last) {
+                    k = immutable_port->add_batch(bufs, ts, md, &bytes); // moves the originals
+                } else {
+                    std::vector<immutable_buffer<T>> shares;
+                    shares.reserve(bufs.size());
+                    for (auto& b : bufs) {
+                        shares.push_back(b.share());
+                    }
+                    k = immutable_port->add_batch(std::span<immutable_buffer<T>>{shares}, ts, md, &bytes);
+                }
+            }
+            if (k > best_k) {
+                best_k = k;
+                best_bytes = bytes;
+            }
         }
+        // The span is consumed in full regardless of admission (frozen v0.5 contract). An
+        // immutable last consumer's add_batch already emptied every element; the other shapes
+        // (mutable last, null slots, nothing connected) leave originals alive — release them.
+        for (auto& b : bufs) {
+            b = buffer_type{};
+        }
+        m_stats.record_transfer(best_bytes, best_k);
     }
 
     /// Convenience overload: wraps a plain metadata value (allocates per call).
@@ -413,17 +460,18 @@ public:
     /**
      * @brief Send a batch of mutable buffers (sharing one timestamp/metadata) with
      *        one amortized add_batch to a single consumer (moved for mutable,
-     *        promoted for immutable); per-buffer send_data fallback for fan-out.
+     *        promoted for immutable); fan-out takes one add_batch per input
+     *        (deep copy to all but the last, move/promote to the last).
      *
      * **Buffer ownership (frozen for the v0.5 line).** Identical to the immutable
      * overload: the call consumes the ENTIRE span whether or not every packet is
      * admitted. The port is bounded, so admission may accept only a PREFIX; the rejected
      * suffix is released as well — every element of @p bufs is left in a moved-from
      * (empty) state on return, and the caller must not read the buffers back. Rejection
-     * is counted in the input's packet-drop statistics. On the single-consumer direct
-     * path (moved for mutable, promoted for immutable) the overflow callback fires ONCE
-     * for the batch with the aggregate rejected-packet count; on the per-buffer fan-out
-     * fallback it fires per rejected packet, exactly as scalar send_data() does.
+     * is counted in the input's packet-drop statistics, and each input's overflow
+     * callback fires ONCE per batch with that input's aggregate rejected-packet count —
+     * on the direct path and on fan-out alike (fan-out fired per rejected packet before
+     * 0.5.1).
      *
      * Every admitted packet carries the same @p ts and the same metadata instance.
      *
@@ -459,9 +507,55 @@ public:
             m_stats.record_transfer(bytes, accepted);
             return;
         }
-        for (auto& b : bufs) {
-            send_data(std::move(b), ts, md);
+        // Fan-out: PORT-outer, one add_batch per input — each input's overflow callback fires
+        // ONCE with its aggregate rejected count (v0.5.0 known issue; see the immutable
+        // overload). Copy-to-all-but-last per the fan-out contract; the last consumer takes
+        // the moves (or the promoted moves, for an immutable last consumer).
+        std::size_t best_k = 0;
+        std::size_t best_bytes = 0;
+        for (std::size_t p = 0; p < ports->size(); ++p) {
+            auto* port = (*ports)[p];
+            if (port == nullptr) {
+                continue;
+            }
+            const bool last = (p + 1 == ports->size());
+            std::size_t bytes = 0;
+            std::size_t k = 0;
+            if (port->is_mutable()) {
+                auto* mutable_port = static_cast<input_port<mutable_buffer<T>>*>(port);
+                if (last) {
+                    k = mutable_port->add_batch(bufs, ts, md, &bytes); // moves the originals
+                } else {
+                    std::vector<mutable_buffer<T>> copies;
+                    copies.reserve(bufs.size());
+                    for (auto& b : bufs) {
+                        copies.push_back(b.copy());
+                    }
+                    k = mutable_port->add_batch(std::span<mutable_buffer<T>>{copies}, ts, md, &bytes);
+                }
+            } else {
+                auto* immutable_port = static_cast<input_port<immutable_buffer<T>>*>(port);
+                m_immutable_batch_scratch.clear();
+                m_immutable_batch_scratch.reserve(bufs.size());
+                for (auto& b : bufs) {
+                    auto imm = last ? std::move(b).to_immutable() : b.copy().to_immutable();
+                    m_immutable_batch_scratch.emplace_back(std::move(imm), ts, md);
+                }
+                k = immutable_port->add_batch(
+                    std::span<typename input_port<immutable_buffer<T>>::queue_type>(m_immutable_batch_scratch),
+                    &bytes);
+                m_immutable_batch_scratch.clear(); // release any rejected suffix immediately
+            }
+            if (k > best_k) {
+                best_k = k;
+                best_bytes = bytes;
+            }
         }
+        // Consume the span in full (frozen v0.5 contract) — see the immutable overload.
+        for (auto& b : bufs) {
+            b = buffer_type{};
+        }
+        m_stats.record_transfer(best_bytes, best_k);
     }
 
     /// Convenience overload: wraps a plain metadata value (allocates per call).

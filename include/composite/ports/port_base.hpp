@@ -443,8 +443,10 @@ public:
         // public and reached directly by tests and by port_set::get_port<...base>
         // callers. send_data() static_casts the input to input_port<...<T>> based
         // solely on is_mutable(); a mismatched T is undefined behavior. Reject the
-        // connect instead of corrupting memory on the first send.
-        if (this->element_type_id() != port->element_type_id()) {
+        // connect instead of corrupting memory on the first send. Compared via
+        // type_index (exact), not element_type_id(): hash_code() is permitted to
+        // collide, and a collision here IS that undefined behavior.
+        if (this->element_type() != port->element_type()) {
             return false;
         }
         if (!port->claim_producer(this)) {
