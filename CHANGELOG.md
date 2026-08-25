@@ -70,7 +70,9 @@ All notable changes to **composite** are documented here. The project follows
 
 ---
 
-## 0.5.1 — unreleased
+## 0.5.1 — correctness and known-issue patch
+
+**Released:** 2026-08-25 (v0.5.1).
 
 Patch release: correctness fixes and the three v0.5.0 known issues. **No inherited object
 layout, vtable, or documented configuration shape changed** — the component ABI stays 1 and no
@@ -78,6 +80,13 @@ fleet source change is required. (One header-only, factory-heap-only type, `slab
 private counter member; it is not a type components inherit from or can embed by value — its
 constructor is tag-gated behind `create()` — so it is outside the ABI inventory above. Rebuild
 recommended as with any header change.)
+
+Release verification: full ctest under Debug/Werror, Release, ASan+UBSan, and TSan (59/59 in
+each); the installed package's exported affinity symbols and a packaged out-of-tree consumer
+build verified against the install tree; the `composite-comps` fleet configured against the
+packaged 0.5.1 candidate (`SameMinorVersion` accepts it under the fleet's 0.5.0 minimum) and
+passed 204/204 tests. The always-on `slab_pool::release()` validation measured within
+run-to-run noise on the pool acquire+release benchmark.
 
 ### Fixed (v0.5.0 known issues)
 
