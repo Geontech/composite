@@ -101,7 +101,13 @@ foreach(t
     # Deterministic coverage for observer/enumeration synchronization: reentrant metric removal
     # during initial enumeration, and an observer retiring itself. Neither schedule is reached by
     # ordinary runs — a regression is a UAF or a hang, so this is worth pinning explicitly.
-    test_registry_observer_sync)
+    test_registry_observer_sync
+    # 0.5.1 regression: pattern flags in a component id must render verbatim, not be compiled
+    # into the spdlog pattern (ids arrive from config files and POST /app/components)
+    test_logger
+    # EAL-arg logical->physical translation (--lcores rejection, guarded -l parsing);
+    # cpu_affinity.cpp lives in libcomposite as of 0.5.1, so plain linking suffices
+    test_cpu_affinity)
   composite_standalone_test(${t})
 endforeach()
 
@@ -149,6 +155,16 @@ target_link_libraries(test_http_integration PRIVATE
   composite::composite composite_warnings nlohmann_json::nlohmann_json spdlog::spdlog_header_only
   httplib::httplib Catch2::Catch2WithMain ${CMAKE_DL_LIBS})
 add_test(NAME TestHttpIntegration COMMAND test_http_integration)
+
+# Minimal loadable module (the suite's only dlopen'd component), for the POST /app/components
+# creation-parity regression: initialize() and the applied log level are observable as
+# properties, pinning REST-created == config-loaded behavior.
+add_library(test_parity_module MODULE test_parity_module.cpp)
+target_link_libraries(test_parity_module PRIVATE
+  composite::composite composite_warnings spdlog::spdlog_header_only)
+target_compile_definitions(test_http_integration PRIVATE
+  TEST_PARITY_MODULE_PATH="$<TARGET_FILE:test_parity_module>")
+add_dependencies(test_http_integration test_parity_module)
 
 ##############################
 # Ports Tests

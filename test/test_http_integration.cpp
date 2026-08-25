@@ -10,6 +10,7 @@
 #include "composite/core/application.hpp"
 #include "composite/core/component.hpp"
 #include "composite/metrics/registry.hpp"
+#include "composite/util/cpu_affinity.hpp"
 #include "helpers.hpp" // make_server consumes the production helpers
 
 #include <catch2/catch_test_macros.hpp>
@@ -820,6 +821,222 @@ TEST_CASE_METHOD(rest_fixture, "SSE metric stream cap -> 503, then frees", "[htt
         admitted_again = got_chunk;
     }
     REQUIRE(admitted_again);
+}
+
+TEST_CASE_METHOD(rest_fixture, "SSE stream does not delay server shutdown", "[http][hardening]") {
+    // 0.5.1 regression (v0.5.0 known issue): the stream's inter-event wait watched only client
+    // liveness, so stop() waited out the remaining interval — up to 60s, long enough for a
+    // container's grace period to SIGKILL the process past its telemetry/DPDK teardown. The
+    // wait now also polls is_running(); a full shutdown (stop + listen-thread join, which
+    // joins the worker running the stream) must complete within ~one 100ms poll, not the
+    // 20s interval this stream requests.
+    std::atomic<bool> got_first_event{false};
+    std::thread streamer([&] {
+        httplib::Client c("localhost", m_port);
+        c.set_read_timeout(30, 0);
+        c.Get("/app/metrics/stream?interval=20000", [&](const char*, size_t) -> bool {
+            got_first_event = true;
+            return true; // hold the stream open through the long interval
+        });
+    });
+    for (int i = 0; i < 400 && !got_first_event.load(); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE(got_first_event.load());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    m_server->stop();
+    if (m_thread.joinable()) {
+        m_thread.join(); // returns only after the worker running the stream provider exits
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    streamer.join();
+    REQUIRE(elapsed < std::chrono::seconds(5));
+}
+
+TEST_CASE_METHOD(rest_fixture, "POST /app/components applies log level and initialize()", "[http][hardening]") {
+    // 0.5.1 regression (v0.5.0 known issue): REST-created components skipped the process log
+    // level, cpu_affinity, and initialize(). The handler now runs the same setup_component()
+    // helper as the config loader, then calls initialize() per component. The probe module
+    // (test_parity_module.cpp) records both behaviors as properties at initialize() time.
+    // Deliberately NARROW parity: application-level "globals" merging and the app-wide startup
+    // sequence remain loader-only — this pins the log level and the initialize() call.
+    const auto saved = composite::global_log_level();
+    composite::set_global_log_level(composite::log_level::trace);
+    auto cli = client();
+    const nlohmann::json body{{"id", "probe"}, {"library", TEST_PARITY_MODULE_PATH}};
+    auto r = cli.Post("/app/components", body.dump(), "application/json");
+    composite::set_global_log_level(saved);
+    REQUIRE(r);
+    REQUIRE(r->status == 201);
+
+    auto props = cli.Get("/app/components/probe/properties");
+    REQUIRE(props);
+    REQUIRE(props->status == 200);
+    auto state = json::parse(props->body);
+    REQUIRE(state["initialized"] == true);   // initialize() ran on the REST path
+    REQUIRE(state["trace_enabled"] == true); // the process-wide log level was applied before it
+}
+
+TEST_CASE_METHOD(rest_fixture, "POST /app/components validates cpu_affinity", "[http][hardening]") {
+    // The REST path resolves "cpu_affinity" through the same setup_component() helper as the
+    // config loader. An unparsable value must fail the request (400) and leave NOTHING
+    // registered; "none" is the documented no-pinning value and must be accepted.
+    if (composite::process_available_cores().empty()) {
+        SUCCEED("no CPU capture in this environment; affinity resolution is disabled by design");
+        return;
+    }
+    auto cli = client();
+    {
+        const nlohmann::json body{
+            {"id", "badaff"}, {"library", TEST_PARITY_MODULE_PATH}, {"cpu_affinity", "not-a-core-list"}};
+        auto r = cli.Post("/app/components", body.dump(), "application/json");
+        REQUIRE(r);
+        REQUIRE(r->status == 400);
+        auto g = cli.Get("/app/components/badaff");
+        REQUIRE(g);
+        REQUIRE(g->status == 404); // the failed creation left no component behind
+    }
+    {
+        const nlohmann::json body{{"id", "noaff"}, {"library", TEST_PARITY_MODULE_PATH}, {"cpu_affinity", "none"}};
+        auto r = cli.Post("/app/components", body.dump(), "application/json");
+        REQUIRE(r);
+        REQUIRE(r->status == 201);
+    }
+    {
+        // A valid logical index resolves against process_available_cores() and is accepted.
+        const nlohmann::json body{{"id", "aff0"}, {"library", TEST_PARITY_MODULE_PATH}, {"cpu_affinity", "0"}};
+        auto r = cli.Post("/app/components", body.dump(), "application/json");
+        REQUIRE(r);
+        REQUIRE(r->status == 201);
+    }
+}
+
+TEST_CASE_METHOD(rest_fixture, "concurrent duplicate POST: one winner, loser does no damage", "[http][hardening]") {
+    // Codex-review finding on the 0.5.1 parity fix: without serialization, two concurrent
+    // creations of the same id could BOTH construct (and now initialize); the loser's
+    // ~component then removed every metric carrying the SHARED component_id label — deleting
+    // the winner's live lifecycle series — and initialize() side effects ran twice. Creation
+    // is now serialized per server: exactly one 201 per round, the rest 409, and the winner
+    // keeps its metrics and stays functional.
+    constexpr int rounds = 8;
+    constexpr int contenders = 4;
+    for (int round = 0; round < rounds; ++round) {
+        const auto id = std::string("dup") + std::to_string(round);
+        std::atomic<int> created{0};
+        std::atomic<int> conflicted{0};
+        std::atomic<int> other{0};
+        std::vector<std::thread> posters;
+        posters.reserve(contenders);
+        for (int t = 0; t < contenders; ++t) {
+            posters.emplace_back([&] {
+                httplib::Client c("localhost", m_port);
+                const nlohmann::json body{{"id", id}, {"library", TEST_PARITY_MODULE_PATH}};
+                auto r = c.Post("/app/components", body.dump(), "application/json");
+                if (r && r->status == 201) {
+                    created.fetch_add(1);
+                } else if (r && r->status == 409) {
+                    conflicted.fetch_add(1);
+                } else {
+                    other.fetch_add(1);
+                }
+            });
+        }
+        for (auto& t : posters) {
+            t.join();
+        }
+        REQUIRE(created.load() == 1);
+        REQUIRE(conflicted.load() == contenders - 1);
+        REQUIRE(other.load() == 0);
+
+        // The winner is intact: visible, initialized, and its lifecycle metrics (registered at
+        // construction under the component_id label) were NOT deregistered by a losing twin.
+        auto cli = client();
+        auto props = cli.Get(("/app/components/" + id + "/properties").c_str());
+        REQUIRE(props);
+        REQUIRE(props->status == 200);
+        REQUIRE(json::parse(props->body)["initialized"] == true);
+        auto m = cli.Get(("/app/metrics?label_key=component_id&label_value=" + id).c_str());
+        REQUIRE(m);
+        REQUIRE(m->status == 200);
+        REQUIRE(json::parse(m->body)["count"].get<int>() >= 4); // process_calls/noop/process_time/state
+    }
+}
+
+TEST_CASE_METHOD(rest_fixture, "a slow initialize() does not block unrelated creations", "[http][hardening]") {
+    // Codex re-review finding on the first concurrency fix: a single global creation mutex kept
+    // duplicate ids out, but held the lock while arbitrary component code ran in initialize() —
+    // one stuck initializer head-of-line blocked every other POST. Exclusivity is now a PER-ID
+    // reservation: the slow creation below must not delay the fast, unrelated one.
+    std::atomic<bool> slow_done{false};
+    std::atomic<int> slow_status{0}; // asserted on the MAIN thread after join (Catch2 macros are not thread-safe)
+    std::thread slow([&] {
+        httplib::Client c("localhost", m_port);
+        c.set_read_timeout(15, 0);
+        const nlohmann::json body{{"id", "slowinit"},
+                                  {"library", TEST_PARITY_MODULE_PATH},
+                                  {"properties", {{"init_delay_ms", 2000}}}};
+        auto r = c.Post("/app/components", body.dump(), "application/json");
+        slow_status = r ? r->status : -1;
+        slow_done = true;
+    });
+    // Give the slow creation time to enter initialize() (properties apply before it).
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    REQUIRE_FALSE(slow_done.load()); // it is genuinely still inside its 2s initialize()
+
+    auto cli = client();
+    const auto t0 = std::chrono::steady_clock::now();
+    const nlohmann::json body{{"id", "fastinit"}, {"library", TEST_PARITY_MODULE_PATH}};
+    auto r = cli.Post("/app/components", body.dump(), "application/json");
+    const auto fast_latency = std::chrono::steady_clock::now() - t0;
+    REQUIRE(r);
+    REQUIRE(r->status == 201);
+    REQUIRE(fast_latency < std::chrono::milliseconds(1000)); // not queued behind the 2s initializer
+    slow.join();
+    REQUIRE(slow_status.load() == 201); // the slow creation itself still succeeded
+}
+
+TEST_CASE_METHOD(rest_fixture, "REST cpu_affinity is applied to the worker, not merely accepted", "[http][hardening]") {
+    // Closes the coverage gap codex flagged: the 201-only check would still pass if
+    // set_cpu_affinity() were never called. The probe's worker self-reports the affinity mask
+    // it ACTUALLY runs under (pthread_getaffinity_np from process(), published as a property).
+    const auto& cores = composite::process_available_cores();
+    if (cores.size() < 2) {
+        SUCCEED("needs >= 2 available CPUs to distinguish a pinned mask from the full mask");
+        return;
+    }
+    auto cli = client();
+    const nlohmann::json body{
+        {"id", "affprobe"}, {"library", TEST_PARITY_MODULE_PATH}, {"cpu_affinity", "0"}}; // logical 0
+    auto r = cli.Post("/app/components", body.dump(), "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 201);
+
+    // Start its worker (RUNTIME enabled write is the start action) and wait for the report.
+    auto en = cli.Patch("/app/components/affprobe", R"({"properties": {"enabled": true}})", "application/json");
+    REQUIRE(en);
+    REQUIRE(en->status == 200);
+    std::string observed;
+    for (int i = 0; i < 400 && observed.empty(); ++i) {
+        std::this_thread::sleep_for(5ms);
+        auto props = cli.Get("/app/components/affprobe/properties");
+        REQUIRE(props);
+        observed = json::parse(props->body)["observed_cpus"].get<std::string>();
+    }
+    // Logical index 0 resolves to the first available physical core — and ONLY it.
+    REQUIRE(observed == std::to_string(cores.front()));
+}
+
+TEST_CASE("parse_dpdk_config rejects --lcores in every spelling", "[hardening]") {
+    // Rejection lives in parse_dpdk_config — the one choke point every load path goes through —
+    // NOT only in the core translator, which runs solely when CPU discovery produced a core
+    // list. Left to the translator, a failed discovery let --lcores reach EAL untouched.
+    const nlohmann::json two_token{{"enabled", true}, {"eal_args", {"-n", "4", "--lcores", "(0-1)@(0-1)"}}};
+    REQUIRE_THROWS_AS(composite::parse_dpdk_config(two_token), std::invalid_argument);
+    const nlohmann::json one_token{{"enabled", true}, {"eal_args", {"--lcores=(0-1)@(0-1)"}}};
+    REQUIRE_THROWS_AS(composite::parse_dpdk_config(one_token), std::invalid_argument);
+    const nlohmann::json plain_l{{"enabled", true}, {"eal_args", {"-l", "0-1", "-n", "4"}}};
+    REQUIRE_NOTHROW(composite::parse_dpdk_config(plain_l)); // the supported spelling stays accepted
 }
 
 #ifdef COMPOSITE_USE_OPENSSL
