@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -32,12 +33,22 @@ namespace composite {
  *
  * The derived class implements three hooks instead of process():
  *   - prepare(md)                  : main thread, ARRIVAL order (per metadata CHANGE, see below)
- *   - work(in, ts, md) -> out      : pool worker, CONCURRENT across packets
+ *   - work(in, ts, md[, ctx]) -> out : pool worker, CONCURRENT across packets
  *   - finalize(out, ts, md) -> bool: main thread, SUBMISSION order (false = drop)
- * plus optional on_workers_resized(n). Order-sensitive stages (prepare/finalize)
- * run single-threaded on the component's worker; the parallel stage (work) runs on
- * the pool. Output is emitted strictly in submission order regardless of which pool
- * worker finishes first.
+ * plus optional on_workers_resized(n) and ingest_context(). Order-sensitive stages
+ * (prepare/finalize) run single-threaded on the component's worker; the parallel stage
+ * (work) runs on the pool. Output is emitted strictly in submission order regardless of
+ * which pool worker finishes first.
+ *
+ * **Per-packet ingest context (FR-1):** work() runs arbitrarily later than ingest, so a
+ * subclass whose work() depends on runtime-changeable configuration cannot know which
+ * config generation a packet was accepted and metadata-stamped under — by the time work()
+ * loads the published snapshot, a RUNTIME write may have published a newer one. Override
+ * ingest_context() to return your published config snapshot (main thread, arrival order,
+ * called once per ingested packet immediately after the metadata is prepared): whatever it
+ * returns rides the packet's slot and is handed back to the 4-argument work() for exactly
+ * that packet. The slot's existing state release/acquire publishes it to the pool worker —
+ * no additional synchronization on the per-packet path.
  *
  * **Concurrency:** the component's single worker thread is the "main" thread — it
  * ingests (get_data, in order), submits to a free ring slot, and retires DONE
@@ -119,10 +130,36 @@ protected:
     /// per-packet counting. Default: no-op.
     virtual auto prepare(composite::metadata& /*md*/) -> void {}
 
-    /// The parallel stage: runs on a pool worker, concurrently across packets.
-    /// Must be thread-safe w.r.t. other workers (use worker_index() for per-worker
-    /// state). Returns the output buffer for this input.
-    virtual auto work(in_t in, timestamp ts, const composite::metadata& md) -> out_t = 0;
+    /// ARRIVAL order, main thread, called once per ingested packet (immediately after the
+    /// packet's metadata is prepared). Whatever this returns rides the packet's slot and is
+    /// handed back to the 4-argument work() for exactly this packet. Intended use: return
+    /// your published config snapshot (e.g. composite::snapshot<T>::load(), via
+    /// std::static_pointer_cast) so work() sees the SAME generation the packet was
+    /// prepared/stamped with, regardless of runtime changes while it was queued.
+    /// Default: nullptr.
+    virtual auto ingest_context() -> std::shared_ptr<const void> { return nullptr; }
+
+    /// The parallel stage: runs on a pool worker, concurrently across packets. Must be
+    /// thread-safe w.r.t. other workers (use worker_index() for per-worker state). Returns
+    /// the output buffer for this input.
+    ///
+    /// Override ONE of the two overloads. A context-using subclass overrides this
+    /// 4-argument form (ctx is the instance ingest_context() captured at THIS packet's
+    /// ingest; recover the type with std::static_pointer_cast). The default forwards to the
+    /// 3-argument form, so existing subclasses compile and behave unchanged.
+    virtual auto work(in_t in, timestamp ts, const composite::metadata& md, const std::shared_ptr<const void>& ctx)
+        -> out_t {
+        (void)ctx;
+        return work(std::move(in), ts, md);
+    }
+
+    /// The 3-argument form, for subclasses that need no per-packet context. Deliberately
+    /// NOT pure: a subclass that overrides the 4-argument form must remain instantiable
+    /// without a dead stub here. A subclass overriding NEITHER overload is a bug this
+    /// default turns into per-packet logged drops (the pool's containment path), not UB.
+    virtual auto work(in_t /*in*/, timestamp /*ts*/, const composite::metadata& /*md*/) -> out_t {
+        throw std::logic_error("pipeline_component: override work() (either the 3- or 4-argument overload)");
+    }
 
     /// SUBMISSION order, main thread. Decide keep/drop for this packet (false = not sent
     /// downstream). The metadata is read-only here — it is shared across packets; annotate
@@ -186,6 +223,7 @@ protected:
                 s.in = std::move(in);
                 s.ts = ts;
                 s.md = prepared_metadata(md); // shared across packets; prepare() runs per CHANGE
+                s.ctx = ingest_context();     // per-packet capture; published by the READY release below
                 s.err = nullptr;
                 s.state.store(slot::READY, std::memory_order_release);
                 {
@@ -244,7 +282,8 @@ private:
         in_t in{};
         out_t out{};
         timestamp ts{};
-        composite::metadata_ptr md{}; ///< shared prepared metadata; always non-null once submitted
+        composite::metadata_ptr md{};    ///< shared prepared metadata; always non-null once submitted
+        std::shared_ptr<const void> ctx{}; ///< ingest_context() capture; rides the slot to work() (FR-1)
         std::exception_ptr err{};
         // Retire-time latches (main-thread only): finalize() runs exactly once per slot even if the
         // send is deferred across an AWAIT_OUTPUT round-trip; `keep` records its decision so a DROPPED
@@ -352,6 +391,8 @@ private:
             s.in = in_t{};
             s.out = out_t{};
             s.md = nullptr;
+            s.ctx = nullptr; // release at retire: a downstream-held context must not outlive its
+                             // slot's recycling by more than the shared_ptr's own lifetime
             s.finalized = false;
             s.keep = false;
             s.state.store(slot::FREE, std::memory_order_release);
@@ -475,10 +516,12 @@ private:
             }
             slot& s = m_ring[my & m_mask];
             // s.state == READY here; run the parallel stage outside the lock. The slot holds
-            // its own metadata reference, so a concurrent rebuild of the prepared metadata on
-            // the main thread never invalidates *s.md.
+            // its own metadata and context references, so a concurrent rebuild of the prepared
+            // metadata (or a newer published config) on the main thread never invalidates
+            // *s.md or s.ctx. Always dispatched through the 4-argument overload; its default
+            // forwards to the 3-argument form for subclasses that ignore the context.
             try {
-                s.out = work(std::move(s.in), s.ts, *s.md);
+                s.out = work(std::move(s.in), s.ts, *s.md, s.ctx);
             } catch (...) {
                 s.err = std::current_exception();
             }

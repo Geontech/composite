@@ -37,8 +37,15 @@ namespace composite {
  * or the component vtable/ownership contract changes in an ABI-incompatible way. The
  * loader refuses to call create() on a library whose composite_abi_version() differs
  * from this value (a stale/foreign build whose contract may not match).
+ *
+ * History:
+ *  - 1: the v0.5 baseline (declared stable at v0.5.0-rc.1).
+ *  - 2: the 0.6 line. Opened by FR-1 (pipeline_component: ingest_context() + the
+ *       4-argument work() overload — vtable and slot-layout changes); every
+ *       layout/vtable-touching 0.6 change shares this one bump. Components built
+ *       against 0.5 must be rebuilt.
  */
-inline constexpr unsigned long abi_version = 1;
+inline constexpr unsigned long abi_version = 2;
 
 /**
  * @brief Construction-time arguments handed to a component factory.

@@ -83,6 +83,21 @@ longer match, and there is no window where a layout change could merge ahead of 
   committed v0.5.1 baselines under `benchmarks/baselines/`, and the scheduled non-gating
   `bench:baseline` CI job. Measurement-definition fixes are detailed in the commit; no
   production framework code changed.
+- **ABI 2 declared** (FR-1 opens the window; components built against 0.5 must be rebuilt —
+  the loader refuses ABI-1 modules).
+- **`pipeline_component`: per-packet ingest context (FR-1).** `work()` runs on pool threads
+  arbitrarily later than ingest, so a subclass whose `work()` depends on runtime-changeable
+  configuration could not know which config generation a packet was accepted and
+  metadata-stamped under. New `ingest_context()` hook (main thread, arrival order, once per
+  packet, immediately after metadata preparation) returns a `shared_ptr<const void>` that
+  rides the packet's slot and is handed to the new 4-argument `work()` overload for exactly
+  that packet — published by the slot's existing release/acquire pair, no new lock or atomic
+  on the per-packet path, released at retire. The 4-argument overload's default forwards to
+  the 3-argument form, so existing subclasses compile and behave unchanged; the 3-argument
+  form is no longer pure (a context-using subclass overrides only the 4-argument form), and
+  a subclass overriding neither gets per-packet logged drops instead of UB. Replaces the
+  fleet's stringly-keyed config-history workaround in `fft` (its deletion is the fleet-side
+  follow-up).
 
 ---
 

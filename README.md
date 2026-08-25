@@ -962,9 +962,18 @@ Override three hooks instead:
   carries a different metadata instance than the previous one, or after
   `invalidate_prepared_metadata()` (call that from your property handler when `prepare()` stamps
   values derived from config). Packets in between share the prepared result.
-- `work(InBuf in, timestamp ts, const metadata& md) -> OutBuf` — runs concurrently on the pool.
+- `work(InBuf in, timestamp ts, const metadata& md[, const shared_ptr<const void>& ctx]) -> OutBuf`
+  — runs concurrently on the pool. Override **one** of the two overloads: the 4-argument form
+  receives the per-packet ingest context (below); the 3-argument form is for stages that need
+  none. (Overriding neither turns every packet into a logged drop.)
 - `finalize(OutBuf& out, timestamp ts, const metadata& md) -> bool` — main thread, submission
   order; return `false` to drop the packet. Metadata is read-only here — annotate in `prepare()`.
+- `ingest_context() -> shared_ptr<const void>` (optional) — main thread, arrival order, once per
+  packet. Whatever it returns rides that packet's slot and is handed back to the 4-argument
+  `work()` for exactly that packet. Use it to bind each packet to the config generation it was
+  accepted under: return your published `snapshot<T>::load()` (via `std::static_pointer_cast`),
+  and `work()` sees the SAME generation the packet was prepared/stamped with, no matter how many
+  RUNTIME writes landed while it sat queued. Default: `nullptr`.
 
 `num_workers` is auto-registered as a RUNTIME property (range 1..1024); changing it drains the pool and
 rebuilds it at the new size. Because only the main thread sends, the single-producer invariant holds.
@@ -976,7 +985,10 @@ use-after-free). Publish an immutable value through **`composite::snapshot<T>`**
 (`<composite/properties/snapshot.hpp>`) from your property handler and `load()` it in `work()`: the
 returned `shared_ptr<const T>` keeps that value alive for as long as the worker holds it, however
 many times the publisher has since moved on. The same applies to any thread the park does not
-quiesce (e.g. a source's receiver threads).
+quiesce (e.g. a source's receiver threads). Note the distinction from `ingest_context()`: a bare
+`load()` in `work()` yields the **newest** generation at execution time; the ingest context yields
+the generation current at that packet's **ingest** — use the latter when the maths must match what
+`prepare()` stamped.
 
 ## Versioning & ABI
 
