@@ -4,11 +4,12 @@
 #
 
 # Executable
+# cpu_affinity.cpp moved into libcomposite (its declarations live in an installed header);
+# the CLI gets it by linking composite::composite like any other consumer.
 add_executable(composite-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpu_affinity.cpp
 )
 # Set RPATH property
 if(COMPOSITE_EMBED_MODULE_RPATH)

@@ -35,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -304,10 +305,19 @@ auto main(int argc, char** argv) -> int {
     if (dpdk_enabled) {
         spdlog::debug("initializing DPDK");
 
-        // Translate DPDK EAL args from logical to physical cores
+        // Translate DPDK EAL args from logical to physical cores. Guarded like the config
+        // parse above: the translator throws on --lcores and on unparsable -l tokens, and an
+        // escape here would bypass every cleanup path below to std::terminate.
         if (!available_cores.empty()) {
-            auto [translated_args, logical_cores] =
-                composite::translate_dpdk_eal_args(dpdk_cfg.eal_args, available_cores);
+            std::vector<std::string> translated_args;
+            std::vector<int> logical_cores;
+            try {
+                std::tie(translated_args, logical_cores) =
+                    composite::translate_dpdk_eal_args(dpdk_cfg.eal_args, available_cores);
+            } catch (const std::exception& e) {
+                spdlog::error("invalid dpdk configuration: {}", e.what());
+                return EXIT_FAILURE;
+            }
             dpdk_cfg.eal_args = translated_args;
             dpdk_logical_cores = logical_cores;
 

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <random>
 #include <spdlog/spdlog.h>
+#include <stdexcept>
 
 namespace composite {
 
@@ -174,6 +175,18 @@ auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config {
     // Parse EAL arguments
     if (dpdk_json.contains("eal_args") && dpdk_json["eal_args"].is_array()) {
         config.eal_args = dpdk_json["eal_args"].get<std::vector<std::string>>();
+        // Reject --lcores HERE, unconditionally — not only in the logical->physical translator,
+        // which runs only when CPU discovery produced a core list. Left to the translator alone,
+        // a failed discovery let --lcores reach EAL untouched: exactly the silent mixing of
+        // physical ids with the logical ids -l users write that the rejection exists to prevent.
+        // Both spellings ("--lcores <map>" and "--lcores=<map>") are refused.
+        for (const auto& arg : config.eal_args) {
+            if (arg == "--lcores" || arg.starts_with("--lcores=")) {
+                throw std::invalid_argument("DPDK --lcores is not supported: its core ids would bypass the "
+                                            "logical->physical translation applied to -l. Express the core "
+                                            "list with -l instead.");
+            }
+        }
     }
 
     // Parse port configurations

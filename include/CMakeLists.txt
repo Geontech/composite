@@ -11,6 +11,10 @@ set(COMPOSITE_SOURCES
     ${PROJECT_SOURCE_DIR}/src/registry.cpp
     # Logging facade backend (keeps spdlog out of the public headers)
     ${PROJECT_SOURCE_DIR}/src/logger.cpp
+    # CPU-affinity utilities: declared in an INSTALLED header (composite/util/cpu_affinity.hpp),
+    # so they must be linkable from composite::composite — until 0.5.1 they were compiled only
+    # into composite-cli, leaving the public declarations unresolvable for package consumers.
+    ${PROJECT_SOURCE_DIR}/src/cpu_affinity.cpp
 )
 
 if(COMPOSITE_USE_DPDK)

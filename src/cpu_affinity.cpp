@@ -10,6 +10,7 @@
 #include <fstream>
 #include <spdlog/spdlog.h>
 #include <sstream>
+#include <stdexcept>
 
 namespace composite {
 
@@ -229,6 +230,23 @@ auto parse_affinity_config(const std::string& affinity_str, const std::vector<in
     return cpuset;
 }
 
+auto process_available_cores() -> const std::vector<int>& {
+    // Captured once (magic static): the mask is a process-startup property, and re-reading it
+    // per call could hand two creation paths two different views of the machine.
+    static const std::vector<int> cores = [] {
+        std::vector<int> out;
+        if (const auto cpuset_opt = get_available_cpus()) {
+            for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+                if (CPU_ISSET(cpu, &(*cpuset_opt))) {
+                    out.push_back(cpu);
+                }
+            }
+        }
+        return out;
+    }();
+    return cores;
+}
+
 auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std::vector<int>& available_cores)
     -> std::pair<std::vector<std::string>, std::vector<int>> {
     std::vector<std::string> translated_args;
@@ -247,6 +265,22 @@ auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std
             std::string token;
             std::vector<int> physical_cores;
 
+            // Guarded parse: std::stoi throws on garbage, and this runs outside any config
+            // try/catch in the caller's error path — rewrap as invalid_argument naming the
+            // token so a typo'd core list fails the load cleanly instead of escaping main().
+            const auto parse_core = [](const std::string& text) -> int {
+                try {
+                    std::size_t consumed = 0;
+                    const int v = std::stoi(text, &consumed);
+                    if (consumed != text.size()) {
+                        throw std::invalid_argument{""};
+                    }
+                    return v;
+                } catch (const std::exception&) {
+                    throw std::invalid_argument("invalid DPDK lcore token '" + text + "' in -l list");
+                }
+            };
+
             while (std::getline(ss, token, ',')) {
                 token.erase(std::remove_if(token.begin(), token.end(), ::isspace), token.end());
                 if (token.empty()) continue;
@@ -254,8 +288,8 @@ auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std
                 // Check for range (e.g., "0-3")
                 size_t dash_pos = token.find('-');
                 if (dash_pos != std::string::npos) {
-                    int start = std::stoi(token.substr(0, dash_pos));
-                    int end = std::stoi(token.substr(dash_pos + 1));
+                    int start = parse_core(token.substr(0, dash_pos));
+                    int end = parse_core(token.substr(dash_pos + 1));
                     for (int logical = start; logical <= end; logical++) {
                         if (static_cast<size_t>(logical) < available_cores.size()) {
                             physical_cores.push_back(available_cores[logical]);
@@ -267,7 +301,7 @@ auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std
                     }
                 } else {
                     // Single logical core
-                    int logical = std::stoi(token);
+                    int logical = parse_core(token);
                     if (static_cast<size_t>(logical) < available_cores.size()) {
                         physical_cores.push_back(available_cores[logical]);
                         dpdk_logical_cores.push_back(logical);
@@ -288,14 +322,16 @@ auto translate_dpdk_eal_args(const std::vector<std::string>& eal_args, const std
 
             spdlog::debug("Translated DPDK -l {} (logical) -> {} (physical)", lcore_str, physical_str);
 
-        } else if (arg == "--lcores" && i + 1 < eal_args.size()) {
-            // --lcores format is more complex, e.g., "(0-1)@(0-1)"
-            // For now, log a warning and pass through unchanged
-            spdlog::warn("DPDK --lcores argument detected. Translation not yet implemented, "
-                         "passing through as-is. Use -l for automatic translation.");
-            translated_args.push_back(arg);
-            translated_args.push_back(eal_args[++i]);
-
+        } else if (arg == "--lcores" || arg.starts_with("--lcores=")) {
+            // REJECTED, not passed through: every other core list in the config is expressed in
+            // LOGICAL indices and translated to physical here, but --lcores has its own
+            // "(lcores)@(cpus)" grammar this translator does not implement. Passing it through
+            // untranslated silently mixed two coordinate systems in one config — the untranslated
+            // values were handed to EAL as PHYSICAL ids while -l users wrote logical ones. Fail
+            // the load loudly instead; -l covers the supported cases.
+            throw std::invalid_argument("DPDK --lcores is not supported: its core ids would bypass the "
+                                        "logical->physical translation applied to -l. Express the core list "
+                                        "with -l instead.");
         } else {
             // Pass through other arguments unchanged
             translated_args.push_back(arg);
