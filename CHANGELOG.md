@@ -70,6 +70,22 @@ All notable changes to **composite** are documented here. The project follows
 
 ---
 
+## 0.6.0 — unreleased (the ABI-2 window)
+
+The version stamps to 0.6.0 at the START of the 0.6 line — deliberately before the first
+ABI-breaking change, not with it. The SONAME is major.minor, so this flips the library to
+`libcomposite.so.0.6` immediately: a 0.5-pinned consumer (`find_package(composite 0.5)` under
+`SameMinorVersion`) REFUSES a develop build instead of silently loading one whose ABI may no
+longer match, and there is no window where a layout change could merge ahead of the bump.
+0.5-series patches continue from the `maint/0.5` branch. Release notes accumulate here.
+
+- Baseline-0: release-grade benchmark harness (`bench_datapath`, new `bench_registry`),
+  committed v0.5.1 baselines under `benchmarks/baselines/`, and the scheduled non-gating
+  `bench:baseline` CI job. Measurement-definition fixes are detailed in the commit; no
+  production framework code changed.
+
+---
+
 ## 0.5.1 — correctness and known-issue patch
 
 **Released:** 2026-08-25 (v0.5.1).
