@@ -46,6 +46,21 @@ it with `find_package(composite)` (or `pkg-config composite`) and links the impo
   opentelemetry-cpp).
 - `COMPOSITE_USE_DPDK` (default OFF) — build DPDK-backed source support.
 
+### Tests and Benchmarks
+
+`-DCOMPOSITE_BUILD_TESTS=ON` (the `default`/`ci`/`release`/sanitizer presets set it) builds the
+ctest suite: `cmake --preset default && cmake --build build/default && ctest --test-dir build/default`.
+
+Two benchmark binaries build alongside the tests but are deliberately **not** ctests (timing
+harnesses, not pass/fail): `bench_datapath` (allocation, SPSC hand-off, batch publish, fan-out,
+doorbell wake latency, N-hop chain throughput, `pipeline_component` slot-ring throughput) and
+`bench_registry` (metrics-registry registration/snapshot/filter/teardown scaling). Both print a
+human table and, with `--json`, write a versioned artifact carrying raw samples, spread, and
+environment metadata. Committed release baselines and the comparison/tolerance rules live in
+[`benchmarks/baselines/`](benchmarks/baselines/README.md); a scheduled, non-gating CI job
+(`bench:baseline`) produces fresh artifacts. Benchmark in Release on a quiet machine — Debug or
+sanitized numbers are not baselines.
+
 ### Container Images
 
 The repository builds two framework-only Rocky Linux 9 image roles:

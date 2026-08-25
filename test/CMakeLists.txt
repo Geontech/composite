@@ -118,12 +118,34 @@ if(COMPOSITE_USE_OPENTELEMETRY)
   composite_standalone_test(test_telemetry_grouping)
 endif()
 
-# Data-path benchmark (Perf-0): built so it cannot rot, but NOT registered as a
-# ctest (it is a timing harness, not pass/fail). Run from a scheduled,
-# non-gating CI job; the table output makes before/after diffs obvious.
+# Benchmarks (Baseline-0): built so they cannot rot, but NOT registered as ctests (timing
+# harnesses, not pass/fail). The scheduled, non-gating `bench:baseline` CI job runs them with
+# --json and uploads the artifacts; committed baselines live in benchmarks/baselines/. The
+# table output makes before/after diffs obvious; the JSON carries raw samples + environment.
+#
+# UNDO the directory-wide -UNDEBUG for the benchmarks. That flag exists so the TESTS' assert()s
+# stay live in every build type — but it also re-armed assertions inside the framework code the
+# benchmarks measure, so a "Release" benchmark quietly timed a build with assertions live (the
+# first committed baselines said so themselves: "assertions": "live"). Target options come
+# after directory options on the compile line, so re-defining NDEBUG here wins; the generator
+# expression keeps Debug builds honest (a Debug bench build still reports assertions live).
+# The artifact's meta block records assertions/optimized, and bench:baseline verifies both.
+set(COMPOSITE_BENCH_NDEBUG "$<$<NOT:$<CONFIG:Debug>>:-DNDEBUG>")
+
 add_executable(bench_datapath bench_datapath.cpp)
 target_include_directories(bench_datapath PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_options(bench_datapath PRIVATE ${COMPOSITE_BENCH_NDEBUG})
+target_compile_definitions(bench_datapath PRIVATE BENCH_CMAKE_CONFIG="$<CONFIG>")
 target_link_libraries(bench_datapath PRIVATE
+  composite::composite composite_warnings spdlog::spdlog_header_only Threads::Threads)
+
+# Registry profile: PERF-5's evidence (registration/snapshot/filter/teardown scaling) and the
+# sizing input for the Prometheus exposition path.
+add_executable(bench_registry bench_registry.cpp)
+target_include_directories(bench_registry PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_options(bench_registry PRIVATE ${COMPOSITE_BENCH_NDEBUG})
+target_compile_definitions(bench_registry PRIVATE BENCH_CMAKE_CONFIG="$<CONFIG>")
+target_link_libraries(bench_registry PRIVATE
   composite::composite composite_warnings spdlog::spdlog_header_only Threads::Threads)
 
 # Property tests on the new typed JSON model.

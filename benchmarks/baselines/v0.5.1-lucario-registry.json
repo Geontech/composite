@@ -1,0 +1,351 @@
+{
+  "cases": [
+    {
+      "cv": 0.08596841363640384,
+      "max": 2299.08,
+      "mean": 1999.0580000000002,
+      "median": 1917.68,
+      "min": 1887.7499999999998,
+      "name": "registry.register",
+      "params": {
+        "metrics": "100"
+      },
+      "samples": [
+        2299.08,
+        1986.33,
+        1917.68,
+        1904.45,
+        1887.7499999999998
+      ],
+      "samples_n": 5,
+      "stddev": 171.85584502716222,
+      "unit": "ns/metric"
+    },
+    {
+      "cv": 0.018595818339096296,
+      "max": 1655.8600000000001,
+      "mean": 1619.05,
+      "median": 1617.67,
+      "min": 1587.3899999999999,
+      "name": "registry.teardown_by_label",
+      "params": {
+        "metrics": "100"
+      },
+      "samples": [
+        1655.8600000000001,
+        1642.26,
+        1617.67,
+        1587.3899999999999,
+        1592.07
+      ],
+      "samples_n": 5,
+      "stddev": 30.10755968191386,
+      "unit": "ns/metric"
+    },
+    {
+      "cv": 0.02961079446425808,
+      "max": 48.56,
+      "mean": 46.884,
+      "median": 46.916000000000004,
+      "min": 44.736,
+      "name": "registry.snapshot_all",
+      "params": {
+        "metrics": "100",
+        "payload_bytes": "14560",
+        "retained_heap_bytes_mallinfo2": "38080"
+      },
+      "samples": [
+        44.736,
+        48.56,
+        47.410999999999994,
+        46.797,
+        46.916000000000004
+      ],
+      "samples_n": 5,
+      "stddev": 1.3882724876622758,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.44634353235203267,
+      "max": 101.50999999999999,
+      "mean": 56.45139999999999,
+      "median": 45.62,
+      "min": 44.085,
+      "name": "registry.snapshot_by_prefix",
+      "notes": "prefix matches 1/10 of the population",
+      "params": {
+        "metrics": "100"
+      },
+      "samples": [
+        101.50999999999999,
+        45.406,
+        45.636,
+        44.085,
+        45.62
+      ],
+      "samples_n": 5,
+      "stddev": 25.196717282217534,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.09058935785913647,
+      "max": 65.72399999999999,
+      "mean": 56.714200000000005,
+      "median": 55.17,
+      "min": 53.223,
+      "name": "registry.snapshot_by_label",
+      "notes": "label matches one component (10 series)",
+      "params": {
+        "metrics": "100"
+      },
+      "samples": [
+        65.72399999999999,
+        55.711000000000006,
+        55.17,
+        53.223,
+        53.742999999999995
+      ],
+      "samples_n": 5,
+      "stddev": 5.1377029594946375,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.52007984702149,
+      "max": 4723.546,
+      "mean": 3339.4364,
+      "median": 4376.358,
+      "min": 1319.771,
+      "name": "registry.register",
+      "params": {
+        "metrics": "1000"
+      },
+      "samples": [
+        4376.358,
+        4723.546,
+        4706.39,
+        1571.117,
+        1319.771
+      ],
+      "samples_n": 5,
+      "stddev": 1736.7735720499954,
+      "unit": "ns/metric"
+    },
+    {
+      "cv": 0.5789040412372227,
+      "max": 10827.319000000001,
+      "mean": 6220.3348,
+      "median": 3823.788,
+      "min": 3475.6420000000003,
+      "name": "registry.teardown_by_label",
+      "params": {
+        "metrics": "1000"
+      },
+      "samples": [
+        10827.319000000001,
+        9422.113,
+        3823.788,
+        3475.6420000000003,
+        3552.812
+      ],
+      "samples_n": 5,
+      "stddev": 3600.9769535685314,
+      "unit": "ns/metric"
+    },
+    {
+      "cv": 0.3556228818812832,
+      "max": 305.85900000000004,
+      "mean": 187.58600000000004,
+      "median": 154.49800000000002,
+      "min": 151.92800000000003,
+      "name": "registry.snapshot_all",
+      "params": {
+        "metrics": "1000",
+        "payload_bytes": "146500",
+        "retained_heap_bytes_mallinfo2": "429696"
+      },
+      "samples": [
+        305.85900000000004,
+        173.3,
+        154.49800000000002,
+        151.92800000000003,
+        152.345
+      ],
+      "samples_n": 5,
+      "stddev": 66.70987392058241,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.4489429974646215,
+      "max": 492.287,
+      "mean": 273.0304,
+      "median": 218.64700000000002,
+      "min": 216.87900000000002,
+      "name": "registry.snapshot_by_prefix",
+      "notes": "prefix matches 1/10 of the population",
+      "params": {
+        "metrics": "1000"
+      },
+      "samples": [
+        492.287,
+        220.153,
+        218.64700000000002,
+        216.87900000000002,
+        217.18599999999998
+      ],
+      "samples_n": 5,
+      "stddev": 122.5750861749646,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.03862635037091755,
+      "max": 242.12,
+      "mean": 226.54480000000004,
+      "median": 222.82399999999998,
+      "min": 221.292,
+      "name": "registry.snapshot_by_label",
+      "notes": "label matches one component (10 series)",
+      "params": {
+        "metrics": "1000"
+      },
+      "samples": [
+        242.12,
+        221.292,
+        223.733,
+        222.755,
+        222.82399999999998
+      ],
+      "samples_n": 5,
+      "stddev": 8.750598819509444,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.05039232370096244,
+      "max": 16664.7574,
+      "mean": 15453.150700000002,
+      "median": 15260.012999999999,
+      "min": 14542.894000000002,
+      "name": "registry.register",
+      "params": {
+        "metrics": "10000"
+      },
+      "samples": [
+        15606.294700000002,
+        16664.7574,
+        15260.012999999999,
+        15191.794399999999,
+        14542.894000000002
+      ],
+      "samples_n": 5,
+      "stddev": 778.7201722741544,
+      "unit": "ns/metric"
+    },
+    {
+      "cv": 0.09159305651367874,
+      "max": 51089.5974,
+      "mean": 46319.99486,
+      "median": 47108.1966,
+      "min": 39989.882900000004,
+      "name": "registry.teardown_by_label",
+      "params": {
+        "metrics": "10000"
+      },
+      "samples": [
+        51089.5974,
+        47108.1966,
+        44673.9874,
+        48738.31,
+        39989.882900000004
+      ],
+      "samples_n": 5,
+      "stddev": 4242.589906925289,
+      "unit": "ns/metric"
+    },
+    {
+      "cv": 0.3605931593343842,
+      "max": 5154.635,
+      "mean": 3286.8916,
+      "median": 2694.226,
+      "min": 2223.338,
+      "name": "registry.snapshot_all",
+      "params": {
+        "metrics": "10000",
+        "payload_bytes": "1474900",
+        "retained_heap_bytes_mallinfo2": "4346512"
+      },
+      "samples": [
+        3740.527,
+        2621.732,
+        2223.338,
+        5154.635,
+        2694.226
+      ],
+      "samples_n": 5,
+      "stddev": 1185.230626433649,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.2132883860424205,
+      "max": 5543.248,
+      "mean": 4111.0772,
+      "median": 3770.3480000000004,
+      "min": 3441.241,
+      "name": "registry.snapshot_by_prefix",
+      "notes": "prefix matches 1/10 of the population",
+      "params": {
+        "metrics": "10000"
+      },
+      "samples": [
+        5543.248,
+        3770.3480000000004,
+        3469.773,
+        4330.776,
+        3441.241
+      ],
+      "samples_n": 5,
+      "stddev": 876.8450208837932,
+      "unit": "us/call"
+    },
+    {
+      "cv": 0.12253589679601212,
+      "max": 4221.862,
+      "mean": 3553.4788,
+      "median": 3447.398,
+      "min": 3048.459,
+      "name": "registry.snapshot_by_label",
+      "notes": "label matches one component (10 series)",
+      "params": {
+        "metrics": "10000"
+      },
+      "samples": [
+        3048.459,
+        3447.398,
+        3672.6850000000004,
+        4221.862,
+        3376.99
+      ],
+      "samples_n": 5,
+      "stddev": 435.42871150361697,
+      "unit": "us/call"
+    }
+  ],
+  "meta": {
+    "affinity_cpus": 16,
+    "arch": "x86_64",
+    "assertions": "disabled",
+    "cmake_config": "Release",
+    "compiler": "14.2.0",
+    "cpu": "Intel(R) Xeon(R) Silver 4110 CPU @ 2.10GHz",
+    "framework_commit": "4825dd2442",
+    "governor": "powersave",
+    "harness": "bench_registry",
+    "harness_commit": "committed-with-artifact",
+    "harness_revision": 2,
+    "host": "lucario.geontech.com",
+    "kernel": "5.15.0-164-fips",
+    "metrics_per_component": 10,
+    "optimized": true,
+    "repetitions": 5,
+    "timestamp_utc": "2026-08-25T20:31:17Z"
+  },
+  "schema_version": 1
+}

@@ -281,6 +281,39 @@ build:portability-debian:
     - cmake --build build -j"$(nproc)"
     - ctest --test-dir build --output-on-failure
 
+# Scheduled benchmark run (Baseline-0). INFORMATIONAL — it uploads the JSON artifacts and
+# never gates a merge request: tolerance bands stay advisory until this runner's variance is
+# characterized against the committed baselines in benchmarks/baselines/. Runs from schedules
+# (and manually from the web UI), in Release: Debug or sanitized numbers are not baselines.
+# Comparisons are only meaningful between artifacts with the same schema_version and a
+# comparable "meta" block (CPU model, governor, runner) — the artifact records all of it.
+bench:baseline:
+  stage: build
+  extends: [.rocky]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  allow_failure: true
+  script:
+    - cmake --preset release
+    - cmake --build build/release --target bench_datapath bench_registry -j"$(nproc)"
+    - mkdir -p bench-results
+    - ./build/release/test/bench_datapath --reps 5 --json bench-results/datapath.json
+        --framework-commit "$CI_COMMIT_SHA" --harness-commit "$CI_COMMIT_SHA"
+    - ./build/release/test/bench_registry --reps 5 --json bench-results/registry.json
+        --framework-commit "$CI_COMMIT_SHA" --harness-commit "$CI_COMMIT_SHA"
+    # A benchmark of a build with assertions live (or unoptimized) is not a baseline — the
+    # first capture shipped exactly that, and only its own metadata caught it. Fail the job
+    # rather than upload misleading numbers.
+    - grep -q '"assertions"[:] "disabled"' bench-results/datapath.json
+    - grep -q '"optimized"[:] true' bench-results/datapath.json
+    - grep -q '"assertions"[:] "disabled"' bench-results/registry.json
+    - grep -q '"optimized"[:] true' bench-results/registry.json
+  artifacts:
+    paths: [bench-results/]
+    expire_in: 90 days
+
 # Install the package and build a downstream consumer against it via
 # find_package(composite). Guards the install/export/pkg-config surface: asserts
 # the generated version.hpp installs and the .pc declares Libs: (both were broken
