@@ -412,6 +412,23 @@ public:
     }
 
     /**
+     * @brief Number of invalid pointers refused by release().
+     *
+     * A non-zero value means a deleter handed back a pointer that is not a slot of this
+     * pool (foreign, or misaligned to the stride). Each refusal intentionally leaks one
+     * slot instead of corrupting the free stack, so a growing value pairs with available()
+     * never returning to capacity(). Always 0 in a correct program; check it the way
+     * histogram::rejected_observations() is checked. (A double release of a currently-free
+     * slot is NOT detectable by this check.)
+     *
+     * @note Thread-safe: relaxed atomic read
+     */
+    [[nodiscard]]
+    auto invalid_releases() const -> std::size_t {
+        return m_invalid_releases.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Get number of buffers currently acquired and not yet released.
      *
      * Returns count of buffers that have been acquired but not yet destroyed.
@@ -480,19 +497,33 @@ private:
      *
      * @note Thread-safe: a lock-free Treiber-stack CAS pushes the slot back (no mutex)
      * @note Private: Only callable by buffer deleter (not part of public API)
-     * @note Debug validation: Asserts on invalid pointers in debug builds
-     *
-     * @warning In release builds, no validation is performed for maximum performance.
-     *          Returning an invalid pointer will corrupt the free stack.
+     * @note Validation is ALWAYS on: the range + stride check is two compares against members
+     *       already in cache — noise next to the CAS that follows — and the release-build
+     *       alternative was silent free-stack corruption. An invalid pointer is REFUSED (the
+     *       slot is intentionally leaked rather than pushed) and counted in
+     *       invalid_releases() — silent-but-counted, the same posture as
+     *       histogram::record()'s rejected_observations(), and for the same reason: this runs
+     *       on a buffer-destruction path where throwing or aborting turns a bookkeeping bug
+     *       into a process fault. Note the check cannot detect a DOUBLE release of a
+     *       currently-free slot (that pointer is in range and aligned); only a foreign or
+     *       misaligned pointer.
      */
+    /// Test seam: release() is deliberately private (deleter-only), but its refusal path is
+    /// unreachable through the public API — the pool's own deleters always hand back the
+    /// pointer they were built with. An unconditional friend (not a COMPOSITE_TESTING branch,
+    /// which in a header-only template is the ODR hazard component.hpp documents) lets the
+    /// suite exercise the validation directly.
+    friend struct slab_pool_test_access;
+
     auto release(T* ptr) -> void {
-#ifndef NDEBUG
-        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        uintptr_t base = reinterpret_cast<uintptr_t>(m_slab.get());
-        bool in_range = (addr >= base) && (addr < base + m_total_bytes);
-        bool aligned = ((addr - base) % m_stride_bytes) == 0;
-        assert(in_range && aligned && "slab_pool: attempt to release invalid pointer");
-#endif
+        const auto addr = reinterpret_cast<uintptr_t>(ptr);
+        const auto base = reinterpret_cast<uintptr_t>(m_slab.get());
+        const bool in_range = (addr >= base) && (addr < base + m_total_bytes);
+        const bool aligned = in_range && ((addr - base) % m_stride_bytes) == 0;
+        if (!(in_range && aligned)) {
+            m_invalid_releases.fetch_add(1, std::memory_order_relaxed);
+            return; // refuse: leaking one slot beats corrupting the free stack
+        }
         const auto idx =
             static_cast<std::uint32_t>((reinterpret_cast<std::uint8_t*>(ptr) - m_slab.get()) / m_stride_bytes);
         push_index(idx);
@@ -598,6 +629,7 @@ private:
     /** @brief Count of buffers currently acquired (not yet released).
      *         available() is derived from this (capacity - outstanding). */
     std::atomic<std::size_t> m_outstanding{0};
+    std::atomic<std::size_t> m_invalid_releases{0}; ///< release() refusals — see invalid_releases()
 
 }; // class slab_pool
 
