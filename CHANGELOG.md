@@ -70,6 +70,32 @@ All notable changes to **composite** are documented here. The project follows
 
 ---
 
+## 0.5.2 — disabled-input gating patch
+
+**Released:** 2026-08-27 (v0.5.2).
+
+### Fixed
+
+- **Initially disabled components no longer accept and retain input.** A component configured
+  `enabled: false` before its first start matched neither branch of the enabled-reconcile
+  (`want=false`, no thread handle), so `pause_input_ports()` never ran and its inputs stayed
+  open at their configured depth. An enabled upstream producer then filled them with the
+  EARLIEST packets (drop-on-full retains the oldest), and a later enable consumed that stale
+  backlog first — observed in production as a snapshot anchored on a packet 89 minutes old.
+  Two changes close it: the reconcile now pauses inputs unconditionally whenever the desired
+  state is disabled (stopping remains conditional on a worker handle, and the "Disabling" log
+  no longer fires when there is no worker to stop), and `application::start()` reconciles every
+  desired-disabled component in a first pass so the disabled input gates exist before any
+  enabled producer starts — regardless of declaration order. Re-enabling still restores the
+  original configured depths (the saved-depth no-overwrite rule is pinned by a new test), and
+  packets already queued before an ordinary disable are still retained (deliberately unchanged;
+  discarding them is a separate policy decision). Regressions: never-started disabled pause,
+  hostile-order application startup with a producer that bursts during its own start hook
+  (deterministic, fails 3/3 on the old single-pass start), and repeated-reconcile depth
+  preservation — each demonstrated to fail with its half of the fix reverted.
+
+---
+
 ## 0.5.1 — correctness and known-issue patch
 
 **Released:** 2026-08-25 (v0.5.1).

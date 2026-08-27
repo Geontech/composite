@@ -81,8 +81,28 @@ public:
         // later-iterated component un-started. Start them all, collect failures, and surface the
         // aggregate afterward so the REST control plane reports WHICH components failed rather than a
         // single opaque 500 that also masks the ones that did start.
+        const auto components = snapshot();
+        // PASS 1 — establish the DISABLED input gates before any producer starts. Reconciling in
+        // one snapshot-order pass let an enabled producer that precedes a disabled consumer start
+        // sending before the consumer's inputs were paused: the consumer's ring retained the
+        // EARLIEST packets (drop-on-full keeps the oldest), and a later enable consumed that
+        // stale backlog first. Gating disabled components up front closes the ordering window
+        // regardless of declaration order. Failures here are deliberately not collected: pass 2
+        // re-reconciles every component and reports through the existing containment, so a
+        // pass-1 failure is retried once and reported once. (A concurrent RUNTIME `enabled`
+        // write is itself an immediate lifecycle action — startup does not serialize operator
+        // writes into a graph-wide transaction.)
+        for (auto& component : components) {
+            if (!component->is_enabled()) {
+                try {
+                    component->apply_lifecycle_changes(); // pauses inputs; no worker to start
+                } catch (...) { // NOLINT(bugprone-empty-catch) — pass 2 retries and reports
+                }
+            }
+        }
+        // PASS 2 — full reconcile in snapshot order (idempotent: pass-1-gated components no-op).
         std::vector<std::string> failures;
-        for (auto& component : snapshot()) {
+        for (auto& component : components) {
             try {
                 component->apply_lifecycle_changes(); // starts iff desired-enabled, atomically
             } catch (const std::exception& e) {
