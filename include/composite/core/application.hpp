@@ -254,8 +254,15 @@ public:
             auto topo = topology_lock();
             auto comps = snapshot();
             // A source has no incoming edge — no component's recorded connections target it.
+            // Classified against the UNION of m_components and m_unremovable: a peer retained
+            // in m_unremovable after a failed removal is still alive and still wired, so its
+            // recorded connections are as real as any registered component's. Classifying
+            // against m_components alone could call a component fed only by such a peer a
+            // "source" (missing its actual incoming edge) and hard-stop it without the upstream
+            // EOS this whole method exists to deliver.
+            auto peers = snapshot_with_unremovable();
             auto has_incoming = [&](const std::string& id) {
-                for (const auto& c : comps) {
+                for (const auto& c : peers) {
                     for (const auto& conn : c->connections()) {
                         if (conn.input.first == id) {
                             return true;
@@ -396,6 +403,12 @@ public:
                 return {nullptr};
             }
             others = m_components; // remaining peers (potential producers into / consumers of target)
+            // Plus anything parked in m_unremovable: a peer stuck there from an earlier failed
+            // removal is still alive and still wired (that is the whole reason it is retained
+            // rather than destroyed), so it can just as well be holding the edge into or out of
+            // THIS target. Missing it here would erase the target's registry entry and destroy
+            // it while that retained peer's port still points into it.
+            others.insert(others.end(), m_unremovable.begin(), m_unremovable.end());
         }
         // Stop the target so its worker is not sending/receiving during teardown.
         // CONTAINED: a failed stop (wedged worker / staged reaction) must NOT skip the
@@ -496,6 +509,21 @@ private:
     auto snapshot() const -> std::vector<component_ptr> {
         std::shared_lock lk{m_mtx};
         return m_components;
+    }
+
+    /// Copy of m_components with m_unremovable appended, both under the shared lock — every peer
+    /// that can still hold a live edge, whether or not it is reachable via lookup. A component
+    /// stuck in m_unremovable is NOT destroyed (that is the whole point of the vector), so its
+    /// ports are exactly as alive as any registered peer's: a producer parked there can still be
+    /// disconnected from, and still needs disconnecting FROM when one of its consumers/producers
+    /// is torn down. Treating m_components alone as "the peers" left such a producer's edge into
+    /// a since-removed consumer unquiesced, so the consumer was destroyed while the producer's
+    /// output port still held a raw pointer into it.
+    auto snapshot_with_unremovable() const -> std::vector<component_ptr> {
+        std::shared_lock lk{m_mtx};
+        auto all = m_components;
+        all.insert(all.end(), m_unremovable.begin(), m_unremovable.end());
+        return all;
     }
 
     std::string m_name;                ///< The name of the application.
