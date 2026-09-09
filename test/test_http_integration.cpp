@@ -1027,6 +1027,109 @@ TEST_CASE_METHOD(rest_fixture, "REST cpu_affinity is applied to the worker, not 
     REQUIRE(observed == std::to_string(cores.front()));
 }
 
+// Regression: PATCH /app/components/:id used to follow the RUNTIME set_properties() with an
+// unconditional apply_lifecycle_changes(). component::set_properties() already reconciles a
+// RUNTIME `enabled` write itself (the write IS the action), so that second call was redundant —
+// and harmful: reconcile_enabled_locked() keys its START decision off worker liveness alone, so
+// it restarted a component whose worker had already finished, even though the PATCH touched an
+// unrelated property and never asked for `enabled` to change.
+TEST_CASE_METHOD(rest_fixture, "RUNTIME PATCH of an unrelated property does not restart a "
+                                "self-finished component",
+                  "[http]") {
+    class finite_knob_comp : public component {
+    public:
+        explicit finite_knob_comp(std::string_view id) : component(id) {
+            add_property("knob", m_knob, config_type::RUNTIME);
+        }
+        auto process() -> retval override {
+            return (m_iters.fetch_add(1, std::memory_order_acq_rel) < 2) ? retval::NORMAL : retval::FINISH;
+        }
+        auto on_worker_start() -> void override {
+            component::on_worker_start();
+            m_starts.fetch_add(1, std::memory_order_release);
+        }
+        std::atomic<int> m_starts{0};
+        std::atomic<int> m_iters{0};
+        std::int32_t m_knob{0};
+        component::auto_stop m_auto_stop{*this}; // MUST be last
+    };
+
+    auto finite = std::make_shared<finite_knob_comp>("finite");
+    m_app.add_component(finite);
+
+    auto cli = client();
+    REQUIRE(cli.Post("/app/start")->status == 200);
+
+    REQUIRE(finite->wait_until_finished(2s));
+    REQUIRE(finite->finished_reason() == finish_reason::completed);
+    REQUIRE(finite->m_starts.load(std::memory_order_acquire) == 1);
+    REQUIRE_FALSE(finite->is_running());
+
+    auto patch = cli.Patch("/app/components/finite", R"({"properties": {"knob": 42}})", "application/json");
+    REQUIRE(patch);
+    REQUIRE(patch->status == 200);
+
+    // Give an erroneous restart time to happen before asserting that it didn't.
+    std::this_thread::sleep_for(100ms);
+
+    REQUIRE(finite->m_starts.load(std::memory_order_acquire) == 1); // not restarted
+    REQUIRE_FALSE(finite->is_running());
+    REQUIRE(finite->finished_reason() == finish_reason::completed);
+
+    // The knob write itself still landed — only the spurious restart is gone.
+    auto state = json::parse(cli.Get("/app/components/finite/properties")->body);
+    REQUIRE(state["knob"] == 42);
+}
+
+// Companion to the regression above: dropping the redundant apply_lifecycle_changes() call must
+// not lose the case it happened to also cover. A RUNTIME `enabled` write reconciles the worker
+// by itself, so PATCHing `enabled` through the same components route still starts a component
+// that was stopped, and still stops one that is running.
+TEST_CASE_METHOD(rest_fixture, "RUNTIME PATCH enabled still starts/stops via the components route",
+                  "[http]") {
+    class loop_comp : public component {
+    public:
+        explicit loop_comp(std::string_view id) : component(id) {}
+        auto process() -> retval override {
+            std::this_thread::sleep_for(5ms);
+            return retval::NOOP;
+        }
+        component::auto_stop m_auto_stop{*this}; // MUST be last
+    };
+
+    auto stopped = std::make_shared<loop_comp>("stopped");
+    stopped->set_properties(json{{"enabled", false}}, config_type::INITIALIZE);
+    m_app.add_component(stopped);
+    auto running = std::make_shared<loop_comp>("running");
+    m_app.add_component(running);
+
+    auto cli = client();
+    REQUIRE(cli.Post("/app/start")->status == 200);
+
+    for (int i = 0; i < 400 && !running->is_running(); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE(running->is_running());
+    std::this_thread::sleep_for(20ms);
+    REQUIRE_FALSE(stopped->is_running()); // enabled=false recorded before start: stayed stopped
+
+    auto up = cli.Patch("/app/components/stopped", R"({"properties": {"enabled": true}})", "application/json");
+    REQUIRE(up);
+    REQUIRE(up->status == 200);
+    for (int i = 0; i < 400 && !stopped->is_running(); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE(stopped->is_running());
+
+    auto down = cli.Patch("/app/components/running", R"({"properties": {"enabled": false}})", "application/json");
+    REQUIRE(down);
+    REQUIRE(down->status == 200);
+    for (int i = 0; i < 400 && running->is_running(); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE_FALSE(running->is_running());
+}
+
 TEST_CASE("parse_dpdk_config rejects --lcores in every spelling", "[hardening]") {
     // Rejection lives in parse_dpdk_config — the one choke point every load path goes through —
     // NOT only in the core translator, which runs solely when CPU discovery produced a core
