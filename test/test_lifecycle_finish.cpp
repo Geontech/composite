@@ -2,12 +2,16 @@
 // component::wait_until_finished(), application::wait_until_finished(), and the finished/finish_reason
 // fields in property_state(). Verifies: FINISH -> completed; a throw -> error; an external stop() is
 // NOT "finished"; restart clears the status; the app-level join waits for every component.
+#include "composite/buffers/buffer.hpp"
 #include "composite/core/application.hpp"
 #include "composite/core/component.hpp"
+#include "composite/core/pipeline_component.hpp"
+#include "composite/metrics/registry.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -127,6 +131,53 @@ public:
     std::vector<std::thread> m_pool;
     component::auto_stop m_auto_stop{*this};
 };
+
+// FINISHes on its first process() call; on_finished() sleeps to hold the completion tail open,
+// so a concurrent property write can be raced against it. Records is_running() at entry (must be
+// true: the park coordinator must not have published EXITING before the tail runs) and the instant
+// it returns (a racing write must not return before this).
+class slow_finisher : public component {
+public:
+    explicit slow_finisher(std::string_view id) : component(id) {}
+    auto process() -> retval override { return retval::FINISH; }
+    auto on_finished(finish_reason) -> void override {
+        m_running_at_entry.store(is_running(), std::memory_order_relaxed);
+        m_tail_started.store(true, std::memory_order_release); // let a waiting writer race the sleep below
+        std::this_thread::sleep_for(200ms);
+        m_finished_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    }
+    std::atomic<bool> m_running_at_entry{false};
+    std::atomic<bool> m_tail_started{false};
+    std::atomic<long long> m_finished_ns{0};
+    component::auto_stop m_auto_stop{*this};
+};
+
+// pipeline_component subclass whose finalize() (main worker thread, submission order) disables
+// itself via a RUNTIME `enabled` write after its first packet -- the pipeline_component analogue of
+// a worker self-write, and the shape most likely to leak a pool if disabling doesn't reap it.
+class self_disabling_pipeline : public pipeline_component<mutable_buffer<int>, mutable_buffer<int>> {
+public:
+    explicit self_disabling_pipeline(std::string_view id, int workers)
+        : pipeline_component(id, "in", "out", workers) {}
+
+protected:
+    auto work(in_t in, timestamp, const composite::metadata&) -> out_t override { return in; }
+    auto finalize(out_t&, timestamp, const composite::metadata&) -> bool override {
+        if (m_seen.fetch_add(1, std::memory_order_relaxed) == 0) {
+            set_properties(json{{"enabled", false}}, config_type::RUNTIME); // self-disable, worker thread
+        }
+        return true;
+    }
+
+public:
+    std::atomic<int> m_seen{0};
+    component::auto_stop m_auto_stop{*this};
+};
+
+auto live_thread_count() -> std::size_t {
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}));
+}
 } // namespace
 
 int main() {
@@ -287,11 +338,88 @@ int main() {
               "partial-start reap: on_worker_stop ran exactly once per start (throw + stop), no double/zero");
     }
 
+    // ---- REGRESSION: a concurrent property write during the completion tail must wait for the
+    //      tail (on_finished/send_eos), not race it -- and is_running() must stay true throughout ----
+    {
+        auto c = std::make_shared<slow_finisher>("slowfin");
+        c->start();
+        for (int i = 0; i < 2000 && !c->m_tail_started.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(c->m_tail_started.load(std::memory_order_acquire), "tail-park: on_finished() reached");
+
+        std::atomic<long long> write_returned_ns{0};
+        std::thread writer([&] {
+            c->set_properties(json{{"yield_interval", 4}}, config_type::RUNTIME);
+            write_returned_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                    std::memory_order_release);
+        });
+        writer.join();
+
+        check(c->wait_until_finished(2s), "tail-park: component finished");
+        check(c->m_running_at_entry.load(std::memory_order_relaxed),
+              "tail-park: is_running() was true on entry to on_finished (EXITING not published early)");
+        check(write_returned_ns.load(std::memory_order_acquire) >= c->m_finished_ns.load(std::memory_order_acquire),
+              "tail-park: the property write returned only AFTER on_finished()'s tail completed");
+    }
+
+    // ---- REGRESSION: a pipeline_component that disables itself (from the worker thread, mid-run)
+    //      must reap its pool and flip its state gauge just like a self-finish, even though it exits
+    //      with finish_reason::none (stop_locked() is not in that path) ----
+    {
+        constexpr int W = 4;
+        const auto baseline = live_thread_count();
+
+        auto pipe = std::make_shared<self_disabling_pipeline>("selfdis", W);
+        output_port<mutable_buffer<int>> feeder{"feed"};
+        auto* in = pipe->get_port<input_port_base>("in");
+        check(in != nullptr && feeder.connect(in), "selfdis: connect feeder");
+
+        pipe->start();
+        for (int i = 0; i < 500 && !pipe->is_running(); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(pipe->is_running(), "selfdis: pipeline running (main worker + pool up)");
+        check(live_thread_count() > baseline, "selfdis: thread count grew while running");
+
+        for (int s = 0; s < 3; ++s) {
+            auto b = make_mutable<int>(1);
+            b.as_span()[0] = s;
+            feeder.send_data(std::move(b), timestamp{});
+        }
+
+        for (int i = 0; i < 2000 && pipe->is_running(); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(!pipe->is_running(), "selfdis: pipeline stopped running after disabling itself");
+        check(pipe->wait_until_finished(2s), "selfdis: worker exited after the self-disable");
+
+        std::size_t after = live_thread_count();
+        for (int i = 0; i < 500 && after > baseline; ++i) {
+            std::this_thread::sleep_for(1ms);
+            after = live_thread_count();
+        }
+        check(after == baseline, "selfdis: pool threads joined -- thread count back to baseline");
+
+        bool found_state = false;
+        for (const auto& m : metrics::registry::instance().snapshot_by_label("component_id", pipe->id())) {
+            if (m.name == "composite.component.state") {
+                found_state = true;
+                check(std::get<double>(m.value) == 0.0, "selfdis: composite.component.state gauge reads 0");
+            }
+        }
+        check(found_state, "selfdis: found the component's state gauge");
+
+        feeder.disconnect(in);
+    }
+
     if (g_failures) {
         std::printf("\n%d FAILURE(S)\n", g_failures);
         return 1;
     }
     std::puts("LIFECYCLE FINISH OK: on_finished(reason), is_finished/finished_reason, "
-              "component + application wait_until_finished, restart-clears-status, property_state");
+              "component + application wait_until_finished, restart-clears-status, property_state, "
+              "a concurrent property write parking through the completion tail, and a self-disabling "
+              "pipeline_component reaping its pool + gauge");
     return 0;
 }

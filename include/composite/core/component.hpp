@@ -355,23 +355,32 @@ public:
     /// final buffered DATA at end-of-stream, override on_end_of_stream() instead — it runs earlier
     /// (as an ordinary worker iteration) and can safely send_data().
     ///
-    /// Keep this PROMPT. It runs during the completion tail while the park coordinator is still in
-    /// its RUNNING state, so a slow on_finished() (or a slow send_eos()) blocks any concurrent
-    /// property write's with_worker_parked() for its whole duration — long enough and that write hits
-    /// its park timeout and is REJECTED with an API-visible error, even though the component is
-    /// finishing normally. If completion needs an unbounded flush (e.g. a network drain), do it before
-    /// returning FINISH, not here.
+    /// Keep this PROMPT anyway. The park coordinator does not publish EXITING until the whole
+    /// completion tail (this hook, then send_eos()) has returned, so a concurrent property write's
+    /// with_worker_parked() cannot run inline alongside it: the write parks as if the worker were
+    /// still iterating, and is only released once EXITING is published — at which point it falls back
+    /// to running inline (the worker no longer reads). A slow on_finished() (or a slow send_eos())
+    /// therefore just makes that write wait longer, bounded by the park timeout; a tail slower than
+    /// the timeout still gets the write REJECTED with an API-visible error even though the component
+    /// is finishing normally. If completion needs an unbounded flush (e.g. a network drain), do it
+    /// before returning FINISH, not here.
     virtual auto on_finished(finish_reason /*reason*/) -> void {}
 
     /// Called ONCE on the worker thread when the base detects end-of-stream — process() returned
     /// NOOP while inputs_at_end() is true (every input drained + producer-closed) and finish_at_end
-    /// is set — just BEFORE the synthesized FINISH and the send_eos() that closes the outputs.
-    /// Override to emit any final held/buffered data via the normal send_data() path (a delay line's
-    /// last frame, a framer's partial residue, a partial accumulator). Unlike on_finished(), this
-    /// runs as an ordinary worker iteration (the park is in its normal RUNNING state, park_point()
-    /// already ran at loop-top), so a BOUNDED flush is safe here. Emission is best-effort on a full
-    /// output (drop-on-full); a component that must not drop its tail should pace via can_send().
-    /// A throw is caught and logged; the component still finishes. Default: no-op.
+    /// is set — just BEFORE the synthesized FINISH and the send_eos() that closes the outputs. Reached
+    /// ONLY through that NOOP-at-end promotion; nothing else calls it. Override to emit any final
+    /// held/buffered data via the normal send_data() path (a delay line's last frame, a framer's
+    /// partial residue, a partial accumulator). Unlike on_finished(), this runs as an ordinary worker
+    /// iteration (the park is in its normal RUNNING state, park_point() already ran at loop-top), so a
+    /// BOUNDED flush is safe here. Emission is best-effort on a full output (drop-on-full); a
+    /// component that must not drop its tail should pace via can_send().
+    ///
+    /// A throw here is treated exactly like a throw from process(): it is caught and logged, recorded
+    /// in finish_error(), and ends the worker with finish_reason::error — NOT the clean completion the
+    /// NOOP-at-end promotion was heading toward. In particular send_eos() is then skipped (an ERROR
+    /// exit never sends EOS), so a tail flush that fails does not misreport itself downstream as an
+    /// orderly close. Default: no-op.
     virtual auto on_end_of_stream() -> void {}
 
     /// Block until the worker has exited (whether it self-finished or was stopped). Returns
@@ -1775,6 +1784,22 @@ private:
 
         const completion_guard done{*this}; // outermost: signals even if everything below throws
 
+        // Guard SECOND-OUTERMOST, spanning BOTH the loop and the completion tail below — so
+        // EXITING is not published until finish_worker() (on_finished, send_eos, the resource
+        // reap) has actually finished. Declared here rather than inside worker_body() so it still
+        // brackets the tail: worker_body() used to construct it and it went out of scope the
+        // moment the loop ended, publishing EXITING to any parked writer WHILE the tail was still
+        // running user hooks and reading members — is_running() (and with_worker_parked(),
+        // including a component's own touched-from-the-hook properties) would report the worker
+        // already gone during on_finished()/send_eos(). Moving construction here — still BEFORE
+        // worker_body() calls worker_started() (park_exit costs nothing to construct early: a
+        // worker that never reaches RUNNING should still terminate in EXITING) — keeps the worker
+        // "live" through the whole tail, so a concurrent property write parks and waits for the
+        // tail to finish (bounded by the park timeout) instead of racing it inline. Destructed
+        // (LIFO) BEFORE `done`, so EXITING is published before m_worker_done — a
+        // wait_until_finished() waiter still only wakes once the worker has fully exited the park.
+        park_coordinator::exit_guard park_exit{m_park};
+
         // Apply the configured CPU affinity FROM THE WORKER ITSELF, before the first process()
         // iteration. The starter also applies it to the handle (start_locked), but by then this
         // thread is already running — that ordering let the first iterations execute unpinned,
@@ -1821,14 +1846,14 @@ private:
 
     auto worker_body(std::stop_token token) -> finish_reason {
         using enum retval;
-        // Guard FIRST. worker_started() publishes m_worker_id and the RUNNING state, and its
-        // wait can throw (std::system_error from the CV). A throw between that publish and the
-        // guard's construction would leave the coordinator RUNNING with m_worker_id naming a
-        // thread that no longer exists — permanently, since only ~exit_guard clears it, and an
-        // id the OS later recycles would hand an unrelated thread the worker's bypasses.
-        // Constructing the guard first costs nothing: publishing EXITING for a worker that never
-        // reached RUNNING is the correct terminal state either way.
-        park_coordinator::exit_guard park_exit{m_park};
+        // The exit_guard that publishes EXITING lives in thread_entry(), constructed BEFORE this
+        // function is called — i.e. still before worker_started() below, which is what actually
+        // matters: worker_started() publishes m_worker_id and the RUNNING state, and its wait can
+        // throw (std::system_error from the CV). A throw between that publish and the guard's
+        // construction would leave the coordinator RUNNING with m_worker_id naming a thread that no
+        // longer exists — permanently, since only ~exit_guard clears it, and an id the OS later
+        // recycles would hand an unrelated thread the worker's bypasses. See thread_entry() for why
+        // the guard now also has to outlive this function (it brackets the completion tail too).
         m_park.worker_started();
         std::uint32_t normal_streak = 0; // batched yield: consecutive NORMALs since the last sched_yield
         finish_reason exit_reason = finish_reason::none; // set iff the loop self-terminates (FINISH/throw)
@@ -1923,15 +1948,23 @@ private:
             // stream is over — synthesize a clean FINISH so the component self-completes and EOS
             // propagates (send_eos() fires below on finish_reason::completed). Sources (no inputs)
             // never trip this (inputs_at_end() == false). Give on_end_of_stream() one chance to emit
-            // held/buffered data first; then fall through to the FINISH dispatch (errored == false
-            // here, so exit_reason = completed). Opt out with finish_at_end = false.
+            // held/buffered data first; then fall through to the FINISH dispatch. errored is false on
+            // entry here (res == NOOP means process() returned normally this iteration), so the
+            // dispatch below reports finish_reason::completed UNLESS on_end_of_stream() itself throws
+            // — a failed tail flush is not an orderly completion, so it is reported the same way a
+            // throw from process() is: errored=true routes the dispatch to finish_reason::error, which
+            // skips send_eos() (an ERROR exit does not send EOS). Opt out with finish_at_end = false.
             if (res == NOOP && m_finish_at_end && inputs_at_end()) {
                 try {
                     on_end_of_stream();
                 } catch (const std::exception& e) {
                     logger()->error("component '{}' on_end_of_stream() threw: {}", m_id, e.what());
+                    set_finish_error(e.what());
+                    errored = true;
                 } catch (...) {
                     logger()->error("component '{}' on_end_of_stream() threw an unknown exception", m_id);
+                    set_finish_error("unknown exception");
+                    errored = true;
                 }
                 res = FINISH;
             }
@@ -1949,9 +1982,18 @@ private:
                 // rings — polling at the NOOP cadence; the token makes a plain stop() wake us
                 // immediately rather than wait out m_delay). disarm unconditionally so a later
                 // signal_data cannot find us armed while we are off processing.
+                //
+                // The re-check also covers a PRODUCER CLOSE (mark_producer_closed / send_eos), not
+                // just a data arrival: signal_data() only fires on the empty->non-empty edge of a
+                // ring, so a producer that closes without a final packet in flight never rings the
+                // doorbell at all. Without also re-testing for the EOS-by-default condition here, a
+                // close landing in the same window sleeps out the full m_delay before the next
+                // loop-top iteration notices inputs_at_end() — turning what should be immediate EOS
+                // propagation into an up-to-m_delay stall. Checking it here catches that close in the
+                // same Dekker window as an ordinary data arrival, so completion is detected promptly.
                 m_park.arm_doorbell();
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (!any_input_has_data()) {
+                if (!any_input_has_data() && !(m_finish_at_end && inputs_at_end())) {
                     m_park.wait_for_data(std::chrono::nanoseconds{m_delay}, token);
                 }
                 m_park.disarm_doorbell();
@@ -2028,30 +2070,34 @@ private:
         if (exit_reason == finish_reason::completed) {
             run_stage_contained("send_eos() at completion", [this] { send_eos(); });
         }
-        // Reap subclass worker resources on SELF-termination (FINISH / error). stop_locked() is NOT
-        // in the call path of a self-finish, so without this a pipeline_component's pool would linger
-        // (idle, but alive, holding N threads) until a later stop() / re-enable / destruction — a
-        // real window now that pipeline_component self-completes on inputs_at_end(). Exchange-guarded
-        // (see worker_resources_down) so a concurrent or subsequent stop_locked() cannot double-reap.
+        // Reap subclass worker resources on EVERY exit this tail reaches — including
+        // exit_reason::none. That covers a worker that latched its OWN exit via
+        // request_worker_exit_locked() rather than self-terminating with FINISH/error: a component
+        // disabling itself (set_properties({"enabled", false}, RUNTIME) from the worker thread) takes
+        // that path (see reconcile_enabled_locked()), and stop_locked() is NOT in the call path of a
+        // self-disable any more than it is of a self-finish — so gating this on exit_reason left a
+        // self-disabling pipeline_component's pool threads alive (idle, but running) and the state
+        // gauge stuck at 1.0 until some LATER stop()/re-enable/destruction happened to reap them.
+        // Exchange-guarded (see worker_resources_down) so a concurrent or subsequent stop_locked()
+        // cannot double-reap.
         //
         // MANDATORY: reached whatever the stages above did, and ordered BEFORE thread_entry()'s
         // completion_guard publishes m_worker_done — so a wait_until_finished() waiter observes a
         // genuinely quiesced component (pool joined), which is the guarantee this ordering exists
         // to provide. Safe from this (the main worker) thread: on_worker_stop() joins the POOL
         // threads, never this one.
-        if (exit_reason != finish_reason::none) {
-            run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
-            // Flip the exported state gauge to "stopped" — a self-finished worker is no longer running,
-            // and stop_locked() (the only OTHER writer) is NOT in this call path, so without this the
-            // composite.component.state metric would report 1.0/"running" forever after a batch/source
-            // graph completes, contradicting is_running(). Ordered after the reap so the gauge flips to
-            // 0 only once the component is fully quiesced, mirroring stop_locked().
-            run_stage_contained("state gauge update at completion", [this] {
-                if (m_state) {
-                    m_state->set(0.0);
-                }
-            });
-        }
+        run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
+        // Flip the exported state gauge to "stopped" unconditionally too — a worker that has left
+        // this tail is no longer running whether it self-finished or self-disabled, and stop_locked()
+        // (the only OTHER writer) is NOT in either path, so gating this the same way as on_finished()/
+        // send_eos() left the composite.component.state metric reporting 1.0/"running" for a
+        // self-disabled component, contradicting is_running(). Ordered after the reap so the gauge
+        // flips to 0 only once the component is fully quiesced, mirroring stop_locked().
+        run_stage_contained("state gauge update at completion", [this] {
+            if (m_state) {
+                m_state->set(0.0);
+            }
+        });
     }
 
 }; // class component
