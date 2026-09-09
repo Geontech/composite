@@ -1414,23 +1414,36 @@ private:
             logger()->debug("Enabling component '{}'", m_id);
             resume_input_ports();
             start_locked();
-        } else if (!want && has_handle) {
-            logger()->debug("Disabling component '{}'", m_id);
+        } else if (!want) {
+            // Pause UNCONDITIONALLY on desired-disabled — even when no worker handle exists.
+            // The old `!want && has_handle` guard matched neither branch for an INITIALLY
+            // disabled component (want=false, has_handle=false), so its inputs stayed open at
+            // their configured depth: an enabled upstream producer filled them with the
+            // EARLIEST packets (drop-on-full keeps the oldest), and a later enable consumed
+            // that stale backlog first — observed in production as a snapshot anchored 89
+            // minutes in the past. Disabled means depth 0 from the first reconcile onward.
+            // Idempotent: pause_input_ports() never overwrites an earlier saved depth with
+            // the paused 0, so repeated disabled reconciles stay safe and the eventual enable
+            // restores the ORIGINAL depth. Stopping stays conditional on a handle (there may
+            // be nothing to stop, and logging "Disabling" with no worker would be a lie).
             pause_input_ports();
-            if (m_park.on_worker_thread()) {
-                // The worker is disabling ITSELF (set_properties({"enabled": false}) from
-                // process() or an on_change reaction — a supported, schema-advertised write).
-                // stop_locked() would join this very thread: it would wait for m_worker_done,
-                // which only this thread can set, and hold m_lifecycle_mtx while doing it, so
-                // every later stop()/start() on the component would wedge behind it too.
-                // Latch the request instead and let the worker unwind through its own completion
-                // tail, which already reaps worker resources and flips the state gauge. The
-                // jthread handle survives until someone joins it; reconcile_enabled_locked()
-                // keys its START decision off liveness rather than the handle precisely so a
-                // later re-enable still restarts correctly.
-                request_worker_exit_locked();
-            } else {
-                stop_locked();
+            if (has_handle) {
+                logger()->debug("Disabling component '{}'", m_id);
+                if (m_park.on_worker_thread()) {
+                    // The worker is disabling ITSELF (set_properties({"enabled": false}) from
+                    // process() or an on_change reaction — a supported, schema-advertised write).
+                    // stop_locked() would join this very thread: it would wait for m_worker_done,
+                    // which only this thread can set, and hold m_lifecycle_mtx while doing it, so
+                    // every later stop()/start() on the component would wedge behind it too.
+                    // Latch the request instead and let the worker unwind through its own
+                    // completion tail, which already reaps worker resources and flips the state
+                    // gauge. The jthread handle survives until someone joins it;
+                    // reconcile_enabled_locked() keys its START decision off liveness rather than
+                    // the handle precisely so a later re-enable still restarts correctly.
+                    request_worker_exit_locked();
+                } else {
+                    stop_locked();
+                }
             }
         }
     }
