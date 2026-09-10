@@ -631,6 +631,38 @@ public:
         return true;
     }
 
+    /// Run @p fn with the data write-lock held and this thread published as park owner — WITHOUT
+    /// the admission gate or the in-flight count. For the worker's own resource teardown after its
+    /// exit_guard has published EXITING: every property writer arriving from then on takes the
+    /// inline path and runs its fn under this same lock, so holding it here excludes them for the
+    /// duration of the reap; a writer admitted earlier is dealt with by drain_in_flight_for() first.
+    /// Publishing the owner lets a nested self-write from inside @p fn re-enter through the owner
+    /// fast path instead of deadlocking on the non-recursive lock.
+    ///
+    /// Bounded, and never blocks on the admission gate: a writer that will not leave the lock (an
+    /// on_apply that itself waits on this worker's exit) must not wedge the exit. Returns false —
+    /// and does NOT run @p fn — if the lock could not be taken within @p timeout.
+    template <typename Fn>
+    [[nodiscard]] auto try_run_excluding_writers(std::chrono::nanoseconds timeout, Fn&& fn) -> bool {
+        constexpr int k_spins_before_sleep = 64;
+        std::unique_lock data_lk{m_data_mtx, std::defer_lock};
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (int spins = 0; !data_lk.try_lock(); ++spins) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            if (spins < k_spins_before_sleep) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        m_park_owner.store(std::this_thread::get_id(), std::memory_order_release);
+        owner_clear clear{*this};
+        fn();
+        return true;
+    }
+
     [[nodiscard]] auto current_state() const -> state { return m_park.load(std::memory_order_acquire); }
 
     /// True if a worker thread exists that will reach a loop point (i.e. NOT

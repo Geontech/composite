@@ -1790,56 +1790,66 @@ private:
         static_assert(noexcept(record_worker_fault("")), "recording an escaped fault must not throw");
         static_assert(noexcept(emergency_note("", "")), "the last-ditch note must not throw");
 
+        static_assert(noexcept(reap_after_exit(finish_reason::none)),
+                      "reap_after_exit must not be able to abandon the teardown");
+
         const completion_guard done{*this}; // outermost: signals even if everything below throws
         t_self_exit_requested = false;      // a recycled thread must not inherit a stale self-exit
 
-
-        // Guard SECOND-OUTERMOST, spanning BOTH the loop and the completion tail below — so
-        // EXITING is not published until finish_worker() (on_finished, send_eos, the resource
-        // reap) has actually finished. Declared here rather than inside worker_body() so it still
-        // brackets the tail: worker_body() used to construct it and it went out of scope the
-        // moment the loop ended, publishing EXITING to any parked writer WHILE the tail was still
-        // running user hooks and reading members — is_running() (and with_worker_parked(),
-        // including a component's own touched-from-the-hook properties) would report the worker
-        // already gone during on_finished()/send_eos(). Moving construction here — still BEFORE
-        // worker_body() calls worker_started() (park_exit costs nothing to construct early: a
-        // worker that never reaches RUNNING should still terminate in EXITING) — keeps the worker
-        // "live" through the whole tail, so a concurrent property write parks and waits for the
-        // tail to finish (bounded by the park timeout) instead of racing it inline. Destructed
-        // (LIFO) BEFORE `done`, so EXITING is published before m_worker_done — a
-        // wait_until_finished() waiter still only wakes once the worker has fully exited the park.
-        park_coordinator::exit_guard park_exit{m_park};
-
-        // Apply the configured CPU affinity FROM THE WORKER ITSELF, before the first process()
-        // iteration. The starter also applies it to the handle (start_locked), but by then this
-        // thread is already running — that ordering let the first iterations execute unpinned,
-        // observable as work landing on excluded cores at every start. Self-application closes
-        // the window: no iteration runs before the mask is in force. (m_cpu_affinity is set
-        // before start and not mutated while the worker lives, so this read is race-free.)
-        if (m_cpu_affinity.has_value()) {
-            // pthread_setaffinity_np RETURNS the error code (it does not set errno).
-            if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(*m_cpu_affinity), &(*m_cpu_affinity));
-                rc != 0) {
-                m_logger->warn("Failed to set thread CPU affinity: {}", strerror(rc));
-            }
-        }
-
         auto exit_reason = finish_reason::none;
+        {
+            // Guard spanning the loop AND the hook tail (on_finished, the staged-reaction drain,
+            // send_eos) — so EXITING is not published until those have returned. worker_body() used
+            // to construct it and it went out of scope the moment the loop ended, publishing EXITING
+            // to any parked writer WHILE the tail was still running user hooks and reading members:
+            // is_running() (and with_worker_parked(), including a component's own touched-from-the-
+            // hook properties) reported the worker already gone during on_finished()/send_eos().
+            // Constructed here — still BEFORE worker_body() calls worker_started() (park_exit costs
+            // nothing to construct early: a worker that never reaches RUNNING should still terminate
+            // in EXITING) — it keeps the worker "live" through the hooks, so a concurrent property
+            // write parks and waits for them (bounded by the park timeout) instead of racing them
+            // inline. It deliberately does NOT span reap_after_exit() below: the reap must wait for
+            // admitted writers to leave, and they can only leave once EXITING releases them.
+            park_coordinator::exit_guard park_exit{m_park};
+
+            // Apply the configured CPU affinity FROM THE WORKER ITSELF, before the first process()
+            // iteration. The starter also applies it to the handle (start_locked), but by then this
+            // thread is already running — that ordering let the first iterations execute unpinned,
+            // observable as work landing on excluded cores at every start. Self-application closes
+            // the window: no iteration runs before the mask is in force. (m_cpu_affinity is set
+            // before start and not mutated while the worker lives, so this read is race-free.)
+            if (m_cpu_affinity.has_value()) {
+                // pthread_setaffinity_np RETURNS the error code (it does not set errno).
+                if (const int rc =
+                        pthread_setaffinity_np(pthread_self(), sizeof(*m_cpu_affinity), &(*m_cpu_affinity));
+                    rc != 0) {
+                    m_logger->warn("Failed to set thread CPU affinity: {}", strerror(rc));
+                }
+            }
+
+            try {
+                exit_reason = worker_body(std::move(token));
+            } catch (const std::exception& ex) {
+                exit_reason = finish_reason::error;
+                record_worker_fault(ex.what());
+            } catch (...) {
+                exit_reason = finish_reason::error;
+                record_worker_fault("unknown exception escaped the worker loop");
+            }
+            try {
+                finish_worker(exit_reason);
+            } catch (const std::exception& ex) {
+                emergency_note(m_id.c_str(), ex.what());
+            } catch (...) {
+                emergency_note(m_id.c_str(), "exception escaped worker finalization");
+            }
+        } // EXITING published; parked writers are released and run inline from here on
         try {
-            exit_reason = worker_body(std::move(token));
-        } catch (const std::exception& ex) {
-            exit_reason = finish_reason::error;
-            record_worker_fault(ex.what());
-        } catch (...) {
-            exit_reason = finish_reason::error;
-            record_worker_fault("unknown exception escaped the worker loop");
-        }
-        try {
-            finish_worker(exit_reason);
+            reap_after_exit(exit_reason);
         } catch (const std::exception& ex) {
             emergency_note(m_id.c_str(), ex.what());
         } catch (...) {
-            emergency_note(m_id.c_str(), "exception escaped worker finalization");
+            emergency_note(m_id.c_str(), "exception escaped worker resource teardown");
         }
     }
 
@@ -2086,37 +2096,84 @@ private:
         if (exit_reason == finish_reason::completed) {
             run_stage_contained("send_eos() at completion", [this] { send_eos(); });
         }
-        // Reap subclass worker resources here only when NOBODY ELSE will: a self-terminating
-        // worker (FINISH / error) and a worker that latched its OWN exit by disabling itself
-        // (set_properties({"enabled", false}, RUNTIME) from the worker thread, see
-        // reconcile_enabled_locked()) — stop_locked() is in neither call path, so without this a
-        // pipeline_component's pool would linger (idle, but alive, holding N threads) and the state
-        // gauge would read 1.0 until a later stop()/re-enable/destruction.
-        //
-        // An EXTERNAL stop (exit_reason none, not self-requested) must NOT reap here: stop_locked()
-        // owns that teardown and orders it correctly — join this thread, settle the park, DRAIN the
-        // property writers it already admitted (one may be inside on_park_requested() right now,
-        // touching the very resources on_worker_stop() frees), and only then reap. Reaping from this
-        // thread would run ahead of that drain. Exchange-guarded (see worker_resources_down) so the
-        // two paths can never double-reap.
-        //
-        // MANDATORY on the self paths: reached whatever the stages above did, and ordered BEFORE
-        // thread_entry()'s completion_guard publishes m_worker_done — so a wait_until_finished()
-        // waiter observes a genuinely quiesced component (pool joined). Safe from this (the main
-        // worker) thread: on_worker_stop() joins the POOL threads, never this one.
-        if (exit_reason != finish_reason::none || t_self_exit_requested) {
-            run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
-            // Flip the exported state gauge to "stopped" — a self-finished or self-disabled worker is
-            // no longer running, and stop_locked() (the only OTHER writer) is not in either path, so
-            // without this composite.component.state would report 1.0/"running" forever after a
-            // batch/source graph completes, contradicting is_running(). Ordered after the reap so the
-            // gauge flips to 0 only once the component is fully quiesced, mirroring stop_locked().
-            run_stage_contained("state gauge update at completion", [this] {
-                if (m_state) {
-                    m_state->set(0.0);
-                }
-            });
+        // Worker resources (on_worker_stop) and the state gauge are handled by reap_after_exit(),
+        // AFTER the exit guard has published EXITING — see there for why the reap cannot live here.
+    }
+
+    /// Final stage of the worker thread, run AFTER the exit guard has published EXITING: tear down
+    /// subclass worker resources (the pool) and flip the state gauge — but only when NOBODY ELSE
+    /// will, and only once the property writers already admitted have left.
+    ///
+    /// Who reaps:
+    ///  - A self-terminating worker (FINISH / error) and a worker that latched its OWN exit by
+    ///    disabling itself (set_properties({"enabled", false}, RUNTIME) from the worker thread, see
+    ///    reconcile_enabled_locked()) reap HERE — stop_locked() is in neither call path, so without
+    ///    this a pipeline_component's pool would linger (idle, but alive, holding N threads) and
+    ///    the state gauge would read 1.0 until a later stop()/re-enable/destruction.
+    ///  - An EXTERNAL stop (exit_reason none, not self-requested) must NOT reap here: stop_locked()
+    ///    owns that teardown and orders it correctly — join this thread, settle the park, DRAIN the
+    ///    writers it already admitted, then reap. Exchange-guarded (see worker_resources_down) so
+    ///    the two paths can never double-reap, whichever runs first.
+    ///
+    /// Why the drain: a property writer admitted before the exit can still be inside its poke —
+    /// on_park_requested(), a user hook that may read the very resources on_worker_stop() frees.
+    /// It cannot leave until EXITING releases it (which is why this runs outside the exit guard),
+    /// and stop_locked() waits for exactly that before ITS reap. The self paths wait the same way.
+    /// A writer wedged inside a hook past the bound is reported and the resources are LEFT UP for
+    /// the next stop_locked() to reap (a bounded leak, never a free under a live reader).
+    ///
+    /// Why the exclusion: once EXITING is published, a NEW writer runs inline under the park's
+    /// data write-lock, and its property_change_handler()/on_apply may read the same resources. The
+    /// reap therefore runs under that lock too (park_coordinator::try_run_excluding_writers), so an
+    /// inline writer either finishes before the reap or starts after it — never alongside it.
+    /// Bounded like the drain: a writer that will not leave the lock (an on_apply that waits on this
+    /// very exit) is reported and the resources are left for the next stop_locked().
+    ///
+    /// Deliberately NOT deferred to whoever holds the lifecycle lock or the admission gate: both
+    /// are held by callers that may or may not go on to reap — the initial start() still holds the
+    /// lifecycle lock while a fast worker finishes, and a try_stop() holds the gate only until its
+    /// deadline — so "the holder will reap" leaked resources when it did not. Taking the gate here
+    /// would race a concurrent stop_locked() for its ownership; the data lock has no owner protocol
+    /// and is exactly what the inline path serializes on.
+    ///
+    /// Ordered BEFORE thread_entry()'s completion_guard publishes m_worker_done — so a
+    /// wait_until_finished() waiter observes a genuinely quiesced component (pool joined). Safe
+    /// from this (the main worker) thread: on_worker_stop() joins the POOL threads, never this one.
+    auto reap_after_exit(finish_reason exit_reason) noexcept -> void {
+        if (exit_reason == finish_reason::none && !t_self_exit_requested) {
+            return; // external stop(): stop_locked() joins, drains, and reaps
         }
+        if (!m_park.drain_in_flight_for(k_stop_report_interval)) {
+            run_stage_contained("in-flight writer drain at completion", [this] {
+                logger()->error("{}: a property write was still in flight {}s after the worker exited — its "
+                                "on_park_requested()/on_apply is not returning; leaving worker resources up "
+                                "for the next stop() to reap rather than freeing them under it.",
+                                m_id, static_cast<int>(k_stop_report_interval.count()));
+            });
+            return;
+        }
+        const bool reaped = m_park.try_run_excluding_writers(k_stop_report_interval, [this] {
+            run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
+        });
+        if (!reaped) {
+            run_stage_contained("writer exclusion at completion", [this] {
+                logger()->error("{}: a property write held the data lock {}s after the worker exited — its "
+                                "property_change_handler()/on_apply is not returning; leaving worker resources "
+                                "up for the next stop() to reap rather than freeing them under it.",
+                                m_id, static_cast<int>(k_stop_report_interval.count()));
+            });
+            return;
+        }
+        // Flip the exported state gauge to "stopped" — a self-finished or self-disabled worker is no
+        // longer running, and stop_locked() (the only OTHER writer) is not in either path, so without
+        // this composite.component.state would report 1.0/"running" forever after a batch/source
+        // graph completes, contradicting is_running(). Ordered after the reap so the gauge flips to 0
+        // only once the component is fully quiesced, mirroring stop_locked().
+        run_stage_contained("state gauge update at completion", [this] {
+            if (m_state) {
+                m_state->set(0.0);
+            }
+        });
     }
 
 }; // class component

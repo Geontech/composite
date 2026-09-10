@@ -217,6 +217,51 @@ public:
     component::auto_stop m_auto_stop{*this};
 };
 
+// REGRESSION: a SELF-DISABLE (set_properties({"enabled", false}, RUNTIME) issued from the worker's
+// own process()) must drain an ADMITTED property write before reaping subclass worker resources --
+// same hazard as poke_resource above, but reached through reconcile_enabled_locked()'s self path
+// (t_self_exit_requested) instead of stop_locked(). on_worker_start() allocates a resource;
+// on_worker_stop() frees it and reports via `reaped`. process() spins until released, then disables
+// itself and returns NOOP. on_park_requested()'s FIRST call captures the resource pointer and
+// blocks until released; later calls are no-ops (process() is released directly by the test here,
+// not by a second park request).
+class self_disabling_poke : public component {
+public:
+    explicit self_disabling_poke(std::string_view id) : component(id) {}
+    auto process() -> retval override {
+        m_processing.store(true, std::memory_order_release);
+        while (!m_process_release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        set_properties(json{{"enabled", false}}, config_type::RUNTIME); // self-disable, worker thread
+        return retval::NOOP;
+    }
+    auto on_worker_start() -> void override { m_resource = new int(42); }
+    auto on_park_requested() -> void override {
+        if (m_pokes.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            m_captured = m_resource;
+            m_poke_entered.store(true, std::memory_order_release);
+            while (!m_poke_release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
+    }
+    auto on_worker_stop() -> void override {
+        delete m_resource;
+        m_resource = nullptr;
+        reaped.store(true, std::memory_order_release);
+    }
+    std::atomic<bool> m_processing{false};
+    std::atomic<bool> m_process_release{false};
+    std::atomic<bool> m_poke_entered{false};
+    std::atomic<bool> m_poke_release{false};
+    std::atomic<bool> reaped{false};
+    std::atomic<int> m_pokes{0};
+    int* m_resource{nullptr};
+    int* m_captured{nullptr};
+    component::auto_stop m_auto_stop{*this};
+};
+
 struct gen_cfg {
     int gen{0};
     COMPOSITE_FIELDS(gen_cfg, (gen, runtime));
@@ -516,6 +561,136 @@ int main() {
         check(!c->is_running(), "poke: not running after stop() completes");
     }
 
+    // ---- REGRESSION: a SELF-DISABLE must drain an admitted property writer before reaping
+    //      subclass worker resources -- not race it, same as the external-stop case above ----
+    {
+        auto c = std::make_shared<self_disabling_poke>("selfpoke");
+        c->start();
+        for (int i = 0; i < 2000 && !c->m_processing.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(c->m_processing.load(std::memory_order_acquire), "selfpoke: process() entered");
+
+        std::thread writer([&] { c->set_properties(json{{"yield_interval", 4}}, config_type::RUNTIME); });
+        for (int i = 0; i < 2000 && !c->m_poke_entered.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(c->m_poke_entered.load(std::memory_order_acquire), "selfpoke: writer admitted into on_park_requested");
+
+        c->m_process_release.store(true, std::memory_order_release); // let process() self-disable
+
+        const auto deadline = std::chrono::steady_clock::now() + 300ms;
+        bool premature = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (c->reaped.load(std::memory_order_acquire)) {
+                premature = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        check(!premature, "selfpoke: resources NOT reaped while the admitted writer still holds them");
+        check(!c->wait_until_finished(300ms), "selfpoke: worker tail still waiting on the writer's drain");
+
+        c->m_poke_release.store(true, std::memory_order_release);
+        writer.join();
+
+        check(c->wait_until_finished(5s), "selfpoke: worker tail completes once the writer releases");
+        check(c->reaped.load(std::memory_order_acquire), "selfpoke: resources reaped once the writer released");
+        check(!c->is_running(), "selfpoke: not running after the self-disable completes");
+        check(c->m_pokes.load(std::memory_order_acquire) >= 1, "selfpoke: on_park_requested was entered");
+        c->stop(); // cleanup: harmless on an already-disabled worker
+    }
+
+    // ---- REGRESSION: a property write arriving AFTER the worker has exited (it runs inline) is
+    //      excluded from the self-exit reap — never concurrent with on_worker_stop() ----
+    //
+    // The admitted-writer drain covers a writer already inside its poke; this covers the one that
+    // arrives afterwards. Its property_change_handler() may read worker resources, so the reap holds
+    // the data write-lock the inline path serializes on: the handler runs before or after the reap,
+    // never alongside it. Without that lock the handler observed the resource mid-free.
+    {
+        class late_writer_target : public component {
+        public:
+            late_writer_target() : component("latewriter") {
+                add_property("knob", m_knob, properties::config_type::RUNTIME);
+            }
+            std::atomic<bool> m_reaping{false};
+            std::atomic<bool> m_freed{false};
+            std::atomic<int> m_handler_calls{0};
+            std::atomic<bool> m_handler_saw_freed{false};
+            auto process() -> retval override {
+                set_properties(properties::json{{"enabled", false}}, properties::config_type::RUNTIME);
+                return retval::NOOP;
+            }
+            auto on_worker_start() -> void override { m_freed.store(false, std::memory_order_release); }
+            auto on_worker_stop() -> void override {
+                // A deliberately slow teardown: a concurrent inline handler would land inside it.
+                m_reaping.store(true, std::memory_order_release);
+                std::this_thread::sleep_for(200ms);
+                m_freed.store(true, std::memory_order_release);
+            }
+            auto property_change_handler(const properties::json&) -> void override {
+                // Record what a handler that read the resource would have seen: with the reap
+                // excluded it always observes the teardown COMPLETE (or not yet begun).
+                m_handler_calls.fetch_add(1, std::memory_order_acq_rel);
+                m_handler_saw_freed.store(!m_reaping.load(std::memory_order_acquire) ||
+                                              m_freed.load(std::memory_order_acquire),
+                                          std::memory_order_release);
+            }
+            int m_knob{0};
+            component::auto_stop m_auto_stop{*this}; // MUST be last
+        };
+        auto c = std::make_shared<late_writer_target>();
+        c->start();
+        for (int i = 0; i < 5000 && !c->m_reaping.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(c->m_reaping.load(std::memory_order_acquire), "latewriter: self-disable reached on_worker_stop()");
+        // Arrives after EXITING: runs inline. Must block until the reap has released the data lock.
+        c->set_properties(properties::json{{"knob", 7}}, properties::config_type::RUNTIME);
+        check(c->m_handler_calls.load(std::memory_order_acquire) == 1, "latewriter: handler ran once");
+        check(c->m_handler_saw_freed.load(std::memory_order_acquire),
+              "latewriter: handler never ran alongside on_worker_stop()");
+        check(c->wait_until_finished(5s), "latewriter: worker finished");
+        c->stop(); // cleanup
+    }
+
+    // ---- REGRESSION: a worker that finishes on its FIRST iteration — while start() may still hold
+    //      the lifecycle lock — still reaps its resources before wait_until_finished() returns ----
+    //
+    // The tail's reap once deferred to whoever held the lifecycle lock, assuming that holder would
+    // reap. The initial start() holds it while spawning and never reaps, so a fast FINISH slipped
+    // through with on_worker_stop() never called. Many iterations, because the race depends on
+    // whether the worker reaches its tail before start() returns.
+    {
+        class fast_finisher : public component {
+        public:
+            fast_finisher() : component("fastfinish") {}
+            std::atomic<int> reaped{0};
+            auto process() -> retval override { return retval::FINISH; }
+            auto on_worker_stop() -> void override { reaped.fetch_add(1, std::memory_order_acq_rel); }
+            component::auto_stop m_auto_stop{*this}; // MUST be last
+        };
+        int unreaped = 0;
+        constexpr int iterations = 2000;
+        for (int i = 0; i < iterations; ++i) {
+            auto c = std::make_shared<fast_finisher>();
+            c->start();
+            if (!c->wait_until_finished(5s)) {
+                check(false, "fastfinish: worker finished within the bound");
+                break;
+            }
+            if (c->reaped.load(std::memory_order_acquire) != 1) {
+                ++unreaped;
+            }
+        }
+        check(unreaped == 0, "fastfinish: every immediately-finishing worker was reaped by the time "
+                             "wait_until_finished() returned");
+        if (unreaped != 0) {
+            std::printf("  fastfinish: %d of %d iterations completed without on_worker_stop()\n", unreaped, iterations);
+        }
+    }
+
     // ---- REGRESSION: a set_properties() issued from on_finished() applies before completion is
     //      published ----
     {
@@ -534,6 +709,7 @@ int main() {
               "component + application wait_until_finished, restart-clears-status, property_state, "
               "a concurrent property write parking through the completion tail, a self-disabling "
               "pipeline_component reaping its pool + gauge, an external stop() draining an admitted "
-              "writer before reaping, and a self-write from on_finished() applying before completion");
+              "writer before reaping, a self-disable draining an admitted writer before reaping, and "
+              "a self-write from on_finished() applying before completion");
     return 0;
 }
