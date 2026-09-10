@@ -400,7 +400,18 @@ private:
             }
         }
         stop_pool();
-        start_pool(); // rebuilds the ring + spawns the new worker count + on_workers_resized(n)
+        try {
+            start_pool(); // rebuilds the ring + spawns the new worker count + on_workers_resized(n)
+        } catch (...) {
+            // The old pool is already gone. Leaving the component "running" with no workers would
+            // wedge it silently: the next packet would sit in the slot ring forever and EOS would
+            // never complete. Re-arm the resize so the next iteration retries the rebuild, and let
+            // the exception reach the base worker loop: under error_restart_max > 0 it backs off and
+            // re-enters process(), which re-runs do_resize(); with no restarts left (or none
+            // configured) the component finishes with finish_reason::error instead of hanging.
+            m_resize_pending.store(true, std::memory_order_release);
+            throw;
+        }
         logger()->debug("pipeline '{}' resized to {} workers", id(), m_pool.size());
     }
 

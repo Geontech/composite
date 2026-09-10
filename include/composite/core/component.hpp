@@ -1287,6 +1287,11 @@ private:
     // tail in finish_worker() — never both, and never zero. Exchange-guarded; see
     // worker_resources_down().
     std::atomic<bool> m_worker_resources_up{false};
+    /// Set on the worker thread when it latches its OWN exit (a self-disable through
+    /// reconcile_enabled_locked()) so the completion tail knows nobody else will reap its
+    /// resources. Thread-local rather than a member: read and written only by the worker
+    /// thread, and adding a data member would change the inherited layout (an ABI break).
+    static inline thread_local bool t_self_exit_requested{false};
     bool m_measure_process_time{
         false}; ///< "measure_process_time" property: gates the hot-path clock reads (default off → zero clocks;
                 ///< principle 4). Worker reads lock-free; swapped only while parked.
@@ -1449,6 +1454,9 @@ private:
                     // gauge. The jthread handle survives until someone joins it;
                     // reconcile_enabled_locked() keys its START decision off liveness rather than
                     // the handle precisely so a later re-enable still restarts correctly.
+                    // Mark the exit as self-requested FIRST: no stop_locked() will run for this
+                    // exit, so the tail must reap the worker resources itself (see finish_worker).
+                    t_self_exit_requested = true;
                     request_worker_exit_locked();
                 } else {
                     stop_locked();
@@ -1783,6 +1791,8 @@ private:
         static_assert(noexcept(emergency_note("", "")), "the last-ditch note must not throw");
 
         const completion_guard done{*this}; // outermost: signals even if everything below throws
+        t_self_exit_requested = false;      // a recycled thread must not inherit a stale self-exit
+
 
         // Guard SECOND-OUTERMOST, spanning BOTH the loop and the completion tail below — so
         // EXITING is not published until finish_worker() (on_finished, send_eos, the resource
@@ -2063,6 +2073,12 @@ private:
             m_finish_reason.store(exit_reason, std::memory_order_release);
             run_stage_contained("on_finished() at completion", [this, exit_reason] { on_finished(exit_reason); });
         }
+        // Drain config<T> reactions staged on THIS thread that no loop-top will ever run: a
+        // set_properties() from on_finished() (or from the final process()/on_end_of_stream()
+        // iteration) takes the worker self-write bypass and stages its on_apply for the next
+        // iteration — and there is none. The worker is still the sole reader here (EXITING is
+        // published only after this tail), so running them inline is exactly the loop-top drain.
+        run_stage_contained("staged reaction drain at completion", [this] { m_prop_set.run_pending_reactions(); });
         // EOS propagation: orderly completion closes our outputs (AFTER on_finished, so a component
         // that flushes final data there gets it out before the close), so downstream consumers reach
         // at_end() and can finish in turn — the chain completes end to end. An ERROR exit does NOT
@@ -2070,34 +2086,37 @@ private:
         if (exit_reason == finish_reason::completed) {
             run_stage_contained("send_eos() at completion", [this] { send_eos(); });
         }
-        // Reap subclass worker resources on EVERY exit this tail reaches — including
-        // exit_reason::none. That covers a worker that latched its OWN exit via
-        // request_worker_exit_locked() rather than self-terminating with FINISH/error: a component
-        // disabling itself (set_properties({"enabled", false}, RUNTIME) from the worker thread) takes
-        // that path (see reconcile_enabled_locked()), and stop_locked() is NOT in the call path of a
-        // self-disable any more than it is of a self-finish — so gating this on exit_reason left a
-        // self-disabling pipeline_component's pool threads alive (idle, but running) and the state
-        // gauge stuck at 1.0 until some LATER stop()/re-enable/destruction happened to reap them.
-        // Exchange-guarded (see worker_resources_down) so a concurrent or subsequent stop_locked()
-        // cannot double-reap.
+        // Reap subclass worker resources here only when NOBODY ELSE will: a self-terminating
+        // worker (FINISH / error) and a worker that latched its OWN exit by disabling itself
+        // (set_properties({"enabled", false}, RUNTIME) from the worker thread, see
+        // reconcile_enabled_locked()) — stop_locked() is in neither call path, so without this a
+        // pipeline_component's pool would linger (idle, but alive, holding N threads) and the state
+        // gauge would read 1.0 until a later stop()/re-enable/destruction.
         //
-        // MANDATORY: reached whatever the stages above did, and ordered BEFORE thread_entry()'s
-        // completion_guard publishes m_worker_done — so a wait_until_finished() waiter observes a
-        // genuinely quiesced component (pool joined), which is the guarantee this ordering exists
-        // to provide. Safe from this (the main worker) thread: on_worker_stop() joins the POOL
-        // threads, never this one.
-        run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
-        // Flip the exported state gauge to "stopped" unconditionally too — a worker that has left
-        // this tail is no longer running whether it self-finished or self-disabled, and stop_locked()
-        // (the only OTHER writer) is NOT in either path, so gating this the same way as on_finished()/
-        // send_eos() left the composite.component.state metric reporting 1.0/"running" for a
-        // self-disabled component, contradicting is_running(). Ordered after the reap so the gauge
-        // flips to 0 only once the component is fully quiesced, mirroring stop_locked().
-        run_stage_contained("state gauge update at completion", [this] {
-            if (m_state) {
-                m_state->set(0.0);
-            }
-        });
+        // An EXTERNAL stop (exit_reason none, not self-requested) must NOT reap here: stop_locked()
+        // owns that teardown and orders it correctly — join this thread, settle the park, DRAIN the
+        // property writers it already admitted (one may be inside on_park_requested() right now,
+        // touching the very resources on_worker_stop() frees), and only then reap. Reaping from this
+        // thread would run ahead of that drain. Exchange-guarded (see worker_resources_down) so the
+        // two paths can never double-reap.
+        //
+        // MANDATORY on the self paths: reached whatever the stages above did, and ordered BEFORE
+        // thread_entry()'s completion_guard publishes m_worker_done — so a wait_until_finished()
+        // waiter observes a genuinely quiesced component (pool joined). Safe from this (the main
+        // worker) thread: on_worker_stop() joins the POOL threads, never this one.
+        if (exit_reason != finish_reason::none || t_self_exit_requested) {
+            run_stage_contained("on_worker_stop() at completion", [this] { worker_resources_down(); });
+            // Flip the exported state gauge to "stopped" — a self-finished or self-disabled worker is
+            // no longer running, and stop_locked() (the only OTHER writer) is not in either path, so
+            // without this composite.component.state would report 1.0/"running" forever after a
+            // batch/source graph completes, contradicting is_running(). Ordered after the reap so the
+            // gauge flips to 0 only once the component is fully quiesced, mirroring stop_locked().
+            run_stage_contained("state gauge update at completion", [this] {
+                if (m_state) {
+                    m_state->set(0.0);
+                }
+            });
+        }
     }
 
 }; // class component

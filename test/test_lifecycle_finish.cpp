@@ -174,6 +174,72 @@ public:
     component::auto_stop m_auto_stop{*this};
 };
 
+// REGRESSION: an external stop() must drain an ADMITTED property write before reaping subclass
+// worker resources -- a writer already inside on_park_requested() may still be touching them.
+// on_worker_start() allocates a resource; on_worker_stop() frees it and reports via `reaped`.
+// process() spins until released. on_park_requested()'s FIRST call captures the resource pointer
+// and blocks until released; a SECOND call (stop()'s own park request) releases process() instead.
+class poke_resource : public component {
+public:
+    explicit poke_resource(std::string_view id) : component(id) {}
+    auto process() -> retval override {
+        m_processing.store(true, std::memory_order_release);
+        while (!m_process_release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        return retval::NOOP;
+    }
+    auto on_worker_start() -> void override { m_resource = new int(42); }
+    auto on_park_requested() -> void override {
+        if (m_pokes.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            m_captured = m_resource;
+            m_poke_entered.store(true, std::memory_order_release);
+            while (!m_poke_release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        } else {
+            m_process_release.store(true, std::memory_order_release); // stop()'s own park request
+        }
+    }
+    auto on_worker_stop() -> void override {
+        delete m_resource;
+        m_resource = nullptr;
+        reaped.store(true, std::memory_order_release);
+    }
+    std::atomic<bool> m_processing{false};
+    std::atomic<bool> m_process_release{false};
+    std::atomic<bool> m_poke_entered{false};
+    std::atomic<bool> m_poke_release{false};
+    std::atomic<bool> reaped{false};
+    std::atomic<int> m_pokes{0};
+    int* m_resource{nullptr};
+    int* m_captured{nullptr};
+    component::auto_stop m_auto_stop{*this};
+};
+
+struct gen_cfg {
+    int gen{0};
+    COMPOSITE_FIELDS(gen_cfg, (gen, runtime));
+};
+
+// REGRESSION: a set_properties() issued from on_finished() must have its on_apply run BEFORE
+// completion is published -- finish_worker() drains staged config<T> reactions after on_finished(),
+// on this same (worker) thread, since no loop-top will ever run again to do it.
+class finishing_writer : public component {
+public:
+    explicit finishing_writer(std::string_view id) : component(id) {
+        add_config(m_cfg, config_type::RUNTIME);
+        m_cfg.on_apply([this](const gen_cfg&, const changes<gen_cfg>&) {
+            m_applied.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    auto process() -> retval override { return retval::FINISH; }
+    auto on_finished(finish_reason) -> void override { set_properties(json{{"gen", 1}}, config_type::RUNTIME); }
+    config<gen_cfg> m_cfg{};
+    std::atomic<int> m_applied{0};
+    component::auto_stop m_auto_stop{*this};
+};
+
 auto live_thread_count() -> std::size_t {
     return static_cast<std::size_t>(
         std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}));
@@ -413,13 +479,61 @@ int main() {
         feeder.disconnect(in);
     }
 
+    // ---- REGRESSION: stop() must drain an admitted property writer before reaping subclass
+    //      worker resources -- not race it ----
+    {
+        auto c = std::make_shared<poke_resource>("poke");
+        c->start();
+        for (int i = 0; i < 2000 && !c->m_processing.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(c->m_processing.load(std::memory_order_acquire), "poke: process() entered");
+
+        std::thread writer([&] { c->set_properties(json{{"yield_interval", 4}}, config_type::RUNTIME); });
+        for (int i = 0; i < 2000 && !c->m_poke_entered.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(c->m_poke_entered.load(std::memory_order_acquire), "poke: writer admitted into on_park_requested");
+
+        std::thread stopper([&] { c->stop(); });
+
+        const auto deadline = std::chrono::steady_clock::now() + 300ms;
+        bool premature = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (c->reaped.load(std::memory_order_acquire)) {
+                premature = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        check(!premature, "poke: resources NOT reaped while the admitted writer still holds them");
+
+        c->m_poke_release.store(true, std::memory_order_release);
+        writer.join();
+        stopper.join();
+
+        check(c->reaped.load(std::memory_order_acquire), "poke: resources reaped once the writer released");
+        check(!c->is_running(), "poke: not running after stop() completes");
+    }
+
+    // ---- REGRESSION: a set_properties() issued from on_finished() applies before completion is
+    //      published ----
+    {
+        auto c = std::make_shared<finishing_writer>("tailreact");
+        c->start();
+        check(c->wait_until_finished(10s), "tail-reaction: worker finished");
+        check(c->m_applied.load(std::memory_order_relaxed) == 1, "tail-reaction: on_apply ran exactly once");
+        check(c->m_cfg->gen == 1, "tail-reaction: field reflects the on_finished() write");
+    }
+
     if (g_failures) {
         std::printf("\n%d FAILURE(S)\n", g_failures);
         return 1;
     }
     std::puts("LIFECYCLE FINISH OK: on_finished(reason), is_finished/finished_reason, "
               "component + application wait_until_finished, restart-clears-status, property_state, "
-              "a concurrent property write parking through the completion tail, and a self-disabling "
-              "pipeline_component reaping its pool + gauge");
+              "a concurrent property write parking through the completion tail, a self-disabling "
+              "pipeline_component reaping its pool + gauge, an external stop() draining an admitted "
+              "writer before reaping, and a self-write from on_finished() applying before completion");
     return 0;
 }
