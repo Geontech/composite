@@ -74,6 +74,9 @@ foreach(t
     test_eos_propagation
     # P0 regression: a pipeline_component's pool must start via application::start()/reconcile
     test_pipeline_app_lifecycle
+    # regression: do_resize() re-arms and rethrows when the pool rebuild fails, instead of
+    # leaving the component running with no workers
+    test_pipeline_resize_failure
     # M6 lifecycle: source_component archetype + application::drain_stop
     test_source_component
     # M4 doorbell: producer wakes an idle consumer on the empty->non-empty edge

@@ -104,6 +104,106 @@ longer match, and there is no window where a layout change could merge ahead of 
   follow-up).
 
 ---
+## 0.5.3 — lifecycle and end-of-stream correctness patch
+
+**Released:** 2026-09-11 (v0.5.3).
+
+Patch release. **No inherited object layout, vtable, or documented configuration shape changed**
+— the component ABI stays 1. Most fixes are header-inline, so a consuming module picks them up
+only when rebuilt; replacing `libcomposite` alone is not enough.
+
+Release verification: full ctest under Debug/Werror, Release, ASan+UBSan, and TSan (60/60 in
+each); the `composite-comps` fleet configured against the packaged 0.5.3 install tree with
+`COMPS_COMPOSITE_PROVIDER=package` (`SameMinorVersion` accepts it under the fleet's 0.5.2
+minimum) and passed 204/204 tests. Every fix below ships with a regression that was
+demonstrated to fail with that fix reverted.
+
+### Fixed
+
+- **A RUNTIME property PATCH no longer restarts a finished or stopped component.** The
+  components property route followed every RUNTIME `set_properties()` with an unconditional
+  `apply_lifecycle_changes()`. `set_properties()` already reconciles a RUNTIME `enabled` write
+  itself, and the second reconcile keyed its START decision off worker liveness alone, so a
+  component whose worker had completed, given up on error, or been stopped — with `enabled`
+  still true — was restarted by a PATCH of an unrelated knob. A finite source re-ran from
+  scratch and its restart cleared the consumer's EOS latch. The redundant call is gone.
+  Regressions: a PATCH on a self-finished component leaves it finished with the knob applied;
+  PATCHing `enabled` through the same route still starts and stops.
+- **`pipeline_component` honours `finish_at_end` and `on_end_of_stream()`.** Its `process()`
+  returned FINISH itself once idle with every input at end-of-stream, bypassing the base's
+  promotion path that runs `on_end_of_stream()` first and respects `finish_at_end=false`. For a
+  pipeline the flush hook therefore never ran (except by race) and the opt-out was ignored,
+  contrary to the documented contract. It now returns NOOP at that point — nothing is in
+  flight, the ring is empty, and the main thread is the sole producer on the output — and the
+  base does the rest. Regressions: a `finish_at_end=false` pipeline stays running past EOS; a
+  pipeline overriding `on_end_of_stream()` sees exactly one call and its tail packet reaches the
+  sink before the sink observes end-of-stream.
+- **`start_pool()` allocates the slot ring before publishing its capacity and mask.** A
+  `bad_alloc` on the resize path previously left the old, smaller ring under the new mask, and
+  a retried iteration under `error_restart_max > 0` would have indexed past it.
+- **`remove_component()` and `drain_stop()` account for retained-unremovable peers.** A
+  component kept in `m_unremovable` after an earlier failed removal was invisible to both: its
+  edge into a component being removed was never disconnected (leaving its output port with a
+  dangling input pointer once the target was destroyed), and a component fed only by such a
+  peer could be classified as a source and hard-stopped. Both now consider the union of the
+  registry and the retained set. Regression: a producer forced into `m_unremovable` is
+  disconnected when its consumer is removed, and later sends are safe no-ops under ASan.
+- **A throwing `on_end_of_stream()` is now an error finish, not a clean completion.** The
+  flush hook's exception was caught and logged, and the worker then finished with
+  `finish_reason::completed` and sent EOS downstream — a failed tail flush reported itself as a
+  lossless close. It is now treated exactly like a throw from `process()`: recorded in
+  `finish_error()`, `finish_reason::error`, and no EOS (an error exit never sends one). A batch
+  graph whose flush fails therefore completes via `drain_stop()` rather than EOS, the same trade
+  already made for any other error exit. Regression: error finish, downstream never at end.
+- **The worker stays live through its completion tail.** The park coordinator's exit guard was
+  scoped to the worker loop, so EXITING was published before `on_finished()` and `send_eos()`
+  ran — and a concurrent property write proceeded inline against them, contrary to the
+  `on_finished()` documentation (which said the opposite and is now accurate). The guard now
+  brackets the whole tail, so a write during it parks until the tail completes (bounded by the
+  park timeout). Because the worker is still live there, a `set_properties()` issued from
+  `on_finished()` stages its `config<T>` reaction the way a loop-top write does; the tail now
+  drains staged reactions right after `on_finished()`, so that reaction runs before completion
+  is published rather than waiting for some later operation. Regressions: a RUNTIME write issued
+  during a 200 ms `on_finished()` returns only after it; a `config<T>` write from `on_finished()`
+  has its `on_apply` run exactly once by the time `wait_until_finished()` returns.
+- **A self-disabling `pipeline_component` reaps its pool — after admitted writers have left.**
+  `finish_worker()` tore down subclass resources and flipped the state gauge only for a
+  self-finish; a worker that wrote `enabled=false` on itself exited with no finish reason and left
+  its pool threads alive and `composite.component.state` at 1.0 until a later stop. The worker's
+  final stage now reaps for a self-finish OR a self-requested exit (a thread-local flag set by the
+  self-disable path — no data member, so no layout change). It runs after EXITING is published and
+  first waits for the property writers already admitted to leave — a writer can still be inside
+  `on_park_requested()`, a hook that may read the very resources `on_worker_stop()` frees — which
+  is the ordering `stop_locked()` already used. A writer wedged past the bound is reported and the
+  resources are left for the next `stop()` rather than freed under it. The reap is deliberately
+  not deferred to whoever holds the lifecycle lock or the admission gate: the initial `start()`
+  still holds the lock while a fast worker finishes, and a `try_stop()` holds the gate only until
+  its deadline, so neither is a promise to reap. A writer arriving after EXITING runs inline under
+  the park's data write-lock, so the reap holds that same lock (bounded the same way): such a
+  writer's `property_change_handler()`/`on_apply` runs before or after `on_worker_stop()`, never
+  alongside it. An EXTERNAL `stop()` still reaps from the stopping thread after join and drain, as
+  0.5.2 did. Regressions: a 4-worker pipeline that
+  disables itself returns the process to its baseline thread count with the gauge at 0; a
+  `stop()` issued while a writer is held inside `on_park_requested()` does not reap until that
+  writer has left; the same for a component that disables itself while such a writer is held; a
+  worker that finishes on its first iteration, while `start()` still holds the lifecycle lock, is
+  reaped by the time `wait_until_finished()` returns, across thousands of iterations; a property
+  write arriving while a self-disabled worker is inside a slow `on_worker_stop()` has its handler
+  run only after the teardown completes.
+- **A failed pool rebuild no longer leaves a `pipeline_component` running with no workers.**
+  `do_resize()` had already stopped the old pool and cleared the resize request when
+  `start_pool()` threw, so under `error_restart_max > 0` the component resumed with an empty
+  pool: the next packet sat in the slot ring forever and end-of-stream never completed. The
+  resize is now re-armed and the exception reaches the base loop, which retries the rebuild
+  after its backoff or, with no restarts left, finishes with `finish_reason::error`. Regression:
+  one injected allocation failure during a resize is retried and the stream completes; with no
+  restarts configured the component finishes with an error naming the allocation failure.
+- **End-of-stream wakes the consumer promptly.** The idle doorbell re-check looked only for
+  queued data, so a producer close landing between the NOOP and the arm slept out the full
+  `noop_thread_delay` (1 ms by default; whatever an operator configured otherwise) before
+  completion was noticed. The re-check now also tests the EOS-by-default condition. Regression:
+  with a 500 ms delay, EOS racing a NOOP completes well under it across 60 trials.
+
 
 ## 0.5.2 — disabled-input gating patch
 

@@ -14,10 +14,15 @@
 #include "composite/ports/input_port.hpp"
 #include "composite/ports/output_port.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 using namespace composite;
 using namespace std::chrono_literals;
@@ -102,6 +107,50 @@ public:
     }
     input_port<ibuf> m_in{"in"};
     std::atomic<long> m_calls{0};
+    component::auto_stop m_auto_stop{*this};
+};
+
+// A relay whose on_end_of_stream() (the tail flush hook) always throws. Forwards live packets
+// normally; only the flush at EOS fails. Used to prove a throwing flush is reported as an error
+// exit (not a clean completion) and does not send EOS downstream.
+class throwing_eos_relay : public component {
+public:
+    explicit throwing_eos_relay(std::string_view id) : component(id) {
+        add_port(&m_in);
+        add_port(&m_out);
+    }
+    auto process() -> retval override {
+        auto pkt = m_in.try_get();
+        if (!pkt) {
+            return retval::NOOP;
+        }
+        auto& [buf, ts, md] = *pkt;
+        m_forwarded.fetch_add(1, std::memory_order_relaxed);
+        m_out.send_data(std::move(buf), ts, md);
+        return retval::NORMAL;
+    }
+    auto on_end_of_stream() -> void override { throw std::runtime_error("tail flush failed"); }
+    input_port<ibuf> m_in{"in"};
+    output_port<ibuf> m_out{"out"};
+    std::atomic<int> m_forwarded{0};
+    component::auto_stop m_auto_stop{*this};
+};
+
+// Idles forever on an empty, never-closed input, marking every NOOP it returns — used to race a
+// producer's EOS against the exact instant the worker enters its doorbell idle-wait.
+class idle_drain : public component {
+public:
+    explicit idle_drain(std::string_view id) : component(id) { add_port(&m_in); }
+    auto process() -> retval override {
+        auto pkt = m_in.try_get();
+        if (pkt) {
+            return retval::NORMAL;
+        }
+        m_noop_seen.store(true, std::memory_order_release);
+        return retval::NOOP;
+    }
+    input_port<ibuf> m_in{"in"};
+    std::atomic<bool> m_noop_seen{false};
     component::auto_stop m_auto_stop{*this};
 };
 
@@ -274,13 +323,76 @@ int main() {
         check(k->m_received.load() == 3, "reopen: sink received the second run's data");
     }
 
+    // ---- REGRESSION: a throwing on_end_of_stream() reports an error exit, not a clean completion ----
+    {
+        application app{"eos-throw"};
+        auto s = std::make_shared<src>("s", 5);
+        auto t = std::make_shared<throwing_eos_relay>("t");
+        auto k = std::make_shared<sink>("k");
+        app.add_component(s);
+        app.add_component(t);
+        app.add_component(k);
+        check(s->connect("out", t, "in"), "eos-throw: connect s->t");
+        check(t->connect("out", k, "in"), "eos-throw: connect t->k");
+        app.start();
+        check(t->wait_until_finished(5s), "eos-throw: the throwing component finished (did not hang)");
+        check(t->finished_reason() == finish_reason::error, "eos-throw: a throwing tail flush -> finish_reason::error");
+        check(!t->finish_error().empty(), "eos-throw: finish_error() carries the flush failure's detail");
+        check(t->m_forwarded.load() == 5, "eos-throw: every live packet was forwarded before the failed flush");
+        std::this_thread::sleep_for(300ms); // generous wait: give a wrongly-sent EOS time to propagate
+        check(!k->m_in.at_end(), "eos-throw: an ERROR exit does NOT send EOS -- downstream stays open");
+        check(!t->is_running(), "eos-throw: the component did not restart itself");
+        check(t->finished_reason() == finish_reason::error, "eos-throw: reason is still error (no restart)");
+        app.stop();
+    }
+
+    // ---- REGRESSION: EOS landing exactly as a consumer enters its NOOP idle-wait must wake it
+    //      promptly, not stall out noop_thread_delay. The vulnerable window is a handful of
+    //      instructions between the doorbell arm and its re-check, so this races many independent
+    //      trials and requires the WORST case to stay well under the delay -- a single trial landing
+    //      in the window is enough to expose a missed re-check; without the fix that trial alone
+    //      stalls for the whole delay. ----
+    {
+        constexpr int trials = 60;
+        constexpr std::uint32_t delay_ns = 500'000'000; // 500 ms noop_thread_delay (property is in ns)
+        long long worst_ms = 0;
+        for (int trial = 0; trial < trials; ++trial) {
+            output_port<ibuf> producer{"out"};
+            auto k = std::make_shared<idle_drain>("fastwake" + std::to_string(trial));
+            k->set_properties(properties::json{{"noop_thread_delay", delay_ns}}, properties::config_type::INITIALIZE);
+            check(producer.connect(&k->m_in), "fastwake: connect");
+
+            std::atomic<long long> send_ns{0};
+            // Spins from the start so it can react to the VERY FIRST noop -- the only one this
+            // component ever produces before it idles on the doorbell for up to noop_thread_delay.
+            std::thread closer([&] {
+                while (!k->m_noop_seen.load(std::memory_order_acquire)) {
+                    // spin: react to the transition as fast as possible
+                }
+                send_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+                producer.send_eos();
+            });
+            k->start();
+            const bool finished = k->wait_until_finished(2s);
+            closer.join();
+            check(finished, "fastwake: consumer finished after the race");
+            const auto finish_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+            const auto elapsed_ms = (finish_ns - send_ns.load(std::memory_order_acquire)) / 1'000'000;
+            worst_ms = std::max<long long>(worst_ms, elapsed_ms);
+        }
+        check(worst_ms < 250,
+              "fastwake: EOS racing a NOOP wakes the consumer promptly in every trial (worst case well "
+              "under noop_thread_delay, not one full delay)");
+    }
+
     if (g_failures) {
         std::printf("\n%d FAILURE(S)\n", g_failures);
         return 1;
     }
     std::puts("EOS PROPAGATION OK: try_get disambiguation, at_end (closed+drained), fan-out close, "
               "reconnect reset, end-to-end source->relay->sink completion via auto-EOS, R1 "
-              "EOS-by-default (plain NOOP consumer auto-FINISHes + on_end_of_stream flush), and the "
-              "finish_at_end=false opt-out");
+              "EOS-by-default (plain NOOP consumer auto-FINISHes + on_end_of_stream flush), the "
+              "finish_at_end=false opt-out, a throwing on_end_of_stream() reporting an error exit "
+              "with no EOS sent, and prompt EOS wake racing the doorbell idle-wait");
     return 0;
 }

@@ -428,5 +428,153 @@ int main() {
         }
         std::puts("PIPELINE ingest-context release OK: slot drops its context at retire");
     }
+
+    // ---- finish_at_end=false: a pipeline_component must NOT self-FINISH at EOS when opted out ----
+    {
+        class idler : public pipeline_component<mutable_buffer<std::int64_t>, mutable_buffer<std::int64_t>> {
+        public:
+            idler() : pipeline_component("idler", "in", "out", 1) {}
+            std::atomic<int> m_finalized{0};
+
+        protected:
+            auto work(in_t in, timestamp /*ts*/, const composite::metadata& /*md*/) -> out_t override { return in; }
+            auto finalize(out_t& /*out*/, timestamp /*ts*/, const composite::metadata& /*md*/) -> bool override {
+                m_finalized.fetch_add(1, std::memory_order_relaxed);
+                return false; // nothing downstream
+            }
+
+        public:
+            component::auto_stop m_auto_stop{*this}; // MUST be last
+        };
+
+        auto p5 = std::make_shared<idler>();
+        p5->set_properties(properties::json{{"finish_at_end", false}}); // RUNTIME property, set before start
+        output_port<mutable_buffer<std::int64_t>> feed5{"feed"};
+        auto* in5 = p5->get_port<input_port_base>("in");
+        if (in5 == nullptr || !feed5.connect(in5)) {
+            std::puts("FAIL: connect (H)");
+            return 1;
+        }
+        p5->start();
+        constexpr int K = 5;
+        for (int s = 0; s < K; ++s) {
+            feed5.send_data(make_mutable<std::int64_t>(4), timestamp{});
+        }
+        feed5.send_eos();
+        for (int i = 0; i < 2000 && p5->m_finalized.load() < K; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (p5->m_finalized.load() != K) {
+            std::printf("FAIL: idler finalized %d of %d before EOS drained (H)\n", p5->m_finalized.load(), K);
+            p5->stop();
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // generous wait past EOS
+        if (!p5->is_running() || p5->is_finished()) {
+            std::puts("FAIL: finish_at_end=false pipeline_component self-finished at EOS (H)");
+            p5->stop();
+            return 1;
+        }
+        p5->stop();
+        std::puts("PIPELINE finish_at_end=false OK: stays running past EOS");
+    }
+
+    // ---- on_end_of_stream(): fires exactly once, may emit a tail packet, and that packet reaches a
+    //      downstream sink BEFORE the sink observes end-of-stream ----
+    {
+        constexpr std::int64_t kTailMark = -1;
+
+        class tail_pipe : public pipeline_component<mutable_buffer<std::int64_t>, mutable_buffer<std::int64_t>> {
+        public:
+            tail_pipe() : pipeline_component("tailpipe", "in", "out", 1) {}
+            std::atomic<int> m_eos_calls{0};
+
+        protected:
+            auto work(in_t in, timestamp /*ts*/, const composite::metadata& /*md*/) -> out_t override { return in; }
+            auto on_end_of_stream() -> void override {
+                m_eos_calls.fetch_add(1, std::memory_order_relaxed);
+                auto tail = make_mutable<std::int64_t>(1);
+                tail.as_span()[0] = kTailMark;
+                out_port().send_data(std::move(tail), timestamp{});
+            }
+
+        public:
+            component::auto_stop m_auto_stop{*this}; // MUST be last
+        };
+
+        class tail_sink : public component {
+        public:
+            explicit tail_sink(std::string_view id) : component(id) { add_port(&m_in); }
+            auto process() -> retval override {
+                const int call = m_calls.fetch_add(1, std::memory_order_relaxed);
+                if (auto pkt = m_in.try_get()) {
+                    auto& [buf, ts, md] = *pkt;
+                    m_received.fetch_add(1, std::memory_order_relaxed);
+                    auto sp = buf.as_span();
+                    if (!sp.empty() && sp[0] == kTailMark) {
+                        m_tail_call.store(call, std::memory_order_relaxed);
+                    }
+                    return retval::NORMAL;
+                }
+                if (inputs_at_end()) {
+                    m_eos_call.store(call, std::memory_order_relaxed);
+                    return retval::FINISH;
+                }
+                return retval::NOOP;
+            }
+            input_port<mutable_buffer<std::int64_t>> m_in{"in"};
+            std::atomic<int> m_calls{0};
+            std::atomic<int> m_received{0};
+            std::atomic<int> m_tail_call{-1};
+            std::atomic<int> m_eos_call{-1};
+            component::auto_stop m_auto_stop{*this}; // MUST be last
+        };
+
+        auto p6 = std::make_shared<tail_pipe>();
+        auto sink6 = std::make_shared<tail_sink>("tailsink");
+        output_port<mutable_buffer<std::int64_t>> feed6{"feed"};
+        auto* in6 = p6->get_port<input_port_base>("in");
+        if (in6 == nullptr || !feed6.connect(in6) || !p6->connect("out", sink6, "in")) {
+            std::puts("FAIL: connect (I)");
+            return 1;
+        }
+        p6->start();
+        sink6->start();
+        constexpr int K6 = 5;
+        for (int s = 0; s < K6; ++s) {
+            auto b = make_mutable<std::int64_t>(1);
+            b.as_span()[0] = s;
+            feed6.send_data(std::move(b), timestamp{});
+        }
+        feed6.send_eos();
+        if (!sink6->wait_until_finished(std::chrono::seconds(5))) {
+            std::puts("FAIL: tail sink never finished (I)");
+            return 1;
+        }
+        if (!p6->wait_until_finished(std::chrono::seconds(5))) {
+            std::puts("FAIL: tail pipe never finished (I)");
+            return 1;
+        }
+        if (p6->m_eos_calls.load() != 1) {
+            std::printf("FAIL: on_end_of_stream() called %d times (want 1) (I)\n", p6->m_eos_calls.load());
+            return 1;
+        }
+        if (p6->finished_reason() != finish_reason::completed) {
+            std::puts("FAIL: tail pipe finish_reason != completed (I)");
+            return 1;
+        }
+        if (sink6->m_received.load() != K6 + 1) {
+            std::printf("FAIL: sink received %d packets (want %d live + 1 tail) (I)\n", sink6->m_received.load(),
+                        K6 + 1);
+            return 1;
+        }
+        if (sink6->m_tail_call.load() < 0 || sink6->m_eos_call.load() < 0 ||
+            sink6->m_tail_call.load() >= sink6->m_eos_call.load()) {
+            std::printf("FAIL: tail packet (call %d) did not precede EOS observation (call %d) (I)\n",
+                        sink6->m_tail_call.load(), sink6->m_eos_call.load());
+            return 1;
+        }
+        std::puts("PIPELINE on_end_of_stream OK: fired once, tail packet arrived before EOS");
+    }
     return 0;
 }
