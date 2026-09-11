@@ -289,9 +289,11 @@ auto set_component_properties(composite::application::component_ptr comp, const 
         spdlog::trace("patching component-level properties on {}", comp->id());
 
         // Park the worker, apply the JSON batch atomically (validate-all-then-commit-all)
-        // and run property_change_handler(); then flush any enabled-toggle lifecycle change.
+        // and run property_change_handler(). A RUNTIME write reconciles `enabled` itself
+        // (the write IS the action), so no lifecycle call is needed here; a second
+        // reconcile after the fact would key off worker liveness alone and restart a
+        // component whose worker had already finished or been stopped.
         comp->set_properties(properties, composite::properties::config_type::RUNTIME);
-        comp->apply_lifecycle_changes();
 
         json_ok(res, {{"success", std::format("successfully set properties on component {}", comp->id())}});
     } catch (const composite::properties::config_violation& ex) {

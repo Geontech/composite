@@ -213,17 +213,17 @@ protected:
         }
         lk.unlock();
         // Truly idle: no input available AND nothing in flight (m_submit == m_retire, so no packet is
-        // dropped). If every input is at end-of-stream (upstream sent EOS and we have ingested and
-        // retired everything), the pipeline is complete: FINISH so the base records
-        // finish_reason::completed and auto-sends EOS on m_out — a downstream stage then reaches
-        // at_end() and completes in turn. Without this a pipeline_component (fft, psd — the framework's
-        // flagship adopters) could NEVER self-terminate, so a batch/file graph built on it would hang
-        // application::wait_until_finished() and burn the full drain_stop() timeout even after the
-        // source finished.
-        if (inputs_at_end()) {
-            return FINISH;
-        }
-        return NOOP; // idle but the stream is still open — wait for more input
+        // dropped). Just return NOOP here and let the base's EOS-by-default promotion (see
+        // component::worker_body's "EOS-by-default" block) decide what happens next: on a NOOP with
+        // inputs_at_end() it calls on_end_of_stream() and THEN promotes to FINISH — which records
+        // finish_reason::completed and auto-sends EOS on every output — honouring finish_at_end for the
+        // rare pipeline stage that must keep running past its inputs. Returning FINISH directly from here
+        // would skip that hook entirely and hard-wire finish_at_end=true, silently breaking the opt-out
+        // for a pipeline_component. Handing off at this exact point is safe: nothing is in flight
+        // (m_submit == m_retire, checked above) and the input ring is empty, so on_end_of_stream() has no
+        // pending work to race with; and the main (ingest/retire) thread is the sole producer on m_out, so
+        // it may freely send_data() from on_end_of_stream() the same as retire_ready() does.
+        return NOOP; // idle; the base promotes to FINISH (after on_end_of_stream()) once inputs_at_end()
     }
 
     /// Wake the main worker (and pool) so a property write / stop quiesces promptly
@@ -400,15 +400,34 @@ private:
             }
         }
         stop_pool();
-        start_pool(); // rebuilds the ring + spawns the new worker count + on_workers_resized(n)
+        try {
+            start_pool(); // rebuilds the ring + spawns the new worker count + on_workers_resized(n)
+        } catch (...) {
+            // The old pool is already gone. Leaving the component "running" with no workers would
+            // wedge it silently: the next packet would sit in the slot ring forever and EOS would
+            // never complete. Re-arm the resize so the next iteration retries the rebuild, and let
+            // the exception reach the base worker loop: under error_restart_max > 0 it backs off and
+            // re-enters process(), which re-runs do_resize(); with no restarts left (or none
+            // configured) the component finishes with finish_reason::error instead of hanging.
+            m_resize_pending.store(true, std::memory_order_release);
+            throw;
+        }
         logger()->debug("pipeline '{}' resized to {} workers", id(), m_pool.size());
     }
 
     auto start_pool() -> void {
         const int n = m_num_workers < 1 ? 1 : m_num_workers;
-        m_cap = round_up_pow2(static_cast<std::size_t>(n) * 2); // depth = 2x workers (>= 1 slot/worker + headroom)
-        m_mask = m_cap - 1;
-        m_ring = std::make_unique<slot[]>(m_cap);
+        const std::size_t cap =
+            round_up_pow2(static_cast<std::size_t>(n) * 2); // depth = 2x workers (>= 1 slot/worker + headroom)
+        const std::size_t mask = cap - 1;
+        // Allocate into a local first, and only THEN publish cap/mask/ring together: on the resize path
+        // (do_resize() -> stop_pool() -> start_pool()) the old, smaller ring is still current until this
+        // point. If make_unique threw after m_cap/m_mask were already widened, a retried process() would
+        // index the OLD (smaller) ring with the NEW (larger) mask — out of bounds.
+        auto ring = std::make_unique<slot[]>(cap);
+        m_cap = cap;
+        m_mask = mask;
+        m_ring = std::move(ring);
         m_submit = m_claim = m_retire = 0;
         m_pool_stop.store(false, std::memory_order_release);
         m_pool.clear();
