@@ -95,13 +95,19 @@ public:
     using in_t = InBuf;
     using out_t = OutBuf;
 
+    /// max_workers is a construction-time ceiling in [1, 1024]. Both the initial
+    /// worker count and subsequent property writes must be in [1, max_workers].
+    /// Invalid constructor arguments throw before any pool can be started.
     explicit pipeline_component(std::string_view id, std::string in_name = "in", std::string out_name = "out",
-                                int default_workers = 2)
+                                int default_workers = 2, int max_workers = 1024)
         : component(id), m_in(in_name), m_out(out_name), m_num_workers(default_workers) {
+        if (max_workers < 1 || max_workers > 1024 || default_workers < 1 || default_workers > max_workers) {
+            throw std::invalid_argument("pipeline_component: require 1 <= default_workers <= max_workers <= 1024");
+        }
         add_port(m_in);
         add_port(m_out);
         add_property("num_workers", m_num_workers, properties::config_type::RUNTIME)
-            .validate([](const int& n) { return n >= 1 && n <= 1024; })
+            .validate([max_workers](const int& n) { return n >= 1 && n <= max_workers; })
             .on_change([this](const properties::json&) {
                 // Flag a pool rebuild; the main worker performs it at a safe point
                 // (between iterations, after draining in-flight work) — see do_resize.

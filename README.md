@@ -975,8 +975,14 @@ Override three hooks instead:
   and `work()` sees the SAME generation the packet was prepared/stamped with, no matter how many
   RUNTIME writes landed while it sat queued. Default: `nullptr`.
 
-`num_workers` is auto-registered as a RUNTIME property (range 1..1024); changing it drains the pool and
-rebuilds it at the new size. Because only the main thread sends, the single-producer invariant holds.
+`num_workers` is auto-registered as a RUNTIME property (default range 1..1024); changing it drains the pool and
+rebuilds it at the new size. Subclasses can pass a construction-time ceiling as the final argument:
+`pipeline_component(id, "in", "out", /*default_workers=*/2, /*max_workers=*/8)`.
+The constructor requires `1 <= default_workers <= max_workers <= 1024` and throws
+`std::invalid_argument` otherwise. INITIALIZE and RUNTIME writes outside `1..max_workers` are
+rejected before committing the value or resizing the pool. This ceiling limits pool threads;
+subclasses remain responsible for budgeting any threads their kernels create internally.
+Because only the main thread sends, the single-producer invariant holds.
 The `fft` and `psd` components in `composite-comps` are built on it.
 
 Pool workers run **concurrently with property commits** — the park quiesces only the main worker —

@@ -82,6 +82,12 @@ longer match, and there is no window where a layout change could merge ahead of 
 
 - **`slab_pool::buffer_size()` (FR-3)** reports the immutable per-buffer element count
   supplied to `create()`, excluding alignment padding; callers can remove shadow-size fields.
+- **Subclass worker ceiling (FR-4).** `pipeline_component` accepts a final `max_workers`
+  constructor argument (default 1024). Constructor arguments must satisfy
+  `1 <= default_workers <= max_workers <= 1024`; invalid combinations throw
+  `std::invalid_argument`. Initialization and runtime property writes above the ceiling or
+  below 1 are rejected before commit/pool creation. Valid existing constructor calls retain
+  their behavior.
 - The 0.5.2 and 0.5.3 maintenance patches are merged into this line (see their sections below).
 - Baseline-0: release-grade benchmark harness (`bench_datapath`, new `bench_registry`),
   committed v0.5.1 baselines under `benchmarks/baselines/`, and the scheduled non-gating

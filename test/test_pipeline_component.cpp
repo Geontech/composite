@@ -428,6 +428,73 @@ int main() {
         }
         std::puts("PIPELINE ingest-context release OK: slot drops its context at retire");
     }
+    // ---- (G) FR-4: reject an excessive request before committing or resizing ----
+    {
+        class limited_pipe : public pipeline_component<mutable_buffer<int>, mutable_buffer<int>> {
+        public:
+            limited_pipe(int initial = 1, int ceiling = 2)
+                : pipeline_component("limited", "in", "out", initial, ceiling) {}
+            std::atomic<int> workers{0};
+            std::atomic<int> resizes{0};
+
+        protected:
+            auto work(in_t in, timestamp, const composite::metadata&) -> out_t override { return in; }
+            auto on_workers_resized(int n) -> void override {
+                workers.store(n);
+                resizes.fetch_add(1);
+            }
+        };
+
+        for (auto [initial, ceiling] : {std::pair{0, 2}, {3, 2}, {1, 0}, {1, 1025}}) {
+            bool rejected = false;
+            try {
+                auto invalid = make_component<limited_pipe>(initial, ceiling);
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            if (!rejected) {
+                std::puts("FAIL: invalid initial worker count or ceiling accepted (G)");
+                return 1;
+            }
+        }
+
+        auto limited = make_component<limited_pipe>();
+        auto rejects = [&](int n, properties::config_type phase) {
+            try {
+                limited->set_properties(properties::json{{"num_workers", n}}, phase);
+            } catch (const properties::validation_error&) {
+                return true;
+            }
+            return false;
+        };
+        if (!rejects(3, properties::config_type::INITIALIZE) || limited->get_property<int>("num_workers") != 1) {
+            std::puts("FAIL: worker ceiling not enforced during initialization (G)");
+            return 1;
+        }
+        limited->start();
+        if (!rejects(3, properties::config_type::RUNTIME) || !rejects(0, properties::config_type::RUNTIME) ||
+            limited->get_property<int>("num_workers") != 1 || limited->resizes.load() != 1) {
+            std::puts("FAIL: rejected worker write committed or resized the pool (G)");
+            return 1;
+        }
+        limited->set_properties(properties::json{{"num_workers", 2}}, properties::config_type::RUNTIME);
+        for (int i = 0; i < 2000 && limited->workers.load() != 2; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        limited->stop();
+        if (limited->workers.load() != 2 || limited->resizes.load() != 2) {
+            std::puts("FAIL: valid boundary worker count did not resize the pool (G)");
+            return 1;
+        }
+        // Omitting the new argument preserves the former 1..1024 property range.
+        auto legacy = make_component<doubler>();
+        legacy->set_properties(properties::json{{"num_workers", 1024}}, properties::config_type::INITIALIZE);
+        if (legacy->get_property<int>("num_workers") != 1024) {
+            std::puts("FAIL: default worker ceiling changed (G)");
+            return 1;
+        }
+        std::puts("PIPELINE worker ceiling OK: constructor/init/runtime validation and valid resize");
+    }
 
     // ---- finish_at_end=false: a pipeline_component must NOT self-FINISH at EOS when opted out ----
     {
