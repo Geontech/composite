@@ -80,6 +80,16 @@ static int test_invalid_release() {
 }
 
 int main() {
+    // Element count is independent of both pool capacity and the aligned slot stride.
+    {
+        auto sized = slab_pool<std::uint64_t>::create(17, 4);
+        static_assert(noexcept(sized->buffer_size()));
+        auto buffer = sized->acquire();
+        if (sized->buffer_size() != 17 || sized->capacity() != 4 || !buffer || buffer->size() != 17) {
+            std::puts("FAIL: buffer_size must report elements, not capacity or padded stride");
+            return 1;
+        }
+    }
     if (const int rc = test_invalid_release(); rc != 0) {
         return rc;
     }

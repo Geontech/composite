@@ -80,6 +80,9 @@ ABI-breaking change, not with it. The SONAME is major.minor, so this flips the l
 longer match, and there is no window where a layout change could merge ahead of the bump.
 0.5-series patches continue from the `maint/0.5` branch. Release notes accumulate here.
 
+- **`slab_pool::buffer_size()` (FR-3)** reports the immutable per-buffer element count
+  supplied to `create()`, excluding alignment padding; callers can remove shadow-size fields.
+- The 0.5.2 and 0.5.3 maintenance patches are merged into this line (see their sections below).
 - Baseline-0: release-grade benchmark harness (`bench_datapath`, new `bench_registry`),
   committed v0.5.1 baselines under `benchmarks/baselines/`, and the scheduled non-gating
   `bench:baseline` CI job. Measurement-definition fixes are detailed in the commit; no

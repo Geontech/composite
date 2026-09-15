@@ -411,6 +411,10 @@ public:
         return m_buffer_count;
     }
 
+    /// Per-buffer element count passed to create(), excluding alignment padding.
+    /// Immutable after construction; thread-safe without synchronization.
+    [[nodiscard]] auto buffer_size() const noexcept -> std::size_t { return m_buffer_size; }
+
     /**
      * @brief Number of invalid pointers refused by release().
      *
