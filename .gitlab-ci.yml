@@ -13,6 +13,18 @@
 # lint:tidy-format (pinned clang-format version) and the arm64 sanitizer, plus one explicit
 # portability job so a newer GCC and a different distro's packaging still get exercised.
 
+# ONE PIPELINE PER PUSH. Without workflow rules, every job with `rules:` (all of .not-on-tag) runs
+# twice on a branch with an open MR — once as a branch pipeline, once as an MR pipeline — for the
+# same commit. Prefer the MR pipeline (it is the one the MR widget and merge checks read), fall back
+# to a branch pipeline when no MR is open, and keep tag pipelines for publish:dockerhub.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
 stages:
   - toolchain
   - lint
