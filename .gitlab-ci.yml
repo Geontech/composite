@@ -21,17 +21,16 @@ stages:
   - publish
 
 variables:
-  # The CI toolchain image tag. BUMP THIS BY HAND when docker/Dockerfile.rocky9's toolchain stage
-  # changes (compiler, cmake, or a pinned dependency revision) — same discipline as the base-image
-  # digest and the nlohmann/otel commit pins, and auditable in the diff. ci:toolchain rebuilds only
-  # when the tag is absent from the registry, so ordinary pipelines skip it in seconds.
-  # The trailing segment is the first 12 hex of sha256(docker/Dockerfile.rocky9). ci:toolchain
-  # RECOMPUTES it and fails if it disagrees, so a Dockerfile edit without a matching tag bump cannot
-  # silently leave the pipeline testing an old toolchain while the release images use the new one.
-  # The value is still literal because `image:` has to resolve before any script runs — the guard is
-  # what makes the manual step safe rather than trusted.
-  TOOLCHAIN_TAG: "rocky9-gcc14-1b23dbf3ef47"
-  CI_TOOLCHAIN_IMAGE: "$CI_REGISTRY_IMAGE/ci-toolchain:$TOOLCHAIN_TAG"
+  # Where ci:toolchain publishes the toolchain stage. There is NO hand-maintained tag: ci:toolchain
+  # builds the stage every pipeline against a registry layer cache, and hands the resulting DIGEST
+  # to later jobs as $CI_TOOLCHAIN_IMAGE (a dotenv artifact). Whether anything actually rebuilds is
+  # BuildKit's cache-key decision — the toolchain stage's own instructions, build args and base
+  # digest — so an edit to a later stage costs a cache hit rather than a failed pipeline, and an
+  # edit to the toolchain stage cannot be forgotten, because nothing has to be remembered.
+  #
+  # $CI_TOOLCHAIN_IMAGE is deliberately NOT defaulted here: a job that somehow ran without
+  # ci:toolchain's artifact should fail to resolve its image, not quietly fall back to some tag.
+  CI_TOOLCHAIN_REPO: "$CI_REGISTRY_IMAGE/ci-toolchain"
 
 # GCC 14 image; install cmake + git (FetchContent needs git) + nlohmann-json3-dev
 # (nlohmann_json is a REQUIRED system dependency — the public JSON type in the
@@ -81,9 +80,15 @@ variables:
 # package installation at all — cmake, ninja, git, GCC Toolset 14, nlohmann_json and
 # opentelemetry-cpp are baked in, which is also what removes "which opentelemetry does this job
 # get?" as a question rather than answering it.
+#
+# $CI_TOOLCHAIN_IMAGE is a digest produced by ci:toolchain in THIS pipeline (see there). If it were
+# ever missing, `image:` would expand to empty and the runner may silently substitute its own
+# default image — so the first thing every job does is prove it is on GCC Toolset 14.
 .rocky:
   image: $CI_TOOLCHAIN_IMAGE
   before_script:
+    - 'echo "toolchain image: ${CI_TOOLCHAIN_IMAGE:?not set - ci:toolchain did not provide it}"'
+    - test "$(command -v g++)" = /opt/rh/gcc-toolset-14/root/usr/bin/g++
     - cmake --version | head -1
     - g++ --version | head -1
 
@@ -103,49 +108,61 @@ variables:
 # use it. Pushed with $CI_JOB_TOKEN, which is scoped to this project's registry — no long-lived
 # credential, and deliberately not Docker Hub, which is for release artifacts only.
 #
-# IDEMPOTENT: if $TOOLCHAIN_TAG already exists the job exits immediately. Only a deliberate tag
-# bump pays for the opentelemetry-cpp source build, so the common pipeline cost is one manifest
-# lookup.
+# BUILT EVERY PIPELINE, CACHED BY BUILDKIT. The build imports the layer cache of this branch's last
+# toolchain image and of the default branch's, so an unchanged stage is a full cache hit and the
+# job costs a dind start plus a manifest round-trip. Only a change BuildKit can see in the
+# toolchain stage — an instruction, a pinned revision ARG, the base digest, the frontend — pays for
+# the opentelemetry-cpp source build. Edits to later stages (builder, runtime, devel) do not touch
+# these cache keys at all, which is the whole point: the old sha256(Dockerfile) tag guard failed
+# the pipeline on every one of them.
+#
+# Inline cache (not a separate cache ref) is sufficient because the toolchain target is a single
+# FROM chain: every layer worth caching is a layer of the pushed image itself. It also means there
+# is no second registry object to keep alive under the cleanup policy.
+#
+# DIGEST, NOT TAG, downstream. The branch tag is only a cache handle and moves with every push;
+# jobs get the immutable digest this job just produced, via the dotenv report below, so a
+# concurrent pipeline re-pushing the tag cannot change what an in-flight pipeline tests. Later
+# stages inherit dotenv variables from earlier-stage jobs by default — no `needs:` required, and
+# none is added so stage ordering (lint before build, build before sanitize) is unchanged.
+#
+# --provenance=false: this is a CI-internal image, and a provenance attestation carries build
+# timestamps, which would give an otherwise byte-identical cache hit a new digest every pipeline.
+# The RELEASE images keep full provenance + SBOM (see build:container).
 # ---------------------------------------------------------------------------
 ci:toolchain:
   stage: toolchain
   extends: [.docker, .not-on-tag]
   script:
     - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-    # GUARD FIRST: the tag must encode the current Dockerfile. Without this, skipping the rebuild
-    # when the tag exists means any Dockerfile change — a compiler bump, a new dependency pin —
-    # keeps the pipeline on a stale toolchain while docker/Dockerfile.rocky9 (and therefore every
-    # released image) moves on. That is precisely the tested-vs-shipped divergence this whole
-    # restructure exists to remove, so it fails loudly and tells you the tag to write.
     - |
       set -eu
-      want="$(sha256sum docker/Dockerfile.rocky9 | cut -c1-12)"
-      case "$TOOLCHAIN_TAG" in
-        *"$want") echo "TOOLCHAIN_TAG matches docker/Dockerfile.rocky9 ($want)" ;;
-        *)
-          echo "TOOLCHAIN_TAG is stale."
-          echo "  docker/Dockerfile.rocky9 hashes to: $want"
-          echo "  TOOLCHAIN_TAG is:                   $TOOLCHAIN_TAG"
-          echo "Set TOOLCHAIN_TAG in .gitlab-ci.yml to something ending in '$want'"
-          echo "(convention: rocky9-gcc<major>-$want) so CI tests the toolchain the images ship."
-          exit 1
-          ;;
-      esac
-    - |
-      if docker manifest inspect "$CI_TOOLCHAIN_IMAGE" >/dev/null 2>&1; then
-        echo "$CI_TOOLCHAIN_IMAGE already present; nothing to build"
-        exit 0
-      fi
-      echo "building $CI_TOOLCHAIN_IMAGE"
-    - >-
-      docker buildx build
-      --file docker/Dockerfile.rocky9
-      --platform linux/amd64
-      --target toolchain
-      --tag "$CI_TOOLCHAIN_IMAGE"
-      --push
-      .
-    - docker buildx imagetools inspect "$CI_TOOLCHAIN_IMAGE"
+      ref="$CI_TOOLCHAIN_REPO:$CI_COMMIT_REF_SLUG"
+      default_ref="$CI_TOOLCHAIN_REPO:${CI_DEFAULT_BRANCH_SLUG:-$CI_DEFAULT_BRANCH}"
+      # A --cache-from ref that does not exist yet (first push on a branch) is a warning, not an
+      # error, so the fallback to the default branch's cache needs no special casing.
+      docker buildx build \
+        --file docker/Dockerfile.rocky9 \
+        --platform linux/amd64 \
+        --target toolchain \
+        --cache-from "type=registry,ref=$ref" \
+        --cache-from "type=registry,ref=$default_ref" \
+        --cache-to type=inline \
+        --provenance=false \
+        --metadata-file toolchain-meta.json \
+        --tag "$ref" \
+        --push \
+        .
+      # docker:cli is Alpine with no jq; the metadata file is pretty-printed one key per line.
+      digest="$(sed -n 's/^ *"containerimage.digest": *"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' toolchain-meta.json)"
+      test -n "$digest" || { echo "no containerimage.digest in build metadata:"; cat toolchain-meta.json; exit 1; }
+      image="$CI_TOOLCHAIN_REPO@$digest"
+      docker buildx imagetools inspect "$image"
+      echo "CI_TOOLCHAIN_IMAGE=$image" > toolchain.env
+      echo "toolchain for this pipeline: $image"
+  artifacts:
+    reports:
+      dotenv: toolchain.env
   after_script:
     - unset DOCKER_AUTH_CONFIG
     - docker logout "$CI_REGISTRY" 2>/dev/null || true
@@ -257,11 +274,12 @@ build:dpdk:
   stage: build
   extends: [.rocky, .not-on-tag]
   before_script:
+    - !reference [.rocky, before_script]
     # dpdk-devel is the ONE package any job still installs: it is a fast dnf install from
     # appstream, and keeping it out of the shared toolchain image avoids paying ~40MB of drivers
     # on every other job. Same package the -dpdk images use.
     - microdnf install -y --enablerepo=crb dpdk-devel
-    - cmake --version | head -1 && pkg-config --modversion libdpdk
+    - pkg-config --modversion libdpdk
   script:
     # Build the library (which now contains dpdk_manager.cpp) + the CLI. Tests off:
     # the DPDK paths need a NIC/hugepages to run; compile coverage is the goal here.
@@ -346,6 +364,9 @@ build:container:
   stage: build
   extends: [.docker, .not-on-tag]
   script:
+    # Logged in up front: the first build below imports ci:toolchain's layer cache from this
+    # project's registry, and the staging pushes further down need the same credential.
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     # LABEL CONTRACT: image labels carry the numeric PROJECT version, which is also what
     # `composite-cli --version` reports. Release identity — including any `-rc.N` — lives in the
@@ -360,11 +381,18 @@ build:container:
     # `-rc.N` suffix on prereleases.
     - export IMAGE_VERSION="$(sed -n 's/^project(composite VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
     - test -n "$IMAGE_VERSION"
+    # TESTED == SHIPPED, BY CONSTRUCTION. The first build imports the exact toolchain image the
+    # build/test/sanitize jobs run in (by digest, from ci:toolchain), so the builder and devel
+    # stages sit on those same layers instead of a fresh local rebuild of the toolchain stage —
+    # which also retires the opentelemetry-cpp source build this job used to pay every pipeline.
+    # Every later build in this job reuses them from the local builder cache. A cache miss (e.g. the
+    # import failed) is a speed problem, not a correctness one: the stage rebuilds from the same pins.
     - >-
       docker buildx build
       --file docker/Dockerfile.rocky9
       --platform linux/amd64
       --target runtime
+      --cache-from "type=registry,ref=$CI_TOOLCHAIN_IMAGE"
       --build-arg IMAGE_CREATED="$IMAGE_CREATED"
       --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
       --build-arg IMAGE_VERSION="$IMAGE_VERSION"
@@ -565,7 +593,6 @@ build:container:
     # release job will promote rather than a local look-alike.
     #
     # The rebuild is nearly free: every layer is already in the builder cache from the passes above.
-    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - export STAGED="$CI_REGISTRY_IMAGE/staging"
     # Pipeline-scoped, and used for every reference within this job. A bare `staging:<sha>` is
     # mutable — a concurrent pipeline or a retry on the same commit rewrites it — so building under

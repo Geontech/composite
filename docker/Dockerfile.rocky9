@@ -5,8 +5,9 @@
 #
 # THIS FILE IS THE ONLY PLACE THESE PINS LIVE, and it is now also the sole definition of the CI
 # toolchain: ci:toolchain publishes the `toolchain` stage below as the image every build/test job
-# runs in, and its tag must end in sha256(this file)[0:12] or the pipeline fails. So a pin change
-# here propagates to CI and to the released images together, by construction.
+# runs in (by digest, rebuilt whenever BuildKit sees the stage change), and build:container imports
+# that same image as its layer cache. So a pin change here propagates to CI and to the released
+# images together, by construction — with no tag to bump by hand.
 #
 # (The publish job used to pre-pull these pins to surface Docker Hub credential-scope failures
 # early. It no longer builds anything, so that preflight is gone; build:container pulls them
