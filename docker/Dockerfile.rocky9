@@ -201,6 +201,7 @@ RUN microdnf install -y ca-certificates libgcc libstdc++ libcurl openssl-libs pr
     && if [ "${COMPOSITE_WITH_DPDK}" = "ON" ]; then microdnf install -y --enablerepo=crb dpdk; fi \
     && microdnf clean all \
     && useradd --uid 10001 --create-home --shell /bin/bash composite \
+    && if [ "${COMPOSITE_WITH_DPDK}" = "ON" ]; then install -d -o 10001 -g 10001 /var/run/dpdk; fi \
     && install -d -o 10001 -g 10001 /config /data /workspace
 
 COPY --from=builder /opt/composite/runtime/ /usr/local/
