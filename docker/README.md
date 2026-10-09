@@ -74,23 +74,44 @@ DPDK is shipped as a **separate variant rather than in the standard image**, bec
 
 A `-dpdk` image needs, from its host:
 
-- **Hugepages.** Allocated on the host and mounted into the container, e.g. `--mount type=bind,source=/dev/hugepages,target=/dev/hugepages`. DPDK's EAL will refuse to initialize without them.
-- **Device access.** `/dev/vfio` for the VFIO driver (`--device /dev/vfio/vfio --device /dev/vfio/<group>`), or `/dev/uio*` for UIO. The NIC must already be bound to a userspace-capable driver on the host — the container cannot do that for you.
-- **Capabilities.** At minimum `--cap-add IPC_LOCK` (hugepage mapping) and typically `--cap-add SYS_RAWIO`. Many deployments use `--privileged` instead; prefer explicit capabilities where you can enumerate them.
-- **Shared memory.** DPDK's runtime files default to `/var/run/dpdk`; give the container a writable path or pass `--file-prefix`.
-- **Non-root caveat.** These images run as UID 10001 like every other Composite image. That user must be able to read the hugepage mount and the VFIO devices, which usually means group ownership on the host side.
+- **Hugepages.** Pre-allocated on the host and exposed through a hugetlbfs mount. Under Docker, bind-mount one such as `/dev/hugepages`. Under Kubernetes, request the hugepage resource and mount an `emptyDir` with the matching `HugePages-<size>` medium.
+- **Device access.** `/dev/vfio` for the VFIO driver (`--device /dev/vfio/vfio --device /dev/vfio/<group>`), or `/dev/uio*` for UIO. The NIC must already be bound to a userspace-capable driver on the host, and the container cannot do that for you.
+- **Permissions, not blanket privilege.** A VFIO/IOMMU deployment can run as non-root with all Linux capabilities dropped when UID 10001 can access the hugepage mount and VFIO group device. Some UIO drivers, memory modes, or host configurations may require capabilities such as `IPC_LOCK` or `SYS_RAWIO`; add only the capabilities required by that concrete setup rather than defaulting to `--privileged`.
+- **Runtime files.** The `-dpdk` images set `XDG_RUNTIME_DIR=/run/user/10001`, so EAL uses `/run/user/10001/dpdk`. Pass `--file-prefix` if you run several instances that must not share it.
+- **Non-root device ownership.** VFIO device ownership and mode are host-specific. Grant UID 10001 access to `/dev/vfio/<group>` through a supplemental group, device plugin, or DRA/CDI configuration; do not assume that passing the device into the container also makes it readable.
 
 `composite-cli --list-dpdk-ports` exists in these images and is the quickest way to confirm the EAL can see the host's NICs:
 
 ```bash
+VFIO_GROUP=470
+VFIO_DEVICE_GID=3000
+printf '{}\n' > /tmp/composite-dpdk-discovery.json
+
 docker run --rm \
   --mount type=bind,source=/dev/hugepages,target=/dev/hugepages \
   --device /dev/vfio/vfio \
-  --cap-add IPC_LOCK \
-  composite:<version>-dpdk --list-dpdk-ports
+  --device /dev/vfio/${VFIO_GROUP} \
+  --group-add "${VFIO_DEVICE_GID}" \
+  --mount type=bind,source=/tmp/composite-dpdk-discovery.json,target=/config/discovery.json,readonly \
+  composite:<version>-dpdk /config/discovery.json --list-dpdk-ports
 ```
 
-If that lists no ports, the problem is host configuration, not the image.
+Set `VFIO_GROUP` to the VF's IOMMU group and `VFIO_DEVICE_GID` to the group that
+owns the VFIO device node. If no ports are listed, verify that the device is
+bound to `vfio-pci`, that its IOMMU group was passed through, and that UID 10001
+can open the group device.
+
+The image creates `/run/user/10001` with mode `0700`, owned by UID 10001. If your runtime
+mounts a fresh filesystem over `/run` or uses a read-only root filesystem, supply a writable
+`XDG_RUNTIME_DIR` owned by UID 10001; EAL creates its `dpdk` subdirectory but not that parent.
+VFIO also needs a sufficient locked-memory limit for its DMA mappings. Set the container's
+`memlock` ulimit to cover the configured memory (for example, `--ulimit memlock=-1:-1` where the
+host permits it).
+
+See [DPDK initialization and CPU allocation](../README.md#dpdk-initialization-and-cpu-allocation)
+for automatic CPU reservation, explicit EAL CPU selectors, and file-prefix precedence. Mempools
+are created on the NIC's NUMA socket; use distinct `mempool_name` values for ports on different
+sockets, since an existing named pool is shared rather than recreated on another socket.
 
 The DPDK variant is built from the same source and the same OTel/TLS options as the standard image — it is strictly additive.
 

@@ -201,7 +201,13 @@ auto validate_connection(const nlohmann::json& conn) -> std::tuple<std::string, 
 
 auto parse_dpdk_config(const nlohmann::json& dpdk_json) -> dpdk::config {
     dpdk::config config;
-
+    if (dpdk_json.contains("minimum_application_physical_cores")) {
+        const auto& minimum = dpdk_json["minimum_application_physical_cores"];
+        if (!minimum.is_number_integer() || minimum < 0 || minimum > UINT16_MAX) {
+            throw std::invalid_argument("minimum_application_physical_cores must be an integer in [0, 65535]");
+        }
+        config.minimum_application_physical_cores = minimum.get<uint16_t>();
+    }
     // Parse EAL arguments
     if (dpdk_json.contains("eal_args") && dpdk_json["eal_args"].is_array()) {
         config.eal_args = dpdk_json["eal_args"].get<std::vector<std::string>>();

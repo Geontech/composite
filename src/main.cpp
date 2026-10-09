@@ -20,6 +20,7 @@
 #include <argparse/argparse.hpp>
 #include <atomic>
 #include <csignal>
+#include <cstdlib>
 #include <ctime>
 #include <dlfcn.h>
 #include <filesystem>
@@ -30,6 +31,7 @@
 #include <httplib.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <set>
 #include <spdlog/spdlog.h>
 #include <string>
@@ -300,21 +302,98 @@ auto main(int argc, char** argv) -> int {
     if (dpdk_enabled) {
         spdlog::debug("initializing DPDK");
 
-        // Translate DPDK EAL args from logical to physical cores. Guarded like the config
-        // parse above: the translator throws on --lcores and on unparsable -l tokens, and an
-        // escape here would bypass every cleanup path below to std::terminate.
-        if (!available_cores.empty()) {
-            std::vector<std::string> translated_args;
-            std::vector<int> logical_cores;
+        const auto has_file_prefix = [&] {
+            for (size_t i = 0; i < dpdk_cfg.eal_args.size(); ++i) {
+                if (dpdk_cfg.eal_args[i] == "--file-prefix" ||
+                    dpdk_cfg.eal_args[i].starts_with("--file-prefix=")) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!has_file_prefix()) {
+            const char* configured_prefix = std::getenv("COMPOSITE_DPDK_FILE_PREFIX");
+            const std::string prefix = configured_prefix && *configured_prefix
+                                           ? configured_prefix
+                                           : "composite";
+            dpdk_cfg.eal_args.insert(dpdk_cfg.eal_args.begin(), {"--file-prefix", prefix});
+            spdlog::debug("using DPDK file prefix '{}'", prefix);
+        }
+
+        const auto cpu_list = [](const std::vector<int>& cpus) {
+            std::string result;
+            for (size_t i = 0; i < cpus.size(); ++i) {
+                if (i > 0) result += ",";
+                result += std::to_string(cpus[i]);
+            }
+            return result;
+        };
+
+        std::vector<int> application_physical_cores;
+        if (available_cores.empty()) {
+            spdlog::error("Cannot configure DPDK safely: unable to determine the process CPU set");
+            return EXIT_FAILURE;
+        }
+        {
+            const auto rx_queue_count = std::accumulate(
+                dpdk_cfg.ports.begin(), dpdk_cfg.ports.end(), std::size_t{0},
+                [](std::size_t total, const composite::dpdk::port_config& port) {
+                    return total + port.rx_queues;
+                });
+            // Normalize explicit selectors before deciding whether to reserve CPUs automatically.
+            // -l uses logical indices; -c retains EAL's physical-bitmask semantics.
             try {
-                std::tie(translated_args, logical_cores) =
-                    composite::translate_dpdk_eal_args(dpdk_cfg.eal_args, available_cores);
+                auto [args, logical] = composite::translate_dpdk_eal_args(dpdk_cfg.eal_args, available_cores);
+                dpdk_cfg.eal_args = std::move(args);
+                dpdk_logical_cores = std::move(logical);
             } catch (const std::exception& e) {
                 spdlog::error("invalid dpdk configuration: {}", e.what());
                 return EXIT_FAILURE;
             }
-            dpdk_cfg.eal_args = translated_args;
-            dpdk_logical_cores = logical_cores;
+            if (dpdk_logical_cores.empty()) {
+                const auto cpu_plan = composite::plan_dpdk_cpu_cores(
+                    available_cores, rx_queue_count, dpdk_cfg.minimum_application_physical_cores);
+                if (!cpu_plan) {
+                    return EXIT_FAILURE;
+                }
+                dpdk_cfg.eal_args.insert(dpdk_cfg.eal_args.begin(), {"-l", cpu_list(cpu_plan->dpdk_cores)});
+                application_physical_cores = cpu_plan->application_cores;
+                for (const int physical : cpu_plan->dpdk_cores) {
+                    const auto it = std::find(available_cores.begin(), available_cores.end(), physical);
+                    dpdk_logical_cores.push_back(std::distance(available_cores.begin(), it));
+                }
+                spdlog::info("DPDK CPU plan: {} RX queue(s), worker CPUs [{}], EAL CPUs [{}], "
+                             "application CPUs [{}]",
+                             rx_queue_count, cpu_list(cpu_plan->rx_worker_cores),
+                             cpu_list(cpu_plan->dpdk_cores), cpu_list(application_physical_cores));
+            } else {
+                // Explicit selections override automatic sizing, including its minimum application
+                // reservation, but cannot split available SMT siblings between DPDK and the application.
+                std::vector<int> dpdk_physical_cores;
+                dpdk_physical_cores.reserve(dpdk_logical_cores.size());
+                for (const int logical : dpdk_logical_cores) {
+                    dpdk_physical_cores.push_back(available_cores[logical]);
+                }
+                const auto worker_cores = composite::dpdk_physical_core_representatives(dpdk_physical_cores, available_cores);
+                if (!worker_cores) {
+                    return EXIT_FAILURE;
+                }
+                if (worker_cores->size() < rx_queue_count) {
+                    spdlog::warn("Explicit DPDK lcore selection provides {} physical core(s) for {} RX "
+                                 "queue(s); receive workers will share cores round-robin",
+                                 worker_cores->size(), rx_queue_count);
+                } else if (worker_cores->size() > rx_queue_count) {
+                    spdlog::warn("Explicit DPDK lcore selection provides {} physical core(s) for {} RX "
+                                 "queue(s); excess selected cores remain reserved from application work",
+                                 worker_cores->size(), rx_queue_count);
+                }
+                for (size_t i = 0; i < available_cores.size(); ++i) {
+                    if (std::find(dpdk_logical_cores.begin(), dpdk_logical_cores.end(), static_cast<int>(i)) ==
+                        dpdk_logical_cores.end()) {
+                        application_physical_cores.push_back(available_cores[i]);
+                    }
+                }
+            }
 
             // Log the DPDK core allocation
             if (!dpdk_logical_cores.empty()) {
@@ -376,13 +455,10 @@ auto main(int argc, char** argv) -> int {
             cpu_set_t non_dpdk_cpuset;
             CPU_ZERO(&non_dpdk_cpuset);
 
-            // Build set of non-DPDK physical cores
-            for (size_t i = 0; i < available_cores.size(); i++) {
-                bool is_dpdk = std::find(dpdk_logical_cores.begin(), dpdk_logical_cores.end(), static_cast<int>(i)) !=
-                               dpdk_logical_cores.end();
-                if (!is_dpdk) {
-                    CPU_SET(available_cores[i], &non_dpdk_cpuset);
-                }
+            // Application affinity remains a stable ascending physical-CPU list; only the
+            // DPDK reservation groups SMT siblings.
+            for (const int cpu : application_physical_cores) {
+                CPU_SET(cpu, &non_dpdk_cpuset);
             }
 
             if (CPU_COUNT(&non_dpdk_cpuset) > 0) {

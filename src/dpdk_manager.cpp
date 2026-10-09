@@ -6,6 +6,7 @@
 #ifdef COMPOSITE_USE_DPDK
 
 #include "composite/dpdk/manager.hpp"
+#include "composite/util/cpu_affinity.hpp"
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <pthread.h>
 #include <sched.h>
 #include <string>
@@ -51,6 +53,7 @@ auto manager::initialize(const dpdk::config& config) -> bool {
         }
         m_registry.clear();
         m_mempool_configs.clear(); // (was missed before — left stale config after a failed init)
+        m_rx_worker_cores.clear();
         int ret = rte_eal_cleanup();
         if (ret != 0) {
             spdlog::warn("DPDK EAL cleanup returned: {}", ret);
@@ -77,6 +80,44 @@ auto manager::initialize(const dpdk::config& config) -> bool {
 
         spdlog::info("Configured DPDK port {} (interface={}, rx_queues={}, mempool={})", port_config.port_id,
                      port_config.interface, port_config.rx_queues, port_config.mempool_name);
+    }
+
+    const auto configured_rx_queues = std::accumulate(
+        config.ports.begin(), config.ports.end(), std::size_t{0},
+        [](std::size_t total, const port_config& port) { return total + port.rx_queues; });
+    std::vector<int> rx_worker_cores;
+    if (configured_rx_queues > 0) {
+        std::vector<int> eal_lcores;
+        unsigned int lcore_id;
+        RTE_LCORE_FOREACH(lcore_id) {
+            eal_lcores.push_back(static_cast<int>(lcore_id));
+        }
+        const auto representatives = dpdk_physical_core_representatives(eal_lcores, process_available_cores());
+        if (!representatives) {
+            cleanup_partial();
+            return false;
+        }
+        rx_worker_cores = *representatives;
+        if (rx_worker_cores.empty()) {
+            spdlog::error("DPDK configured {} RX queue(s), but EAL has no usable physical core", configured_rx_queues);
+            cleanup_partial();
+            return false;
+        }
+        if (rx_worker_cores.size() < configured_rx_queues) {
+            spdlog::warn("DPDK configured {} RX queue(s) across {} selected physical core(s); "
+                         "receive workers will share cores round-robin",
+                         configured_rx_queues, rx_worker_cores.size());
+        } else if (rx_worker_cores.size() > configured_rx_queues) {
+            spdlog::warn("DPDK selected {} physical core(s) for {} RX queue(s); "
+                         "excess selected cores have no receive worker",
+                         rx_worker_cores.size(), configured_rx_queues);
+        }
+    }
+    std::size_t worker_index = 0;
+    for (const auto& port_config : config.ports) {
+        for (uint16_t queue_id = 0; queue_id < port_config.rx_queues; ++queue_id) {
+            m_rx_worker_cores[{port_config.interface, queue_id}] = rx_worker_cores[worker_index++ % rx_worker_cores.size()];
+        }
     }
 
     m_initialized.store(true, std::memory_order_release);
@@ -112,6 +153,7 @@ auto manager::shutdown() -> void {
     // Note: mempools are freed automatically by DPDK on cleanup
     m_registry.clear();
     m_mempool_configs.clear();
+    m_rx_worker_cores.clear();
 
     // Clean up EAL
     int ret = rte_eal_cleanup();
@@ -175,6 +217,18 @@ auto manager::get_dpdk_lcores() const -> std::vector<int> {
     }
 
     return lcores;
+}
+
+auto manager::get_rx_worker_core(const std::string& interface_name, uint16_t queue_id) const
+    -> std::optional<int> {
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    const auto it = m_rx_worker_cores.find({interface_name, queue_id});
+    if (it == m_rx_worker_cores.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 auto manager::list_available_ports() const -> std::vector<port_summary> {
@@ -351,11 +405,11 @@ auto manager::create_mempool(const port_config& config) -> rte_mempool* {
         return existing;
     }
 
-    // Create new mempool
+    // On the NIC's socket like the queues; the main lcore's may have no memory.
     rte_mempool* pool =
         rte_pktmbuf_pool_create(config.mempool_name.c_str(), config.mempool_size, config.mempool_cache_size,
                                 0, // private data size
-                                config.mbuf_data_room_size, rte_socket_id());
+                                config.mbuf_data_room_size, rte_eth_dev_socket_id(config.port_id));
 
     if (!pool) {
         spdlog::error("Failed to create mempool '{}': {}", config.mempool_name, rte_strerror(rte_errno));

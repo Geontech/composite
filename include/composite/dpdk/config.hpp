@@ -33,6 +33,7 @@ struct port_config {
 struct config {
     std::vector<std::string> eal_args; ///< EAL initialization arguments
     std::vector<port_config> ports;    ///< Port configurations
+    uint16_t minimum_application_physical_cores{1}; ///< Minimum complete application cores in automatic CPU plans only
 };
 
 } // namespace composite::dpdk

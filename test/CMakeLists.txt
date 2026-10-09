@@ -114,6 +114,17 @@ foreach(t
   composite_standalone_test(${t})
 endforeach()
 
+if(COMPOSITE_USE_DPDK)
+  composite_standalone_test(test_dpdk_manager)
+  target_include_directories(test_dpdk_manager SYSTEM PRIVATE ${DPDK_INCLUDE_DIRS})
+  target_compile_options(test_dpdk_manager PRIVATE ${DPDK_CFLAGS_OTHER})
+  target_compile_definitions(test_dpdk_manager PRIVATE TEST_DPDK_CLI_PATH="$<TARGET_FILE:composite-cli>")
+  add_dependencies(test_dpdk_manager composite-cli)
+  set_tests_properties(test_dpdk_manager PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 30
+    ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:composite>:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # OTLP instrument grouping. Only meaningful when the OTel bridge is compiled in, so it is
 # conditional — but it IS a ctest when enabled, because the bug it guards against (N components
 # collapsing into one exported series) is invisible without asserting on the series count.

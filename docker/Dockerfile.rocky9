@@ -5,8 +5,9 @@
 #
 # THIS FILE IS THE ONLY PLACE THESE PINS LIVE, and it is now also the sole definition of the CI
 # toolchain: ci:toolchain publishes the `toolchain` stage below as the image every build/test job
-# runs in, and its tag must end in sha256(this file)[0:12] or the pipeline fails. So a pin change
-# here propagates to CI and to the released images together, by construction.
+# runs in (by digest, rebuilt whenever BuildKit sees the stage change), and build:container imports
+# that same image as its layer cache. So a pin change here propagates to CI and to the released
+# images together, by construction — with no tag to bump by hand.
 #
 # (The publish job used to pre-pull these pins to surface Docker Hub credential-scope failures
 # early. It no longer builds anything, so that preflight is gone; build:container pulls them
@@ -201,7 +202,9 @@ RUN microdnf install -y ca-certificates libgcc libstdc++ libcurl openssl-libs pr
     && if [ "${COMPOSITE_WITH_DPDK}" = "ON" ]; then microdnf install -y --enablerepo=crb dpdk; fi \
     && microdnf clean all \
     && useradd --uid 10001 --create-home --shell /bin/bash composite \
-    && install -d -o 10001 -g 10001 /config /data /workspace
+    && if [ "${COMPOSITE_WITH_DPDK}" = "ON" ]; then install -d -o 10001 -g 10001 /var/run/dpdk; fi \
+    && install -d -o 10001 -g 10001 /config /data /workspace \
+    && install -d -m 0700 -o 10001 -g 10001 /run/user/10001
 
 COPY --from=builder /opt/composite/runtime/ /usr/local/
 COPY LICENSE /usr/share/licenses/composite/LICENSE
@@ -212,6 +215,7 @@ RUN printf '%s\n' /usr/local/lib64 > /etc/ld.so.conf.d/composite.conf \
 
 USER 10001:10001
 WORKDIR /workspace
+ENV XDG_RUNTIME_DIR=/run/user/10001
 
 EXPOSE 5000
 ENTRYPOINT ["/usr/local/bin/composite-cli"]
@@ -248,10 +252,12 @@ COPY --from=builder /opt/composite/licenses/ /usr/share/licenses/composite/third
 RUN printf '%s\n' /usr/local/lib64 > /etc/ld.so.conf.d/composite.conf \
     && ldconfig \
     && useradd --uid 10001 --create-home --shell /bin/bash composite \
-    && install -d -o 10001 -g 10001 /workspace
+    && install -d -o 10001 -g 10001 /workspace \
+    && install -d -m 0700 -o 10001 -g 10001 /run/user/10001
 
 USER 10001:10001
 WORKDIR /workspace
+ENV XDG_RUNTIME_DIR=/run/user/10001
 CMD ["/bin/bash"]
 
 # CI-only target: prove the installed SDK can build the documented external
@@ -280,4 +286,3 @@ COPY docker/smoke/check-features.sh /usr/local/bin/check-features.sh
 # smoke image so the publish job can re-run it against the pulled manifest.
 RUN /usr/local/bin/check-features.sh "${COMPOSITE_WITH_DPDK}"
 CMD ["--server", "0.0.0.0", "/config/smoke.json"]
-

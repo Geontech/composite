@@ -96,6 +96,14 @@ public:
     auto get_dpdk_lcores() const -> std::vector<int>;
 
     /**
+     * @brief Get the CPU assigned to a configured receive queue
+     *
+     * @return Physical CPU ID, or std::nullopt when the interface/queue has no worker assignment
+     */
+    COMPOSITE_API
+    auto get_rx_worker_core(const std::string& interface_name, uint16_t queue_id) const -> std::optional<int>;
+
+    /**
      * @brief Get DPDK port ID for a given interface name
      *
      * Maps Linux interface names (e.g., "eth0") to DPDK port IDs.
@@ -272,6 +280,7 @@ private:
     std::atomic<bool> m_initialized{false};
     port_registry m_registry;
     std::map<std::string, mempool_config> m_mempool_configs; ///< Mempool name → config (init-time only)
+    std::map<std::pair<std::string, uint16_t>, int> m_rx_worker_cores;
 
 }; // class manager
 

@@ -12,8 +12,10 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -157,8 +159,7 @@ public:
 // a worker self-write, and the shape most likely to leak a pool if disabling doesn't reap it.
 class self_disabling_pipeline : public pipeline_component<mutable_buffer<int>, mutable_buffer<int>> {
 public:
-    explicit self_disabling_pipeline(std::string_view id, int workers)
-        : pipeline_component(id, "in", "out", workers) {}
+    explicit self_disabling_pipeline(std::string_view id, int workers) : pipeline_component(id, "in", "out", workers) {}
 
 protected:
     auto work(in_t in, timestamp, const composite::metadata&) -> out_t override { return in; }
@@ -274,9 +275,8 @@ class finishing_writer : public component {
 public:
     explicit finishing_writer(std::string_view id) : component(id) {
         add_config(m_cfg, config_type::RUNTIME);
-        m_cfg.on_apply([this](const gen_cfg&, const changes<gen_cfg>&) {
-            m_applied.fetch_add(1, std::memory_order_relaxed);
-        });
+        m_cfg.on_apply(
+            [this](const gen_cfg&, const changes<gen_cfg>&) { m_applied.fetch_add(1, std::memory_order_relaxed); });
     }
     auto process() -> retval override { return retval::FINISH; }
     auto on_finished(finish_reason) -> void override { set_properties(json{{"gen", 1}}, config_type::RUNTIME); }
@@ -285,9 +285,18 @@ public:
     component::auto_stop m_auto_stop{*this};
 };
 
-auto live_thread_count() -> std::size_t {
-    return static_cast<std::size_t>(
-        std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}));
+
+auto live_threads_named(std::string_view prefix) -> std::size_t {
+    std::size_t count = 0;
+    for (const auto& task : std::filesystem::directory_iterator("/proc/self/task")) {
+        std::ifstream comm{task.path() / "comm"};
+        std::string name;
+        std::getline(comm, name);
+        if (name.starts_with(prefix)) {
+            ++count;
+        }
+    }
+    return count;
 }
 } // namespace
 
@@ -479,7 +488,7 @@ int main() {
     //      with finish_reason::none (stop_locked() is not in that path) ----
     {
         constexpr int W = 4;
-        const auto baseline = live_thread_count();
+        constexpr std::string_view worker_name_prefix = "selfdis.w";
 
         auto pipe = std::make_shared<self_disabling_pipeline>("selfdis", W);
         output_port<mutable_buffer<int>> feeder{"feed"};
@@ -491,7 +500,10 @@ int main() {
             std::this_thread::sleep_for(1ms);
         }
         check(pipe->is_running(), "selfdis: pipeline running (main worker + pool up)");
-        check(live_thread_count() > baseline, "selfdis: thread count grew while running");
+        for (int i = 0; i < 500 && live_threads_named(worker_name_prefix) < W; ++i) {
+            std::this_thread::sleep_for(1ms);
+        }
+        check(live_threads_named(worker_name_prefix) == W, "selfdis: all named pool workers running");
 
         for (int s = 0; s < 3; ++s) {
             auto b = make_mutable<int>(1);
@@ -505,12 +517,10 @@ int main() {
         check(!pipe->is_running(), "selfdis: pipeline stopped running after disabling itself");
         check(pipe->wait_until_finished(2s), "selfdis: worker exited after the self-disable");
 
-        std::size_t after = live_thread_count();
-        for (int i = 0; i < 500 && after > baseline; ++i) {
+        for (int i = 0; i < 500 && live_threads_named(worker_name_prefix) != 0; ++i) {
             std::this_thread::sleep_for(1ms);
-            after = live_thread_count();
         }
-        check(after == baseline, "selfdis: pool threads joined -- thread count back to baseline");
+        check(live_threads_named(worker_name_prefix) == 0, "selfdis: named pool workers joined");
 
         bool found_state = false;
         for (const auto& m : metrics::registry::instance().snapshot_by_label("component_id", pipe->id())) {

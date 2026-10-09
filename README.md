@@ -164,6 +164,60 @@ Top-level keys:
 **Note:** an output port may fan out to multiple input ports, but an input port accepts exactly one
 producer (fan-in is rejected at connect time — it is the single-producer precondition of the SPSC ring).
 
+### DPDK initialization and CPU allocation
+
+With `COMPOSITE_USE_DPDK=ON`, enable DPDK through the application's top-level `dpdk` object:
+
+```json
+{
+    "dpdk": {
+        "enabled": true,
+        "minimum_application_physical_cores": 1,
+        "eal_args": ["-a", "0000:03:00.0"],
+        "ports": [{"port_id": 0, "interface": "rx0", "rx_queues": 1}]
+    }
+}
+```
+
+The PCI address and port configuration must match your deployment. Host device access, hugepages,
+permissions, and container mounts are described in [DPDK images](docker/README.md#dpdk-images).
+
+When `eal_args` contains no CPU selector, the CLI reserves **one complete physical core per configured
+RX queue**, including all SMT siblings, from the process cpuset. It selects the lowest-numbered
+complete cores; NIC NUMA locality must be arranged by the host or orchestrator. The remaining CPUs
+are available to application threads, including partial physical cores whose other siblings are
+outside the cpuset. The main thread moves to that application mask before components are created;
+component `cpu_affinity` overrides still resolve against the original process cpuset.
+
+`minimum_application_physical_cores` defaults to **1** and applies **only to automatic allocation**.
+It accepts integers from 0 through 65535. Partial cores provide additional application capacity but
+never count toward this minimum. Zero permits a plan with no complete application cores; if no
+application CPUs remain at all, the main thread shares a DPDK CPU and a warning is logged.
+Automatic allocation fails if there are insufficient complete cores, no configured RX queues
+(including an empty `ports` list), or unreadable/invalid CPU topology.
+
+Explicit CPU selections override automatic sizing and its application-core minimum:
+
+- `"eal_args": ["-l", "0,2"]` selects **logical indices** in the sorted process cpuset.
+- `"eal_args": ["-c", "0x101"]` preserves EAL's **physical CPU bitmask** semantics (CPUs 0 and 8).
+- Attached values such as `-l0,2` and `-c0x101` are accepted. Only one selector is allowed.
+  `--lcores` remains unsupported and is rejected during configuration parsing.
+
+An explicit selection must include every **available** SMT sibling of each selected CPU. Existing
+`-l` configurations that split available sibling pairs must be updated. Unlike automatic allocation,
+explicit selections may use a physical core whose other siblings are outside the cpuset, and may be
+used when no RX queues are configured. Missing topology is an error in both modes.
+
+The manager exposes `get_rx_worker_core(interface, queue_id)` for receiver components to obtain their
+CPU assignment. Queues are assigned in configuration order, using one representative CPU per selected
+physical core and wrapping round-robin when an explicit selection has fewer cores than queues.
+Receiver components must apply that affinity to their worker threads.
+
+For normal DPDK-enabled startup, an explicit EAL `--file-prefix` takes precedence; otherwise the CLI
+uses a nonempty `COMPOSITE_DPDK_FILE_PREFIX` environment variable, then `composite`. Use distinct prefixes
+for independent instances sharing a runtime directory. `--list-dpdk-ports` performs discovery directly
+using the supplied EAL arguments; it does not apply automatic CPU planning or this prefix default.
+
 ## Component Interface
 
 ### Component Loading

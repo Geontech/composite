@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: LGPL-3.0-or-later
  */
 
-// translate_dpdk_eal_args: logical->physical core translation for DPDK EAL args.
+// Deterministic CPU topology planning and EAL CPU-selector normalization.
 //
 // 0.5.1 regressions pinned here:
 //  - "--lcores" is REJECTED (std::invalid_argument), not passed through: its core ids skip the
@@ -13,8 +13,11 @@
 //    of std::stoi escaping through main() to std::terminate.
 
 #include "composite/util/cpu_affinity.hpp"
+#include "cpu_topology.hpp"
 
 #include <cstdio>
+#include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -47,6 +50,79 @@ auto throws_invalid_argument(const std::vector<std::string>& eal_args, const std
 
 int main() {
     const std::vector<int> cores{7, 9, 51, 53};
+
+    { // Deterministic SMT topology, independent of the test runner's CPU allocation.
+        const std::map<int, std::vector<int>> topology{
+            {0, {0, 8}}, {8, {0, 8}}, {1, {1, 9}}, {9, {1, 9}}, {2, {2, 10}}, {10, {2, 10}}};
+        const auto siblings = [&](int cpu) -> std::optional<std::vector<int>> {
+            const auto it = topology.find(cpu);
+            return it == topology.end() ? std::nullopt : std::optional{it->second};
+        };
+        const std::vector<int> full{0, 1, 2, 8, 9, 10};
+        const auto plan = composite::detail::plan_dpdk_cpu_cores(full, 2, 1, siblings);
+        check(plan && plan->dpdk_cores == std::vector<int>({0, 1, 8, 9}) &&
+                  plan->rx_worker_cores == std::vector<int>({0, 1}) &&
+                  plan->application_cores == std::vector<int>({2, 10}),
+              "two RX queues reserve two whole cores and leave a whole application core");
+        const auto partial = composite::detail::plan_dpdk_cpu_cores({0, 1, 2, 8, 9}, 1, 1, siblings);
+        check(partial && partial->application_cores == std::vector<int>({1, 2, 9}),
+              "partial cores remain available to application work alongside complete cores");
+        check(!composite::detail::plan_dpdk_cpu_cores({0, 1, 2, 8}, 1, 1, siblings),
+              "partial cores do not satisfy the minimum complete application core count");
+        const auto no_minimum = composite::detail::plan_dpdk_cpu_cores({0, 1, 2, 8}, 1, 0, siblings);
+        check(no_minimum && no_minimum->application_cores == std::vector<int>({1, 2}),
+              "zero minimum still retains partial application cores");
+        check(!composite::detail::plan_dpdk_cpu_cores({}, 1, 1, siblings), "empty allocation is rejected");
+        check(!composite::detail::plan_dpdk_cpu_cores(full, 0, 1, siblings),
+              "zero RX queues require an explicit selection");
+        check(!composite::detail::plan_dpdk_cpu_cores(full, 4, 0, siblings), "insufficient RX cores are rejected");
+        check(!composite::detail::plan_dpdk_cpu_cores(full, 1, std::numeric_limits<size_t>::max(), siblings),
+              "minimum core count cannot overflow the capacity check");
+        check(!composite::detail::plan_dpdk_cpu_cores({3}, 1, 0, siblings), "missing topology fails closed");
+        const auto reps = composite::detail::dpdk_physical_core_representatives({9, 0, 8, 1, 0}, full, siblings);
+        check(reps && *reps == std::vector<int>({0, 1}), "one sorted representative per selected physical core");
+        check(!composite::detail::dpdk_physical_core_representatives({0}, full, siblings),
+              "explicit selection cannot leave an available SMT sibling for application work");
+        check(composite::detail::dpdk_physical_core_representatives({0}, {0, 1}, siblings).has_value(),
+              "explicit selection need not include SMT siblings outside its cpuset");
+        check(!composite::detail::dpdk_physical_core_representatives({3}, {3}, siblings),
+              "explicit selection rejects missing topology");
+        check(!composite::detail::dpdk_physical_core_representatives({8}, {0}, siblings),
+              "explicit selection rejects unavailable CPUs");
+    }
+    {
+        const auto non_smt = [](int cpu) -> std::optional<std::vector<int>> { return std::vector<int>{cpu}; };
+        const auto plan = composite::detail::plan_dpdk_cpu_cores({7, 3, 5}, 1, 1, non_smt);
+        check(plan && plan->dpdk_cores == std::vector<int>({3}) &&
+                  plan->application_cores == std::vector<int>({5, 7}), "non-SMT CPUs each count as a complete core");
+        const auto invalid = [](int) -> std::optional<std::vector<int>> { return std::vector<int>{}; };
+        check(!composite::detail::plan_dpdk_cpu_cores({0}, 1, 0, invalid), "empty sibling topology is rejected");
+        check(!composite::detail::dpdk_physical_core_representatives({0}, {0}, invalid),
+              "representatives also reject empty sibling topology");
+        check(!composite::dpdk_cpu_allocation_is_smt_safe({-1}, {-1}),
+              "public SMT validator fails closed when sysfs topology is unavailable");
+        check(!composite::dpdk_physical_core_representatives({-1}, {-1}),
+              "public representative selection has the same sysfs failure policy");
+    }
+
+    {
+        const auto [args, logical] = composite::translate_dpdk_eal_args({"-c", "0x280", "--no-pci"}, cores);
+        check(args == std::vector<std::string>({"-l", "7,9", "--no-pci"}) && logical == std::vector<int>({0, 1}),
+              "physical -c mask normalizes to a single EAL list and records logical reservations");
+        const auto attached = composite::translate_dpdk_eal_args({"-c280"}, cores);
+        check(attached.first == std::vector<std::string>({"-l", "7,9"}), "attached -c mask is recognized");
+        const auto list = composite::translate_dpdk_eal_args({"-l0,2"}, cores);
+        check(list.first == std::vector<std::string>({"-l", "7,51"}), "attached -l list uses logical indices");
+        const auto high_mask = composite::translate_dpdk_eal_args({"-c10000000000000000"}, {64});
+        check(high_mask.first == std::vector<std::string>({"-l", "64"}), "masks support physical CPUs above bit 63");
+        for (const auto& args_to_reject : std::vector<std::vector<std::string>>{
+                 {"-l"}, {"-l", ""}, {"-l", "2-1"}, {"-l", "99"}, {"-c"}, {"-c", "0"},
+                 {"-c", "0x"}, {"-c", "xyz"}, {"-c", "1"}, {"-l", "0", "-c", "80"},
+                 {"-c80", "-c280"}, {"-l0", "-l1"}}) {
+            check(throws_invalid_argument(args_to_reject, cores),
+                  "invalid/empty/duplicate explicit selection is rejected");
+        }
+    }
 
     { // -l range translation
         const auto [args, logical] = composite::translate_dpdk_eal_args({"-l", "0-1"}, cores);

@@ -25,7 +25,7 @@ All notable changes to **composite** are documented here. The project follows
     described a toolchain nothing was released against. Covered modes: Debug + `-Wall -Wextra
     -Wpedantic -Werror` with the full ctest suite (`ci` preset), Release,
     `-DCOMPOSITE_USE_OPENSSL=ON`, `-DCOMPOSITE_USE_OPENTELEMETRY=ON`, both of those under
-    ASan+UBSan and TSan, `-DCOMPOSITE_USE_DPDK=ON` (compile-only — no NIC in CI), and an
+    ASan+UBSan and TSan, `-DCOMPOSITE_USE_DPDK=ON` (virtual-NIC tests; physical NICs are not exercised), and an
     installed-package consumer build.
   - **Also gating, as a portability check:** one **Debian trixie / GCC 14.4** job building the
     default option set and running ctest. It is not the reference toolchain; it exists so a change
@@ -69,6 +69,38 @@ All notable changes to **composite** are documented here. The project follows
   instead and take the clean refusal.
 
 ---
+
+## 0.5.4 — tested DPDK implementation and added cpu auto discovery for pinning
+
+### Changed
+
+- DPDK startup without an explicit CPU selector reserves one complete physical core per RX queue.
+  `minimum_application_physical_cores` (default 1) retains that many complete application cores
+  in automatic plans. Partial cores remain available to the application but do not satisfy the
+  minimum, including when the minimum is zero. The minimum is range-checked during JSON parsing
+  and enforced without arithmetic overflow. Automatic plans require at least one RX queue and
+  readable CPU topology.
+- Explicit DPDK selections must include every available SMT sibling of each selected CPU.
+  Existing configurations that split sibling pairs must be updated. Explicit selections override
+  automatic sizing and its application-core minimum; `-l` uses logical cpuset indices and `-c`
+  retains physical CPU bitmask semantics. Separate and attached `-l`/`-c` values are normalized
+  before automatic planning; empty, missing, duplicate, and malformed selections fail with
+  configuration errors. `--lcores` remains unsupported.
+- DPDK mempools are created on the NIC's NUMA socket. Receiver components can query per-queue CPU
+  assignments with `manager::get_rx_worker_core`; assignments wrap when queues outnumber cores.
+- Normal CLI startup defaults the DPDK file prefix to `COMPOSITE_DPDK_FILE_PREFIX`, or `composite`
+  when unset/empty; an explicit EAL prefix wins. Container images provide a writable runtime
+  directory through `XDG_RUNTIME_DIR` for UID 10001.
+- CI builds its toolchain against a registry cache and passes its immutable digest to later jobs.
+  Advisory lint runs after build and sanitizer jobs.
+
+### Fixed
+
+- CI suppresses duplicate push pipelines for open merge requests while preserving manually
+  launched, scheduled, and triggered branch pipelines.
+- The VFIO discovery example passes both the control device and the IOMMU group device.
+- The lifecycle self-disable regression counts only its own named pool workers, avoiding unrelated
+  process thread activity.
 
 ## 0.5.3 — lifecycle and end-of-stream correctness patch
 

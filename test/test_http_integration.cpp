@@ -1130,6 +1130,18 @@ TEST_CASE_METHOD(rest_fixture, "RUNTIME PATCH enabled still starts/stops via the
     REQUIRE_FALSE(running->is_running());
 }
 
+TEST_CASE("parse_dpdk_config validates the automatic application-core minimum", "[hardening]") {
+    REQUIRE(composite::parse_dpdk_config(nlohmann::json::object()).minimum_application_physical_cores == 1);
+    for (int minimum : {0, 1, 65535}) {
+        REQUIRE(composite::parse_dpdk_config({{"minimum_application_physical_cores", minimum}})
+                    .minimum_application_physical_cores == minimum);
+    }
+    for (const auto& invalid : nlohmann::json::array({-1, 65536, 1.5, "1", true, nullptr})) {
+        REQUIRE_THROWS_AS(composite::parse_dpdk_config({{"minimum_application_physical_cores", invalid}}),
+                          std::invalid_argument);
+    }
+}
+
 TEST_CASE("parse_dpdk_config rejects --lcores in every spelling", "[hardening]") {
     // Rejection lives in parse_dpdk_config — the one choke point every load path goes through —
     // NOT only in the core translator, which runs solely when CPU discovery produced a core
